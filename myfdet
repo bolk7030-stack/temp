@@ -9,16 +9,16 @@ echo "[2/5] Configuring wg0..."
 uci -q delete network.wg0
 uci set network.wg0=interface
 uci set network.wg0.proto='wireguard'
-uci set network.wg0.private_key='6LR2vaOEACv0x52sJ48B9tpVaMsD8+03gTa5H/9in3k='
-uci add_list network.wg0.addresses='10.71.61.183/32'
-uci add_list network.wg0.addresses='fc00:bbbb:bbbb:bb01::8:3db6/128'
+uci set network.wg0.private_key='CGWiEE11kp+uYLamVnj85sEujkAyOL6diw4n7/5MWVk='
+uci add_list network.wg0.addresses='10.72.208.125/32'
+uci add_list network.wg0.addresses='fc00:bbbb:bbbb:bb01::9:d07c/128'
 
 echo "[3/5] Configuring Mullvad peer..."
 uci -q delete network.wg0_peer
 uci set network.wg0_peer=wireguard_wg0
 uci set network.wg0_peer.interface='wg0'
-uci set network.wg0_peer.public_key='+USmlxhnLmlNkDnBbu+rXwjUwa383e0ilYEqPkEkNHA='
-uci set network.wg0_peer.endpoint_host='185.141.119.131'
+uci set network.wg0_peer.public_key='cYqP1UqhOYuaj47e4jAbgL55h52L+ALjtML26OtBvFU='
+uci set network.wg0_peer.endpoint_host='185.141.119.161'
 uci set network.wg0_peer.endpoint_port='51820'
 uci set network.wg0_peer.persistent_keepalive='25'
 uci add_list network.wg0_peer.allowed_ips='0.0.0.0/0'
