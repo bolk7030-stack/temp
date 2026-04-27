@@ -1,21 +1,17 @@
 #!/bin/sh
-set -ex
+set -e
 
 echo "[1/5] Installing WireGuard..."
 apk update
-apk add wireguard-tools kmod-wireguard luci-proto-wireguard curl
-
-modprobe wireguard || true
+apk add wireguard-tools kmod-wireguard curl
 
 echo "[2/5] Configuring wg0..."
 uci -q delete network.wg0
 uci set network.wg0=interface
 uci set network.wg0.proto='wireguard'
 uci set network.wg0.private_key='6LR2vaOEACv0x52sJ48B9tpVaMsD8+03gTa5H/9in3k='
-uci set network.wg0.auto='1'
 uci add_list network.wg0.addresses='10.71.61.183/32'
 uci add_list network.wg0.addresses='fc00:bbbb:bbbb:bb01::8:3db6/128'
-uci add_list network.wg0.dns='10.64.0.1'
 
 echo "[3/5] Configuring Mullvad peer..."
 uci -q delete network.wg0_peer
@@ -47,17 +43,13 @@ uci set firewall.vpn_forward.dest='vpn'
 echo "[5/5] Applying..."
 uci commit network
 uci commit firewall
-
 /etc/init.d/network restart
-sleep 5
-ifup wg0 || true
-
 /etc/init.d/firewall restart
 
 echo "Checking WireGuard..."
+sleep 2
 ip link show wg0 || true
 wg show || true
-ip route || true
 
 echo "Public IP:"
 curl -4 ifconfig.me || true
