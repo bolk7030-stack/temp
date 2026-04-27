@@ -12,7 +12,6 @@ uci set network.wg0.proto='wireguard'
 uci set network.wg0.private_key='CGWiEE11kp+uYLamVnj85sEujkAyOL6diw4n7/5MWVk='
 uci add_list network.wg0.addresses='10.72.208.125/32'
 uci add_list network.wg0.addresses='fc00:bbbb:bbbb:bb01::9:d07c/128'
-uci add_list network.wg0.dns='10.64.0.1'
 
 echo "[3/5] Configuring Mullvad peer..."
 uci -q delete network.wg0_peer
@@ -24,13 +23,6 @@ uci set network.wg0_peer.endpoint_port='51820'
 uci set network.wg0_peer.persistent_keepalive='25'
 uci add_list network.wg0_peer.allowed_ips='0.0.0.0/0'
 uci add_list network.wg0_peer.allowed_ips='::/0'
-
-echo "[3.5/5] Adding endpoint escape route..."
-uci -q delete network.mullvad_endpoint
-uci set network.mullvad_endpoint=route
-uci set network.mullvad_endpoint.interface='wan'
-uci set network.mullvad_endpoint.target='185.141.119.161/32'
-uci set network.mullvad_endpoint.gateway='192.168.1.1'
 
 echo "[4/5] Firewall..."
 uci -q delete firewall.vpn
@@ -58,7 +50,6 @@ echo "Checking WireGuard..."
 sleep 2
 ip link show wg0 || true
 wg show || true
-ip route || true
 
 echo "Public IP:"
 curl -4 ifconfig.me || true
