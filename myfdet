@@ -26,14 +26,11 @@ uci add_list network.wg0_peer.allowed_ips='0.0.0.0/0'
 uci add_list network.wg0_peer.allowed_ips='::/0'
 
 echo "[3.5/5] Adding endpoint escape route..."
-WAN_GW="$(ip route | awk '/default/ {print $3; exit}')"
-if [ -n "$WAN_GW" ]; then
-    uci -q delete network.mullvad_endpoint
-    uci set network.mullvad_endpoint=route
-    uci set network.mullvad_endpoint.interface='wan'
-    uci set network.mullvad_endpoint.target='185.141.119.161/32'
-    uci set network.mullvad_endpoint.gateway="$WAN_GW"
-fi
+uci -q delete network.mullvad_endpoint
+uci set network.mullvad_endpoint=route
+uci set network.mullvad_endpoint.interface='wan'
+uci set network.mullvad_endpoint.target='185.141.119.161/32'
+uci set network.mullvad_endpoint.gateway='192.168.1.1'
 
 echo "[4/5] Firewall..."
 uci -q delete firewall.vpn
