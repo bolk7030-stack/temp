@@ -1,31 +1,35 @@
 #!/bin/sh
-set -e
+set -u
 
 echo "[1/5] Installing WireGuard..."
 apk update
 apk add wireguard-tools kmod-wireguard curl
 
 echo "[2/5] Configuring wg0..."
-uci -q delete network.wg0
+uci -q delete network.wg0 || true
+uci -q delete network.wg0_peer || true
+
 uci set network.wg0=interface
 uci set network.wg0.proto='wireguard'
-uci set network.wg0.private_key='KE9+uTrEEwS/cRQXf2rN7drchmQNhQyrxMea9/HapmE='
-uci add_list network.wg0.addresses='10.66.25.155/32'
-uci add_list network.wg0.addresses='fc00:bbbb:bbbb:bb01::3:199a/128'
+uci set network.wg0.private_key='CGWiEE11kp+uYLamVnj85sEujkAyOL6diw4n7/5MWVk='
+uci add_list network.wg0.addresses='10.72.208.125/32'
+uci add_list network.wg0.addresses='fc00:bbbb:bbbb:bb01::9:d07c/128'
 
 echo "[3/5] Configuring Mullvad peer..."
-uci -q delete network.wg0_peer
 uci set network.wg0_peer=wireguard_wg0
 uci set network.wg0_peer.interface='wg0'
-uci set network.wg0_peer.public_key='MVqe9e9aDwfFuvEhEn4Wd/zWV3cmiCX9fZMWetz+23A='
-uci set network.wg0_peer.endpoint_host='185.195.232.70'
+uci set network.wg0_peer.public_key='cYqP1UqhOYuaj47e4jAbgL55h52L+ALjtML26OtBvFU='
+uci set network.wg0_peer.endpoint_host='185.141.119.161'
 uci set network.wg0_peer.endpoint_port='51820'
 uci set network.wg0_peer.persistent_keepalive='25'
+uci set network.wg0_peer.route_allowed_ips='1'
 uci add_list network.wg0_peer.allowed_ips='0.0.0.0/0'
 uci add_list network.wg0_peer.allowed_ips='::/0'
 
 echo "[4/5] Firewall..."
-uci -q delete firewall.vpn
+uci -q delete firewall.vpn || true
+uci -q delete firewall.vpn_forward || true
+
 uci set firewall.vpn=zone
 uci set firewall.vpn.name='vpn'
 uci add_list firewall.vpn.network='wg0'
@@ -35,7 +39,6 @@ uci set firewall.vpn.forward='REJECT'
 uci set firewall.vpn.masq='1'
 uci set firewall.vpn.mtu_fix='1'
 
-uci -q delete firewall.vpn_forward
 uci set firewall.vpn_forward=forwarding
 uci set firewall.vpn_forward.src='lan'
 uci set firewall.vpn_forward.dest='vpn'
@@ -43,11 +46,16 @@ uci set firewall.vpn_forward.dest='vpn'
 echo "[5/5] Applying..."
 uci commit network
 uci commit firewall
-/etc/init.d/network restart
-/etc/init.d/firewall restart
+
+/etc/init.d/network restart || true
+sleep 5
+/etc/init.d/firewall restart || true
+
+echo "[Manual ifup wg0]"
+ifup wg0 || true
+sleep 3
 
 echo "Checking WireGuard..."
-sleep 2
 ip link show wg0 || true
 wg show || true
 
