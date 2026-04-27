@@ -7,8 +7,8 @@ apk add wireguard-tools kmod-wireguard curl
 
 echo "[2/5] Configuring wg0..."
 uci -q delete network.wg0
-uci set network.wg0='interface'
-uci set network.wg0.proto='wireguard'
+uci set network.wg0=interface
+uci set network.wg0.proto=wireguard
 uci set network.wg0.private_key='KE9+uTrEEwS/cRQXf2rN7drchmQNhQyrxMea9/HapmE='
 uci add_list network.wg0.addresses='10.66.25.155/32'
 uci add_list network.wg0.addresses='fc00:bbbb:bbbb:bb01::3:199a/128'
