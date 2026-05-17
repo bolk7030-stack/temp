@@ -3,36 +3,37 @@
 WAN_DEV="eth1"
 IFB_DEV="ifb-eth1"
 
-WAN_CLASS="1:1"
-IFB_CLASS="1:1"
+GAME_CLASS="1:15"
 
-BASE_UP=85000
-BASE_DOWN=120000
+SLEEP_SEC=1
 
-MIN_UP=55000
-MIN_DOWN=85000
+BASE_GAME_UP=8500
+BASE_GAME_DOWN=12000
 
-MAX_UP=85000
-MAX_DOWN=120000
+MAX_GAME_UP=18000
+MAX_GAME_DOWN=24000
 
-DROP_PER_BACKLOG=500   # kbit drop per queued packet
-SLEEP_SEC=2
+MIN_GAME_UP=5000
+MIN_GAME_DOWN=8000
 
-SMOOTH_PRESSURE=0
+BOOST=0
+BOOST_STEP=1000
+BOOST_DECAY=500
+MAX_BOOST=10000
 
-has_class() {
-    tc class show dev "$1" 2>/dev/null | grep -q "class hfsc $2"
-}
-
-get_backlog_packets() {
+get_pkts() {
     DEV="$1"
+    CLASS="$2"
 
-    tc -s qdisc show dev "$DEV" 2>/dev/null | awk '
-        /backlog/ {
+    tc -s class show dev "$DEV" 2>/dev/null | awk -v cls="$CLASS" '
+        $0 ~ "class hfsc " cls {
+            found=1
+            next
+        }
+        found && /Sent/ {
             for (i=1; i<=NF; i++) {
-                if ($i ~ /^[0-9]+p$/) {
-                    gsub("p","",$i)
-                    print $i
+                if ($i == "pkt") {
+                    print $(i-1)
                     exit
                 }
             }
@@ -40,53 +41,75 @@ get_backlog_packets() {
     '
 }
 
+has_class() {
+    tc class show dev "$1" 2>/dev/null | grep -q "class hfsc $2"
+}
+
+LAST_WAN=0
+LAST_IFB=0
+LAST_TOTAL=0
+
 while true
 do
-    WAN_BACKLOG="$(get_backlog_packets "$WAN_DEV")"
-    IFB_BACKLOG="$(get_backlog_packets "$IFB_DEV")"
+    WAN_PKTS="$(get_pkts "$WAN_DEV" "$GAME_CLASS")"
+    IFB_PKTS="$(get_pkts "$IFB_DEV" "$GAME_CLASS")"
 
-    [ -z "$WAN_BACKLOG" ] && WAN_BACKLOG=0
-    [ -z "$IFB_BACKLOG" ] && IFB_BACKLOG=0
+    [ -z "$WAN_PKTS" ] && WAN_PKTS=0
+    [ -z "$IFB_PKTS" ] && IFB_PKTS=0
 
-    # Use the worse side as pressure
-    if [ "$IFB_BACKLOG" -gt "$WAN_BACKLOG" ]; then
-        PRESSURE="$IFB_BACKLOG"
+    WAN_DELTA=$((WAN_PKTS - LAST_WAN))
+    IFB_DELTA=$((IFB_PKTS - LAST_IFB))
+    TOTAL_DELTA=$((WAN_DELTA + IFB_DELTA))
+
+    if [ "$LAST_TOTAL" -gt 0 ]; then
+        DIFF=$((TOTAL_DELTA - LAST_TOTAL))
     else
-        PRESSURE="$WAN_BACKLOG"
+        DIFF=0
     fi
 
-    # Microburst memory:
-    # pressure jumps up fast, decays gradually
-    if [ "$PRESSURE" -gt "$SMOOTH_PRESSURE" ]; then
-        SMOOTH_PRESSURE="$PRESSURE"
+    REGIME="steady"
+
+    if [ "$TOTAL_DELTA" -eq 0 ]; then
+        REGIME="quiet/stall"
+        BOOST=$((BOOST + BOOST_STEP))
+    elif [ "$DIFF" -gt 20 ]; then
+        REGIME="burst/catchup"
+        BOOST=$((BOOST - BOOST_DECAY))
+    elif [ "$DIFF" -lt -20 ]; then
+        REGIME="dropoff/late"
+        BOOST=$((BOOST + BOOST_STEP))
     else
-        SMOOTH_PRESSURE=$(( (SMOOTH_PRESSURE + PRESSURE) / 2 ))
+        REGIME="steady"
+        BOOST=$((BOOST - BOOST_DECAY))
     fi
 
-    NEW_UP=$((BASE_UP - (SMOOTH_PRESSURE * DROP_PER_BACKLOG)))
-    NEW_DOWN=$((BASE_DOWN - (SMOOTH_PRESSURE * DROP_PER_BACKLOG)))
+    [ "$BOOST" -lt 0 ] && BOOST=0
+    [ "$BOOST" -gt "$MAX_BOOST" ] && BOOST="$MAX_BOOST"
 
-    [ "$NEW_UP" -lt "$MIN_UP" ] && NEW_UP="$MIN_UP"
-    [ "$NEW_DOWN" -lt "$MIN_DOWN" ] && NEW_DOWN="$MIN_DOWN"
+    NEW_GAME_UP=$((BASE_GAME_UP + BOOST))
+    NEW_GAME_DOWN=$((BASE_GAME_DOWN + BOOST))
 
-    [ "$NEW_UP" -gt "$MAX_UP" ] && NEW_UP="$MAX_UP"
-    [ "$NEW_DOWN" -gt "$MAX_DOWN" ] && NEW_DOWN="$MAX_DOWN"
+    [ "$NEW_GAME_UP" -lt "$MIN_GAME_UP" ] && NEW_GAME_UP="$MIN_GAME_UP"
+    [ "$NEW_GAME_DOWN" -lt "$MIN_GAME_DOWN" ] && NEW_GAME_DOWN="$MIN_GAME_DOWN"
 
-    echo "wan_backlog=${WAN_BACKLOG}p ifb_backlog=${IFB_BACKLOG}p pressure=${SMOOTH_PRESSURE} up=${NEW_UP}kbit down=${NEW_DOWN}kbit"
+    [ "$NEW_GAME_UP" -gt "$MAX_GAME_UP" ] && NEW_GAME_UP="$MAX_GAME_UP"
+    [ "$NEW_GAME_DOWN" -gt "$MAX_GAME_DOWN" ] && NEW_GAME_DOWN="$MAX_GAME_DOWN"
 
-    if has_class "$WAN_DEV" "$WAN_CLASS"; then
-        tc class change dev "$WAN_DEV" classid "$WAN_CLASS" \
-            hfsc sc rate "${NEW_UP}kbit" ul rate "${NEW_UP}kbit"
-    else
-        echo "skip WAN"
+    echo "wan=$WAN_DELTA ifb=$IFB_DELTA total=$TOTAL_DELTA diff=$DIFF regime=$REGIME boost=$BOOST up=$NEW_GAME_UP down=$NEW_GAME_DOWN"
+
+    if has_class "$WAN_DEV" "$GAME_CLASS"; then
+        tc class change dev "$WAN_DEV" classid "$GAME_CLASS" \
+            hfsc ls rate "${NEW_GAME_UP}kbit" ul rate "${NEW_GAME_UP}kbit"
     fi
 
-    if has_class "$IFB_DEV" "$IFB_CLASS"; then
-        tc class change dev "$IFB_DEV" classid "$IFB_CLASS" \
-            hfsc sc rate "${NEW_DOWN}kbit" ul rate "${NEW_DOWN}kbit"
-    else
-        echo "skip IFB"
+    if has_class "$IFB_DEV" "$GAME_CLASS"; then
+        tc class change dev "$IFB_DEV" classid "$GAME_CLASS" \
+            hfsc ls rate "${NEW_GAME_DOWN}kbit" ul rate "${NEW_GAME_DOWN}kbit"
     fi
+
+    LAST_WAN="$WAN_PKTS"
+    LAST_IFB="$IFB_PKTS"
+    LAST_TOTAL="$TOTAL_DELTA"
 
     sleep "$SLEEP_SEC"
 done
