@@ -11,48 +11,78 @@ IFB_CLASS="1:1"
 BASE_UP=85000
 BASE_DOWN=120000
 
-MIN_UP=45000
-MIN_DOWN=70000
+MIN_UP=55000
+MIN_DOWN=85000
 
-DROP_PER_MS=2000
+MAX_UP=85000
+MAX_DOWN=120000
+
+DROP_PER_MS=500
 SLEEP_SEC=5
+
+SMOOTH_JITTER=0
+ALPHA_NUM=7
+ALPHA_DEN=10
 
 has_class() {
     tc class show dev "$1" 2>/dev/null | grep -q "class hfsc $2"
 }
 
-while true
-do
+get_ping_jitter() {
     OUT="$(ping -c 5 -q "$PING_TARGET" 2>/dev/null)"
 
-    MIN="$(echo "$OUT" | awk -F'/' '/round-trip|rtt/ {print int($4)}')"
-    MAX="$(echo "$OUT" | awk -F'/' '/round-trip|rtt/ {print int($6)}')"
+    RTT_LINE="$(echo "$OUT" | grep -E 'round-trip|rtt')"
 
-    [ -z "$MIN" ] && echo "ping failed" && sleep "$SLEEP_SEC" && continue
-    [ -z "$MAX" ] && echo "ping failed" && sleep "$SLEEP_SEC" && continue
+    [ -z "$RTT_LINE" ] && echo "" && return
 
-    JITTER=$((MAX - MIN))
+    NUMS="$(echo "$RTT_LINE" | sed 's/.*= //' | sed 's/ ms//')"
 
-    NEW_UP=$((BASE_UP - (JITTER * DROP_PER_MS)))
-    NEW_DOWN=$((BASE_DOWN - (JITTER * DROP_PER_MS)))
+    MIN="$(echo "$NUMS" | cut -d/ -f1 | cut -d. -f1)"
+    MAX="$(echo "$NUMS" | cut -d/ -f3 | cut -d. -f1)"
+
+    [ -z "$MIN" ] && echo "" && return
+    [ -z "$MAX" ] && echo "" && return
+
+    echo $((MAX - MIN))
+}
+
+while true
+do
+    JITTER="$(get_ping_jitter)"
+
+    [ -z "$JITTER" ] && echo "ping parse failed" && sleep "$SLEEP_SEC" && continue
+
+    # EWMA smoothing:
+    # smooth = 0.7 old + 0.3 new
+    SMOOTH_JITTER=$(((SMOOTH_JITTER * ALPHA_NUM + JITTER * (ALPHA_DEN - ALPHA_NUM)) / ALPHA_DEN))
+
+    # Deadband: ignore tiny jitter
+    EFFECTIVE_JITTER="$SMOOTH_JITTER"
+    [ "$EFFECTIVE_JITTER" -lt 3 ] && EFFECTIVE_JITTER=0
+
+    NEW_UP=$((BASE_UP - (EFFECTIVE_JITTER * DROP_PER_MS)))
+    NEW_DOWN=$((BASE_DOWN - (EFFECTIVE_JITTER * DROP_PER_MS)))
 
     [ "$NEW_UP" -lt "$MIN_UP" ] && NEW_UP="$MIN_UP"
     [ "$NEW_DOWN" -lt "$MIN_DOWN" ] && NEW_DOWN="$MIN_DOWN"
 
-    echo "jitter=${JITTER}ms up=${NEW_UP}kbit down=${NEW_DOWN}kbit"
+    [ "$NEW_UP" -gt "$MAX_UP" ] && NEW_UP="$MAX_UP"
+    [ "$NEW_DOWN" -gt "$MAX_DOWN" ] && NEW_DOWN="$MAX_DOWN"
+
+    echo "raw_jitter=${JITTER}ms smooth=${SMOOTH_JITTER}ms up=${NEW_UP}kbit down=${NEW_DOWN}kbit"
 
     if has_class "$WAN_DEV" "$WAN_CLASS"; then
         tc class change dev "$WAN_DEV" classid "$WAN_CLASS" \
             hfsc sc rate "${NEW_UP}kbit" ul rate "${NEW_UP}kbit"
     else
-        echo "skip WAN: class missing"
+        echo "skip WAN"
     fi
 
     if has_class "$IFB_DEV" "$IFB_CLASS"; then
         tc class change dev "$IFB_DEV" classid "$IFB_CLASS" \
             hfsc sc rate "${NEW_DOWN}kbit" ul rate "${NEW_DOWN}kbit"
     else
-        echo "skip IFB: class missing"
+        echo "skip IFB"
     fi
 
     sleep "$SLEEP_SEC"
