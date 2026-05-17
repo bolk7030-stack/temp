@@ -1,0 +1,43 @@
+#!/bin/sh
+
+PING_TARGET="1.1.1.1"
+
+WAN_DEV="eth1"
+IFB_DEV="ifb-eth1"
+
+WAN_CLASS="1:1"
+IFB_CLASS="1:1"
+
+BASE_UP=45000
+BASE_DOWN=90000
+
+MIN_UP=25000
+MIN_DOWN=50000
+
+MULT=2000   # each 1ms jitter reduces rate by 2mbit
+
+while true
+do
+    OUT="$(ping -c 5 -q "$PING_TARGET" 2>/dev/null)"
+
+    MIN="$(echo "$OUT" | awk -F'/' '/round-trip|rtt/ {print int($4)}')"
+    MAX="$(echo "$OUT" | awk -F'/' '/round-trip|rtt/ {print int($6)}')"
+
+    [ -z "$MIN" ] && sleep 2 && continue
+    [ -z "$MAX" ] && sleep 2 && continue
+
+    JITTER=$((MAX - MIN))
+
+    NEW_UP=$((BASE_UP - (JITTER * MULT / 1000)))
+    NEW_DOWN=$((BASE_DOWN - (JITTER * MULT / 1000)))
+
+    [ "$NEW_UP" -lt "$MIN_UP" ] && NEW_UP="$MIN_UP"
+    [ "$NEW_DOWN" -lt "$MIN_DOWN" ] && NEW_DOWN="$MIN_DOWN"
+
+    echo "jitter=${JITTER}ms up=${NEW_UP}kbit down=${NEW_DOWN}kbit"
+
+    tc class change dev "$WAN_DEV" classid "$WAN_CLASS" hfsc sc rate "${NEW_UP}kbit" ul rate "${NEW_UP}kbit" 2>/dev/null
+    tc class change dev "$IFB_DEV" classid "$IFB_CLASS" hfsc sc rate "${NEW_DOWN}kbit" ul rate "${NEW_DOWN}kbit" 2>/dev/null
+
+    sleep 5
+done
