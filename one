@@ -10,16 +10,19 @@ SLEEP_SEC=1
 BASE_GAME_UP=8500
 BASE_GAME_DOWN=12000
 
-MAX_GAME_UP=18000
-MAX_GAME_DOWN=24000
+MAX_GAME_UP=15000
+MAX_GAME_DOWN=20000
 
 MIN_GAME_UP=5000
 MIN_GAME_DOWN=8000
 
 BOOST=0
-BOOST_STEP=1000
-BOOST_DECAY=500
-MAX_BOOST=10000
+BOOST_STEP=500
+BOOST_DECAY=1500
+MAX_BOOST=7000
+
+DROP_THRESHOLD=-20
+BURST_THRESHOLD=20
 
 get_pkts() {
     DEV="$1"
@@ -67,17 +70,15 @@ do
         DIFF=0
     fi
 
-    REGIME="steady"
-
     if [ "$TOTAL_DELTA" -eq 0 ]; then
-        REGIME="quiet/stall"
-        BOOST=$((BOOST + BOOST_STEP))
-    elif [ "$DIFF" -gt 20 ]; then
-        REGIME="burst/catchup"
+        REGIME="idle/no-flow"
         BOOST=$((BOOST - BOOST_DECAY))
-    elif [ "$DIFF" -lt -20 ]; then
+    elif [ "$DIFF" -lt "$DROP_THRESHOLD" ]; then
         REGIME="dropoff/late"
         BOOST=$((BOOST + BOOST_STEP))
+    elif [ "$DIFF" -gt "$BURST_THRESHOLD" ]; then
+        REGIME="burst/catchup"
+        BOOST=$((BOOST - BOOST_DECAY))
     else
         REGIME="steady"
         BOOST=$((BOOST - BOOST_DECAY))
