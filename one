@@ -17,11 +17,11 @@ MIN_DOWN=85000
 MAX_UP=85000
 MAX_DOWN=120000
 
-DROP_PER_MS=500
-SLEEP_SEC=5
+DROP_PER_MS=750
+SLEEP_SEC=2
 
 SMOOTH_JITTER=0
-ALPHA_NUM=7
+ALPHA_NUM=4
 ALPHA_DEN=10
 
 has_class() {
@@ -30,7 +30,6 @@ has_class() {
 
 get_ping_jitter() {
     OUT="$(ping -c 5 -q "$PING_TARGET" 2>/dev/null)"
-
     RTT_LINE="$(echo "$OUT" | grep -E 'round-trip|rtt')"
 
     [ -z "$RTT_LINE" ] && echo "" && return
@@ -52,13 +51,14 @@ do
 
     [ -z "$JITTER" ] && echo "ping parse failed" && sleep "$SLEEP_SEC" && continue
 
-    # EWMA smoothing:
-    # smooth = 0.7 old + 0.3 new
+    # More reactive EWMA:
+    # smooth = 0.4 old + 0.6 new
     SMOOTH_JITTER=$(((SMOOTH_JITTER * ALPHA_NUM + JITTER * (ALPHA_DEN - ALPHA_NUM)) / ALPHA_DEN))
 
-    # Deadband: ignore tiny jitter
     EFFECTIVE_JITTER="$SMOOTH_JITTER"
-    [ "$EFFECTIVE_JITTER" -lt 3 ] && EFFECTIVE_JITTER=0
+
+    # Small deadband only
+    [ "$EFFECTIVE_JITTER" -lt 1 ] && EFFECTIVE_JITTER=0
 
     NEW_UP=$((BASE_UP - (EFFECTIVE_JITTER * DROP_PER_MS)))
     NEW_DOWN=$((BASE_DOWN - (EFFECTIVE_JITTER * DROP_PER_MS)))
@@ -69,7 +69,7 @@ do
     [ "$NEW_UP" -gt "$MAX_UP" ] && NEW_UP="$MAX_UP"
     [ "$NEW_DOWN" -gt "$MAX_DOWN" ] && NEW_DOWN="$MAX_DOWN"
 
-    echo "raw_jitter=${JITTER}ms smooth=${SMOOTH_JITTER}ms up=${NEW_UP}kbit down=${NEW_DOWN}kbit"
+    echo "raw_jitter=${JITTER}ms smooth=${SMOOTH_JITTER}ms effective=${EFFECTIVE_JITTER}ms up=${NEW_UP}kbit down=${NEW_DOWN}kbit"
 
     if has_class "$WAN_DEV" "$WAN_CLASS"; then
         tc class change dev "$WAN_DEV" classid "$WAN_CLASS" \
