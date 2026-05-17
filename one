@@ -21,8 +21,6 @@ DROP_PER_MS=750
 SLEEP_SEC=2
 
 SMOOTH_JITTER=0
-ALPHA_NUM=4
-ALPHA_DEN=10
 
 has_class() {
     tc class show dev "$1" 2>/dev/null | grep -q "class hfsc $2"
@@ -51,14 +49,15 @@ do
 
     [ -z "$JITTER" ] && echo "ping parse failed" && sleep "$SLEEP_SEC" && continue
 
-    # More reactive EWMA:
-    # smooth = 0.4 old + 0.6 new
-    SMOOTH_JITTER=$(((SMOOTH_JITTER * ALPHA_NUM + JITTER * (ALPHA_DEN - ALPHA_NUM)) / ALPHA_DEN))
+    # Microburst-style memory:
+    # jumps up fast, decays gradually
+    if [ "$JITTER" -gt "$SMOOTH_JITTER" ]; then
+        SMOOTH_JITTER="$JITTER"
+    else
+        SMOOTH_JITTER=$(( (SMOOTH_JITTER + JITTER) / 2 ))
+    fi
 
     EFFECTIVE_JITTER="$SMOOTH_JITTER"
-
-    # Small deadband only
-    [ "$EFFECTIVE_JITTER" -lt 1 ] && EFFECTIVE_JITTER=0
 
     NEW_UP=$((BASE_UP - (EFFECTIVE_JITTER * DROP_PER_MS)))
     NEW_DOWN=$((BASE_DOWN - (EFFECTIVE_JITTER * DROP_PER_MS)))
@@ -69,7 +68,7 @@ do
     [ "$NEW_UP" -gt "$MAX_UP" ] && NEW_UP="$MAX_UP"
     [ "$NEW_DOWN" -gt "$MAX_DOWN" ] && NEW_DOWN="$MAX_DOWN"
 
-    echo "raw_jitter=${JITTER}ms smooth=${SMOOTH_JITTER}ms effective=${EFFECTIVE_JITTER}ms up=${NEW_UP}kbit down=${NEW_DOWN}kbit"
+    echo "raw_jitter=${JITTER}ms effective=${EFFECTIVE_JITTER}ms up=${NEW_UP}kbit down=${NEW_DOWN}kbit"
 
     if has_class "$WAN_DEV" "$WAN_CLASS"; then
         tc class change dev "$WAN_DEV" classid "$WAN_CLASS" \
