@@ -2,7 +2,6 @@
 
 WAN_DEV="eth1"
 IFB_DEV="ifb-eth1"
-
 GAME_CLASS="1:15"
 
 SLEEP_SEC=1
@@ -10,19 +9,21 @@ SLEEP_SEC=1
 BASE_GAME_UP=8500
 BASE_GAME_DOWN=12000
 
-MAX_GAME_UP=15000
-MAX_GAME_DOWN=20000
+MAX_GAME_UP=16000
+MAX_GAME_DOWN=22000
 
 MIN_GAME_UP=5000
 MIN_GAME_DOWN=8000
 
+# continuous controller knobs
 BOOST=0
-BOOST_STEP=500
-BOOST_DECAY=1500
-MAX_BOOST=7000
+MAX_BOOST=8000
 
-DROP_THRESHOLD=-20
-BURST_THRESHOLD=20
+MEMORY_NUM=8
+MEMORY_DEN=10
+
+FACTOR=250
+BASE_PULSE=150
 
 get_pkts() {
     DEV="$1"
@@ -48,8 +49,6 @@ has_class() {
     tc class show dev "$1" 2>/dev/null | grep -q "class hfsc $2"
 }
 
-LAST_WAN=0
-LAST_IFB=0
 LAST_TOTAL=0
 
 while true
@@ -60,29 +59,27 @@ do
     [ -z "$WAN_PKTS" ] && WAN_PKTS=0
     [ -z "$IFB_PKTS" ] && IFB_PKTS=0
 
-    WAN_DELTA=$((WAN_PKTS - LAST_WAN))
-    IFB_DELTA=$((IFB_PKTS - LAST_IFB))
-    TOTAL_DELTA=$((WAN_DELTA + IFB_DELTA))
+    TOTAL=$((WAN_PKTS + IFB_PKTS))
+    DELTA=$((TOTAL - LAST_TOTAL))
 
-    if [ "$LAST_TOTAL" -gt 0 ]; then
-        DIFF=$((TOTAL_DELTA - LAST_TOTAL))
+    # cadence pressure:
+    # lower packet flow = more obligation
+    # higher packet flow = less obligation
+    if [ "$DELTA" -le 0 ]; then
+        SIGNAL=8
+    elif [ "$DELTA" -lt 5 ]; then
+        SIGNAL=5
+    elif [ "$DELTA" -lt 15 ]; then
+        SIGNAL=3
     else
-        DIFF=0
+        SIGNAL=1
     fi
 
-    if [ "$TOTAL_DELTA" -eq 0 ]; then
-        REGIME="idle/no-flow"
-        BOOST=$((BOOST - BOOST_DECAY))
-    elif [ "$DIFF" -lt "$DROP_THRESHOLD" ]; then
-        REGIME="dropoff/late"
-        BOOST=$((BOOST + BOOST_STEP))
-    elif [ "$DIFF" -gt "$BURST_THRESHOLD" ]; then
-        REGIME="burst/catchup"
-        BOOST=$((BOOST - BOOST_DECAY))
-    else
-        REGIME="steady"
-        BOOST=$((BOOST - BOOST_DECAY))
-    fi
+    TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
+
+    # continuous boost:
+    # boost = 0.8 old + 0.2 target
+    BOOST=$(((BOOST * MEMORY_NUM + TARGET * (MEMORY_DEN - MEMORY_NUM)) / MEMORY_DEN))
 
     [ "$BOOST" -lt 0 ] && BOOST=0
     [ "$BOOST" -gt "$MAX_BOOST" ] && BOOST="$MAX_BOOST"
@@ -96,7 +93,7 @@ do
     [ "$NEW_GAME_UP" -gt "$MAX_GAME_UP" ] && NEW_GAME_UP="$MAX_GAME_UP"
     [ "$NEW_GAME_DOWN" -gt "$MAX_GAME_DOWN" ] && NEW_GAME_DOWN="$MAX_GAME_DOWN"
 
-    echo "wan=$WAN_DELTA ifb=$IFB_DELTA total=$TOTAL_DELTA diff=$DIFF regime=$REGIME boost=$BOOST up=$NEW_GAME_UP down=$NEW_GAME_DOWN"
+    echo "delta=$DELTA signal=$SIGNAL target=$TARGET boost=$BOOST up=$NEW_GAME_UP down=$NEW_GAME_DOWN"
 
     if has_class "$WAN_DEV" "$GAME_CLASS"; then
         tc class change dev "$WAN_DEV" classid "$GAME_CLASS" \
@@ -108,9 +105,7 @@ do
             hfsc ls rate "${NEW_GAME_DOWN}kbit" ul rate "${NEW_GAME_DOWN}kbit"
     fi
 
-    LAST_WAN="$WAN_PKTS"
-    LAST_IFB="$IFB_PKTS"
-    LAST_TOTAL="$TOTAL_DELTA"
+    LAST_TOTAL="$TOTAL"
 
     sleep "$SLEEP_SEC"
 done
