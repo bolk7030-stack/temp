@@ -20,17 +20,17 @@ BOOST=0
 SPIKE=0
 AVG_DELTA=0
 
-# smoother baseline authority
-FACTOR=220
-BASE_PULSE=120
-MAX_BOOST=5000
+# Warm baseline / invoked authority
+FACTOR=260
+BASE_PULSE=180
+MAX_BOOST=5500
 MEMORY_NUM=6
 MEMORY_DEN=10
 
-# lighter quick-step pulse
-SPIKE_STEP=500
-SPIKE_DECAY=1200
-MAX_SPIKE=1200
+# Quick-step impulse
+SPIKE_STEP=700
+SPIKE_DECAY=1000
+MAX_SPIKE=1600
 
 get_pkts() {
     DEV="$1"
@@ -69,17 +69,19 @@ do
     TOTAL=$((WAN_PKTS + IFB_PKTS))
     DELTA=$((TOTAL - LAST_TOTAL))
 
-    # rolling cadence memory
     AVG_DELTA=$(((AVG_DELTA * 7 + DELTA * 3) / 10))
 
     if [ "$DELTA" -le 0 ]; then
-        # no detected flow: do NOT boost
-        SIGNAL=0
-        TARGET=0
-        BOOST=$((BOOST / 2))
-        SPIKE=0
+        # Quiet does NOT kill authority anymore.
+        # Keeps a warm ignition bias.
+        SIGNAL=2
+        TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
+
+        BOOST=$(((BOOST * MEMORY_NUM + TARGET * (MEMORY_DEN - MEMORY_NUM)) / MEMORY_DEN))
+
+        # Spike cools but does not hard-reset.
+        SPIKE=$((SPIKE / 2))
     else
-        # deficit = how far current cadence is below recent cadence
         DEFICIT=$((AVG_DELTA - DELTA))
         [ "$DEFICIT" -lt 0 ] && DEFICIT=0
 
@@ -88,7 +90,7 @@ do
 
         BOOST=$(((BOOST * MEMORY_NUM + TARGET * (MEMORY_DEN - MEMORY_NUM)) / MEMORY_DEN))
 
-        # quick-step only when active flow is low/fragile
+        # Quick-step only when flow is active but cadence is low.
         if [ "$DELTA" -lt 8 ]; then
             SPIKE=$((SPIKE + SPIKE_STEP))
         else
@@ -111,7 +113,7 @@ do
     [ "$NEW_GAME_UP" -gt "$MAX_GAME_UP" ] && NEW_GAME_UP="$MAX_GAME_UP"
     [ "$NEW_GAME_DOWN" -gt "$MAX_GAME_DOWN" ] && NEW_GAME_DOWN="$MAX_GAME_DOWN"
 
-    echo "delta=$DELTA avg=$AVG_DELTA signal=$SIGNAL boost=$BOOST spike=$SPIKE up=$NEW_GAME_UP down=$NEW_GAME_DOWN"
+    echo "delta=$DELTA avg=$AVG_DELTA signal=$SIGNAL target=$TARGET boost=$BOOST spike=$SPIKE up=$NEW_GAME_UP down=$NEW_GAME_DOWN"
 
     if has_class "$WAN_DEV" "$GAME_CLASS"; then
         tc class change dev "$WAN_DEV" classid "$GAME_CLASS" \
