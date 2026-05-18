@@ -18,17 +18,17 @@ MIN_GAME_DOWN=8000
 
 # Smooth baseline authority
 BOOST=0
-MAX_BOOST=6500
-FACTOR=120
-BASE_PULSE=50
-MEMORY_NUM=6
+MAX_BOOST=4500
+FACTOR=150
+BASE_PULSE=80
+MEMORY_NUM=7
 MEMORY_DEN=10
 
-# Short impulse / burst authority
+# Short impulse / quick-step authority
 SPIKE=0
-SPIKE_STEP=1800
-SPIKE_DECAY=700
-MAX_SPIKE=3000
+SPIKE_STEP=600
+SPIKE_DECAY=900
+MAX_SPIKE=1400
 
 get_pkts() {
     DEV="$1"
@@ -69,7 +69,7 @@ do
 
     # Obligation signal from packet cadence
     if [ "$DELTA" -le 0 ]; then
-        SIGNAL=6
+        SIGNAL=4
     elif [ "$DELTA" -lt 5 ]; then
         SIGNAL=5
     elif [ "$DELTA" -lt 15 ]; then
@@ -81,15 +81,15 @@ do
     TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
 
     # Smooth baseline controller:
-    # BOOST = 0.6 old + 0.4 target
+    # BOOST = 0.7 old + 0.3 target
     BOOST=$(((BOOST * MEMORY_NUM + TARGET * (MEMORY_DEN - MEMORY_NUM)) / MEMORY_DEN))
 
     [ "$BOOST" -lt 0 ] && BOOST=0
     [ "$BOOST" -gt "$MAX_BOOST" ] && BOOST="$MAX_BOOST"
 
     # Impulse layer:
-    # quick burst when cadence is quiet/low, fast decay otherwise
-    if [ "$DELTA" -le 1 ]; then
+    # small quick-step burst only when game flow is active but cadence is low
+    if [ "$DELTA" -gt 0 ] && [ "$DELTA" -lt 8 ]; then
         SPIKE=$((SPIKE + SPIKE_STEP))
     else
         SPIKE=$((SPIKE - SPIKE_DECAY))
