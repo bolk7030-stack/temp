@@ -2,6 +2,7 @@
 
 WAN_DEV="eth1"
 IFB_DEV="ifb-eth1"
+
 GAME_CLASS="1:15"
 
 SLEEP_SEC=1
@@ -9,21 +10,25 @@ SLEEP_SEC=1
 BASE_GAME_UP=8500
 BASE_GAME_DOWN=12000
 
-MAX_GAME_UP=16000
-MAX_GAME_DOWN=22000
+MAX_GAME_UP=18000
+MAX_GAME_DOWN=24000
 
 MIN_GAME_UP=5000
 MIN_GAME_DOWN=8000
 
-# continuous controller knobs
+# Smooth baseline authority
 BOOST=0
-MAX_BOOST=8000
-
-MEMORY_NUM=8
+MAX_BOOST=6500
+FACTOR=120
+BASE_PULSE=50
+MEMORY_NUM=6
 MEMORY_DEN=10
 
-FACTOR=250
-BASE_PULSE=150
+# Short impulse / burst authority
+SPIKE=0
+SPIKE_STEP=1800
+SPIKE_DECAY=700
+MAX_SPIKE=3000
 
 get_pkts() {
     DEV="$1"
@@ -62,11 +67,9 @@ do
     TOTAL=$((WAN_PKTS + IFB_PKTS))
     DELTA=$((TOTAL - LAST_TOTAL))
 
-    # cadence pressure:
-    # lower packet flow = more obligation
-    # higher packet flow = less obligation
+    # Obligation signal from packet cadence
     if [ "$DELTA" -le 0 ]; then
-        SIGNAL=8
+        SIGNAL=6
     elif [ "$DELTA" -lt 5 ]; then
         SIGNAL=5
     elif [ "$DELTA" -lt 15 ]; then
@@ -77,15 +80,26 @@ do
 
     TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
 
-    # continuous boost:
-    # boost = 0.8 old + 0.2 target
+    # Smooth baseline controller:
+    # BOOST = 0.6 old + 0.4 target
     BOOST=$(((BOOST * MEMORY_NUM + TARGET * (MEMORY_DEN - MEMORY_NUM)) / MEMORY_DEN))
 
     [ "$BOOST" -lt 0 ] && BOOST=0
     [ "$BOOST" -gt "$MAX_BOOST" ] && BOOST="$MAX_BOOST"
 
-    NEW_GAME_UP=$((BASE_GAME_UP + BOOST))
-    NEW_GAME_DOWN=$((BASE_GAME_DOWN + BOOST))
+    # Impulse layer:
+    # quick burst when cadence is quiet/low, fast decay otherwise
+    if [ "$DELTA" -le 1 ]; then
+        SPIKE=$((SPIKE + SPIKE_STEP))
+    else
+        SPIKE=$((SPIKE - SPIKE_DECAY))
+    fi
+
+    [ "$SPIKE" -lt 0 ] && SPIKE=0
+    [ "$SPIKE" -gt "$MAX_SPIKE" ] && SPIKE="$MAX_SPIKE"
+
+    NEW_GAME_UP=$((BASE_GAME_UP + BOOST + SPIKE))
+    NEW_GAME_DOWN=$((BASE_GAME_DOWN + BOOST + SPIKE))
 
     [ "$NEW_GAME_UP" -lt "$MIN_GAME_UP" ] && NEW_GAME_UP="$MIN_GAME_UP"
     [ "$NEW_GAME_DOWN" -lt "$MIN_GAME_DOWN" ] && NEW_GAME_DOWN="$MIN_GAME_DOWN"
@@ -93,7 +107,7 @@ do
     [ "$NEW_GAME_UP" -gt "$MAX_GAME_UP" ] && NEW_GAME_UP="$MAX_GAME_UP"
     [ "$NEW_GAME_DOWN" -gt "$MAX_GAME_DOWN" ] && NEW_GAME_DOWN="$MAX_GAME_DOWN"
 
-    echo "delta=$DELTA signal=$SIGNAL target=$TARGET boost=$BOOST up=$NEW_GAME_UP down=$NEW_GAME_DOWN"
+    echo "delta=$DELTA signal=$SIGNAL target=$TARGET boost=$BOOST spike=$SPIKE up=$NEW_GAME_UP down=$NEW_GAME_DOWN"
 
     if has_class "$WAN_DEV" "$GAME_CLASS"; then
         tc class change dev "$WAN_DEV" classid "$GAME_CLASS" \
