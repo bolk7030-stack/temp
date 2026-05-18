@@ -16,19 +16,21 @@ MAX_GAME_DOWN=24000
 MIN_GAME_UP=5000
 MIN_GAME_DOWN=8000
 
-# Smooth baseline authority
 BOOST=0
-MAX_BOOST=4500
-FACTOR=150
-BASE_PULSE=80
-MEMORY_NUM=7
+SPIKE=0
+AVG_DELTA=0
+
+# smoother baseline authority
+FACTOR=220
+BASE_PULSE=120
+MAX_BOOST=5000
+MEMORY_NUM=6
 MEMORY_DEN=10
 
-# Short impulse / quick-step authority
-SPIKE=0
-SPIKE_STEP=600
-SPIKE_DECAY=900
-MAX_SPIKE=1400
+# lighter quick-step pulse
+SPIKE_STEP=500
+SPIKE_DECAY=1200
+MAX_SPIKE=1200
 
 get_pkts() {
     DEV="$1"
@@ -67,33 +69,35 @@ do
     TOTAL=$((WAN_PKTS + IFB_PKTS))
     DELTA=$((TOTAL - LAST_TOTAL))
 
-    # Obligation signal from packet cadence
+    # rolling cadence memory
+    AVG_DELTA=$(((AVG_DELTA * 7 + DELTA * 3) / 10))
+
     if [ "$DELTA" -le 0 ]; then
-        SIGNAL=4
-    elif [ "$DELTA" -lt 5 ]; then
-        SIGNAL=5
-    elif [ "$DELTA" -lt 15 ]; then
-        SIGNAL=3
+        # no detected flow: do NOT boost
+        SIGNAL=0
+        TARGET=0
+        BOOST=$((BOOST / 2))
+        SPIKE=0
     else
-        SIGNAL=1
+        # deficit = how far current cadence is below recent cadence
+        DEFICIT=$((AVG_DELTA - DELTA))
+        [ "$DEFICIT" -lt 0 ] && DEFICIT=0
+
+        SIGNAL=$((DEFICIT + 1))
+        TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
+
+        BOOST=$(((BOOST * MEMORY_NUM + TARGET * (MEMORY_DEN - MEMORY_NUM)) / MEMORY_DEN))
+
+        # quick-step only when active flow is low/fragile
+        if [ "$DELTA" -lt 8 ]; then
+            SPIKE=$((SPIKE + SPIKE_STEP))
+        else
+            SPIKE=$((SPIKE - SPIKE_DECAY))
+        fi
     fi
-
-    TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
-
-    # Smooth baseline controller:
-    # BOOST = 0.7 old + 0.3 target
-    BOOST=$(((BOOST * MEMORY_NUM + TARGET * (MEMORY_DEN - MEMORY_NUM)) / MEMORY_DEN))
 
     [ "$BOOST" -lt 0 ] && BOOST=0
     [ "$BOOST" -gt "$MAX_BOOST" ] && BOOST="$MAX_BOOST"
-
-    # Impulse layer:
-    # small quick-step burst only when game flow is active but cadence is low
-    if [ "$DELTA" -gt 0 ] && [ "$DELTA" -lt 8 ]; then
-        SPIKE=$((SPIKE + SPIKE_STEP))
-    else
-        SPIKE=$((SPIKE - SPIKE_DECAY))
-    fi
 
     [ "$SPIKE" -lt 0 ] && SPIKE=0
     [ "$SPIKE" -gt "$MAX_SPIKE" ] && SPIKE="$MAX_SPIKE"
@@ -107,7 +111,7 @@ do
     [ "$NEW_GAME_UP" -gt "$MAX_GAME_UP" ] && NEW_GAME_UP="$MAX_GAME_UP"
     [ "$NEW_GAME_DOWN" -gt "$MAX_GAME_DOWN" ] && NEW_GAME_DOWN="$MAX_GAME_DOWN"
 
-    echo "delta=$DELTA signal=$SIGNAL target=$TARGET boost=$BOOST spike=$SPIKE up=$NEW_GAME_UP down=$NEW_GAME_DOWN"
+    echo "delta=$DELTA avg=$AVG_DELTA signal=$SIGNAL boost=$BOOST spike=$SPIKE up=$NEW_GAME_UP down=$NEW_GAME_DOWN"
 
     if has_class "$WAN_DEV" "$GAME_CLASS"; then
         tc class change dev "$WAN_DEV" classid "$GAME_CLASS" \
