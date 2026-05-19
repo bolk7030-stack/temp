@@ -14,6 +14,7 @@ MAX_GAME_DOWN=20000
 MIN_GAME_UP=5000
 MIN_GAME_DOWN=8000
 
+# Core controller
 BOOST=0
 AVG_DELTA=0
 
@@ -24,11 +25,16 @@ MAX_BOOST=3000
 MEMORY_NUM=8
 MEMORY_DEN=10
 
-# Leaky-hold apply
-UP_APPLY_THRESHOLD=250
-DOWN_APPLY_THRESHOLD=700
-DOWN_RELEASE_STEP=300
+# Persistence filter
+DEFICIT_DEADBAND=5
+PERSIST_REQUIRED=2
+RECOVER_REQUIRED=4
 
+BAD_COUNT=0
+GOOD_COUNT=0
+
+# Event-triggered apply
+APPLY_THRESHOLD=250
 LAST_APPLIED_UP=0
 LAST_APPLIED_DOWN=0
 
@@ -56,7 +62,16 @@ has_class() {
     tc class show dev "$1" 2>/dev/null | grep -q "class hfsc $2"
 }
 
+absdiff() {
+    A="$1"
+    B="$2"
+    D=$((A - B))
+    [ "$D" -lt 0 ] && D=$((0 - D))
+    echo "$D"
+}
+
 LAST_TOTAL=0
+SEEDED=0
 
 while true
 do
@@ -67,15 +82,67 @@ do
     [ -z "$IFB_PKTS" ] && IFB_PKTS=0
 
     TOTAL=$((WAN_PKTS + IFB_PKTS))
+
+    if [ "$SEEDED" -eq 0 ]; then
+        LAST_TOTAL="$TOTAL"
+        AVG_DELTA=0
+        SEEDED=1
+        echo "seed total=$TOTAL"
+        sleep "$SLEEP_SEC"
+        continue
+    fi
+
     DELTA=$((TOTAL - LAST_TOTAL))
 
+    if [ "$DELTA" -lt 0 ]; then
+        DELTA=0
+        AVG_DELTA=0
+        BAD_COUNT=0
+        GOOD_COUNT=0
+        echo "counter-reset detected total=$TOTAL last=$LAST_TOTAL"
+    fi
+
+    # Compare current delta against PRIOR expectation
+    EXPECTED="$AVG_DELTA"
+
+    # Then update memory after preserving the prior expectation
     AVG_DELTA=$(((AVG_DELTA * 7 + DELTA * 3) / 10))
 
-    DEFICIT=$((AVG_DELTA - DELTA))
-    [ "$DEFICIT" -lt 0 ] && DEFICIT=0
+    # Avoid false deficit before memory has formed
+    if [ "$EXPECTED" -eq 0 ]; then
+        DEFICIT=0
+    else
+        DEFICIT=$((EXPECTED - DELTA))
+        [ "$DEFICIT" -lt 0 ] && DEFICIT=0
+    fi
 
-    SIGNAL=$((DEFICIT + 2))
-    TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
+    if [ "$DEFICIT" -le "$DEFICIT_DEADBAND" ]; then
+        EFFECTIVE_DEFICIT=0
+    else
+        EFFECTIVE_DEFICIT="$DEFICIT"
+    fi
+
+    if [ "$EFFECTIVE_DEFICIT" -gt 0 ]; then
+        BAD_COUNT=$((BAD_COUNT + 1))
+        GOOD_COUNT=0
+    else
+        GOOD_COUNT=$((GOOD_COUNT + 1))
+        BAD_COUNT=0
+    fi
+
+    if [ "$BAD_COUNT" -ge "$PERSIST_REQUIRED" ]; then
+        SIGNAL=$((EFFECTIVE_DEFICIT + 2))
+        TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
+        MODE="authority-hold"
+    elif [ "$GOOD_COUNT" -ge "$RECOVER_REQUIRED" ]; then
+        SIGNAL=1
+        TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
+        MODE="release"
+    else
+        SIGNAL=2
+        TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
+        MODE="warm"
+    fi
 
     BOOST=$(((BOOST * MEMORY_NUM + TARGET * (MEMORY_DEN - MEMORY_NUM)) / MEMORY_DEN))
 
@@ -91,68 +158,31 @@ do
     [ "$DESIRED_UP" -gt "$MAX_GAME_UP" ] && DESIRED_UP="$MAX_GAME_UP"
     [ "$DESIRED_DOWN" -gt "$MAX_GAME_DOWN" ] && DESIRED_DOWN="$MAX_GAME_DOWN"
 
-    if [ "$LAST_APPLIED_UP" -eq 0 ]; then
-        LAST_APPLIED_UP="$DESIRED_UP"
-    fi
-
-    if [ "$LAST_APPLIED_DOWN" -eq 0 ]; then
-        LAST_APPLIED_DOWN="$DESIRED_DOWN"
-    fi
-
-    APPLY_UP="$LAST_APPLIED_UP"
-    APPLY_DOWN="$LAST_APPLIED_DOWN"
-
-    # Rise fast
-    if [ "$DESIRED_UP" -gt "$LAST_APPLIED_UP" ]; then
-        DIFF=$((DESIRED_UP - LAST_APPLIED_UP))
-        if [ "$DIFF" -ge "$UP_APPLY_THRESHOLD" ]; then
-            APPLY_UP="$DESIRED_UP"
-        fi
-    fi
-
-    if [ "$DESIRED_DOWN" -gt "$LAST_APPLIED_DOWN" ]; then
-        DIFF=$((DESIRED_DOWN - LAST_APPLIED_DOWN))
-        if [ "$DIFF" -ge "$UP_APPLY_THRESHOLD" ]; then
-            APPLY_DOWN="$DESIRED_DOWN"
-        fi
-    fi
-
-    # Release slow
-    if [ "$DESIRED_UP" -lt "$LAST_APPLIED_UP" ]; then
-        DIFF=$((LAST_APPLIED_UP - DESIRED_UP))
-        if [ "$DIFF" -ge "$DOWN_APPLY_THRESHOLD" ]; then
-            APPLY_UP=$((LAST_APPLIED_UP - DOWN_RELEASE_STEP))
-            [ "$APPLY_UP" -lt "$DESIRED_UP" ] && APPLY_UP="$DESIRED_UP"
-        fi
-    fi
-
-    if [ "$DESIRED_DOWN" -lt "$LAST_APPLIED_DOWN" ]; then
-        DIFF=$((LAST_APPLIED_DOWN - DESIRED_DOWN))
-        if [ "$DIFF" -ge "$DOWN_APPLY_THRESHOLD" ]; then
-            APPLY_DOWN=$((LAST_APPLIED_DOWN - DOWN_RELEASE_STEP))
-            [ "$APPLY_DOWN" -lt "$DESIRED_DOWN" ] && APPLY_DOWN="$DESIRED_DOWN"
-        fi
-    fi
+    UP_DIFF="$(absdiff "$DESIRED_UP" "$LAST_APPLIED_UP")"
+    DOWN_DIFF="$(absdiff "$DESIRED_DOWN" "$LAST_APPLIED_DOWN")"
 
     SHOULD_APPLY=0
-    [ "$APPLY_UP" -ne "$LAST_APPLIED_UP" ] && SHOULD_APPLY=1
-    [ "$APPLY_DOWN" -ne "$LAST_APPLIED_DOWN" ] && SHOULD_APPLY=1
+    if [ "$LAST_APPLIED_UP" -eq 0 ] || [ "$LAST_APPLIED_DOWN" -eq 0 ]; then
+        SHOULD_APPLY=1
+    elif [ "$UP_DIFF" -ge "$APPLY_THRESHOLD" ] || [ "$DOWN_DIFF" -ge "$APPLY_THRESHOLD" ]; then
+        SHOULD_APPLY=1
+    fi
 
-    echo "delta=$DELTA avg=$AVG_DELTA deficit=$DEFICIT boost=$BOOST desired_up=$DESIRED_UP desired_down=$DESIRED_DOWN apply_up=$APPLY_UP apply_down=$APPLY_DOWN apply=$SHOULD_APPLY"
+    echo "delta=$DELTA expected=$EXPECTED avg=$AVG_DELTA deficit=$DEFICIT eff=$EFFECTIVE_DEFICIT bad=$BAD_COUNT good=$GOOD_COUNT mode=$MODE target=$TARGET boost=$BOOST up=$DESIRED_UP down=$DESIRED_DOWN apply=$SHOULD_APPLY"
 
     if [ "$SHOULD_APPLY" -eq 1 ]; then
         if has_class "$WAN_DEV" "$GAME_CLASS"; then
             tc class change dev "$WAN_DEV" classid "$GAME_CLASS" \
-                hfsc ls rate "${APPLY_UP}kbit" ul rate "${APPLY_UP}kbit"
+                hfsc ls rate "${DESIRED_UP}kbit" ul rate "${DESIRED_UP}kbit"
         fi
 
         if has_class "$IFB_DEV" "$GAME_CLASS"; then
             tc class change dev "$IFB_DEV" classid "$GAME_CLASS" \
-                hfsc ls rate "${APPLY_DOWN}kbit" ul rate "${APPLY_DOWN}kbit"
+                hfsc ls rate "${DESIRED_DOWN}kbit" ul rate "${DESIRED_DOWN}kbit"
         fi
 
-        LAST_APPLIED_UP="$APPLY_UP"
-        LAST_APPLIED_DOWN="$APPLY_DOWN"
+        LAST_APPLIED_UP="$DESIRED_UP"
+        LAST_APPLIED_DOWN="$DESIRED_DOWN"
     fi
 
     LAST_TOTAL="$TOTAL"
