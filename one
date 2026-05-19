@@ -10,27 +10,25 @@ SLEEP_SEC=1
 BASE_GAME_UP=8500
 BASE_GAME_DOWN=12000
 
-MAX_GAME_UP=18000
-MAX_GAME_DOWN=24000
+MAX_GAME_UP=15000
+MAX_GAME_DOWN=20000
 
 MIN_GAME_UP=5000
 MIN_GAME_DOWN=8000
 
+# Continuous authority controller
 BOOST=0
-SPIKE=0
 AVG_DELTA=0
 
-# Warm baseline / invoked authority
-FACTOR=260
-BASE_PULSE=180
-MAX_BOOST=5500
-MEMORY_NUM=6
-MEMORY_DEN=10
+# proactive tuning
+FACTOR=180
+BASE_PULSE=300
+MAX_BOOST=3000
 
-# Quick-step impulse
-SPIKE_STEP=700
-SPIKE_DECAY=1000
-MAX_SPIKE=1600
+# smooth memory:
+# BOOST = 0.8 old + 0.2 target
+MEMORY_NUM=8
+MEMORY_DEN=10
 
 get_pkts() {
     DEV="$1"
@@ -60,6 +58,20 @@ LAST_TOTAL=0
 
 while true
 do
+    # --------------------------------------------------
+    # REAL-TIME SENSOR INPUT
+    # --------------------------------------------------
+    # Reads live packet counters from QoSmate HFSC class.
+    #
+    # This does NOT measure:
+    #   - ping
+    #   - actual EA server latency
+    #   - input lag directly
+    #
+    # It measures:
+    #   - packet cadence through game queue
+    # --------------------------------------------------
+
     WAN_PKTS="$(get_pkts "$WAN_DEV" "$GAME_CLASS")"
     IFB_PKTS="$(get_pkts "$IFB_DEV" "$GAME_CLASS")"
 
@@ -67,45 +79,65 @@ do
     [ -z "$IFB_PKTS" ] && IFB_PKTS=0
 
     TOTAL=$((WAN_PKTS + IFB_PKTS))
+
+    # packets this second
     DELTA=$((TOTAL - LAST_TOTAL))
 
+    # rolling cadence memory:
+    # 70% old + 30% new
     AVG_DELTA=$(((AVG_DELTA * 7 + DELTA * 3) / 10))
 
-    if [ "$DELTA" -le 0 ]; then
-        # Quiet does NOT kill authority anymore.
-        # Keeps a warm ignition bias.
-        SIGNAL=2
-        TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
+    # --------------------------------------------------
+    # PROACTIVE SIGNAL
+    # --------------------------------------------------
+    # If current cadence falls below recent cadence,
+    # build "authority pressure" BEFORE a hard stall.
+    # --------------------------------------------------
 
-        BOOST=$(((BOOST * MEMORY_NUM + TARGET * (MEMORY_DEN - MEMORY_NUM)) / MEMORY_DEN))
+    DEFICIT=$((AVG_DELTA - DELTA))
+    [ "$DEFICIT" -lt 0 ] && DEFICIT=0
 
-        # Spike cools but does not hard-reset.
-        SPIKE=$((SPIKE / 2))
-    else
-        DEFICIT=$((AVG_DELTA - DELTA))
-        [ "$DEFICIT" -lt 0 ] && DEFICIT=0
+    # warm continuous authority
+    SIGNAL=$((DEFICIT + 2))
 
-        SIGNAL=$((DEFICIT + 1))
-        TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
+    TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
 
-        BOOST=$(((BOOST * MEMORY_NUM + TARGET * (MEMORY_DEN - MEMORY_NUM)) / MEMORY_DEN))
+    # --------------------------------------------------
+    # CONTINUOUS CONTROLLER
+    # --------------------------------------------------
+    # BOOST moves gradually toward TARGET.
+    #
+    # Not discrete spikes.
+    # Not hard intervention.
+    # More like live queue pressure bias.
+    # --------------------------------------------------
 
-        # Quick-step only when flow is active but cadence is low.
-        if [ "$DELTA" -lt 8 ]; then
-            SPIKE=$((SPIKE + SPIKE_STEP))
-        else
-            SPIKE=$((SPIKE - SPIKE_DECAY))
-        fi
-    fi
+    BOOST=$(((BOOST * MEMORY_NUM + TARGET * (MEMORY_DEN - MEMORY_NUM)) / MEMORY_DEN))
 
     [ "$BOOST" -lt 0 ] && BOOST=0
     [ "$BOOST" -gt "$MAX_BOOST" ] && BOOST="$MAX_BOOST"
 
-    [ "$SPIKE" -lt 0 ] && SPIKE=0
-    [ "$SPIKE" -gt "$MAX_SPIKE" ] && SPIKE="$MAX_SPIKE"
+    # --------------------------------------------------
+    # LIVE OUTPUT
+    # --------------------------------------------------
+    # Dynamically changes HFSC game class allowance.
+    #
+    # Output action:
+    #   tc class change ...
+    #
+    # This influences:
+    #   - queue priority persistence
+    #   - scheduling continuity
+    #   - game traffic authority
+    #
+    # PACKETSIZE=150 helps because:
+    #   - less fragmented cadence
+    #   - smoother queue texture
+    #   - less discrete/choppy feel
+    # --------------------------------------------------
 
-    NEW_GAME_UP=$((BASE_GAME_UP + BOOST + SPIKE))
-    NEW_GAME_DOWN=$((BASE_GAME_DOWN + BOOST + SPIKE))
+    NEW_GAME_UP=$((BASE_GAME_UP + BOOST))
+    NEW_GAME_DOWN=$((BASE_GAME_DOWN + BOOST))
 
     [ "$NEW_GAME_UP" -lt "$MIN_GAME_UP" ] && NEW_GAME_UP="$MIN_GAME_UP"
     [ "$NEW_GAME_DOWN" -lt "$MIN_GAME_DOWN" ] && NEW_GAME_DOWN="$MIN_GAME_DOWN"
@@ -113,7 +145,7 @@ do
     [ "$NEW_GAME_UP" -gt "$MAX_GAME_UP" ] && NEW_GAME_UP="$MAX_GAME_UP"
     [ "$NEW_GAME_DOWN" -gt "$MAX_GAME_DOWN" ] && NEW_GAME_DOWN="$MAX_GAME_DOWN"
 
-    echo "delta=$DELTA avg=$AVG_DELTA signal=$SIGNAL target=$TARGET boost=$BOOST spike=$SPIKE up=$NEW_GAME_UP down=$NEW_GAME_DOWN"
+    echo "delta=$DELTA avg=$AVG_DELTA deficit=$DEFICIT signal=$SIGNAL target=$TARGET boost=$BOOST up=$NEW_GAME_UP down=$NEW_GAME_DOWN"
 
     if has_class "$WAN_DEV" "$GAME_CLASS"; then
         tc class change dev "$WAN_DEV" classid "$GAME_CLASS" \
