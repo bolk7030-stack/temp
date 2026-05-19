@@ -24,8 +24,11 @@ MAX_BOOST=3000
 MEMORY_NUM=8
 MEMORY_DEN=10
 
-# Event-triggered apply
-APPLY_THRESHOLD=400
+# Leaky-hold apply
+UP_APPLY_THRESHOLD=250
+DOWN_APPLY_THRESHOLD=700
+DOWN_RELEASE_STEP=300
+
 LAST_APPLIED_UP=0
 LAST_APPLIED_DOWN=0
 
@@ -51,14 +54,6 @@ get_pkts() {
 
 has_class() {
     tc class show dev "$1" 2>/dev/null | grep -q "class hfsc $2"
-}
-
-absdiff() {
-    A="$1"
-    B="$2"
-    D=$((A - B))
-    [ "$D" -lt 0 ] && D=$((0 - D))
-    echo "$D"
 }
 
 LAST_TOTAL=0
@@ -87,41 +82,77 @@ do
     [ "$BOOST" -lt 0 ] && BOOST=0
     [ "$BOOST" -gt "$MAX_BOOST" ] && BOOST="$MAX_BOOST"
 
-    NEW_GAME_UP=$((BASE_GAME_UP + BOOST))
-    NEW_GAME_DOWN=$((BASE_GAME_DOWN + BOOST))
+    DESIRED_UP=$((BASE_GAME_UP + BOOST))
+    DESIRED_DOWN=$((BASE_GAME_DOWN + BOOST))
 
-    [ "$NEW_GAME_UP" -lt "$MIN_GAME_UP" ] && NEW_GAME_UP="$MIN_GAME_UP"
-    [ "$NEW_GAME_DOWN" -lt "$MIN_GAME_DOWN" ] && NEW_GAME_DOWN="$MIN_GAME_DOWN"
+    [ "$DESIRED_UP" -lt "$MIN_GAME_UP" ] && DESIRED_UP="$MIN_GAME_UP"
+    [ "$DESIRED_DOWN" -lt "$MIN_GAME_DOWN" ] && DESIRED_DOWN="$MIN_GAME_DOWN"
 
-    [ "$NEW_GAME_UP" -gt "$MAX_GAME_UP" ] && NEW_GAME_UP="$MAX_GAME_UP"
-    [ "$NEW_GAME_DOWN" -gt "$MAX_GAME_DOWN" ] && NEW_GAME_DOWN="$MAX_GAME_DOWN"
+    [ "$DESIRED_UP" -gt "$MAX_GAME_UP" ] && DESIRED_UP="$MAX_GAME_UP"
+    [ "$DESIRED_DOWN" -gt "$MAX_GAME_DOWN" ] && DESIRED_DOWN="$MAX_GAME_DOWN"
 
-    UP_DIFF="$(absdiff "$NEW_GAME_UP" "$LAST_APPLIED_UP")"
-    DOWN_DIFF="$(absdiff "$NEW_GAME_DOWN" "$LAST_APPLIED_DOWN")"
-
-    SHOULD_APPLY=0
-
-    if [ "$LAST_APPLIED_UP" -eq 0 ] || [ "$LAST_APPLIED_DOWN" -eq 0 ]; then
-        SHOULD_APPLY=1
-    elif [ "$UP_DIFF" -ge "$APPLY_THRESHOLD" ] || [ "$DOWN_DIFF" -ge "$APPLY_THRESHOLD" ]; then
-        SHOULD_APPLY=1
+    if [ "$LAST_APPLIED_UP" -eq 0 ]; then
+        LAST_APPLIED_UP="$DESIRED_UP"
     fi
 
-    echo "delta=$DELTA avg=$AVG_DELTA deficit=$DEFICIT signal=$SIGNAL target=$TARGET boost=$BOOST up=$NEW_GAME_UP down=$NEW_GAME_DOWN diff_up=$UP_DIFF diff_down=$DOWN_DIFF apply=$SHOULD_APPLY"
+    if [ "$LAST_APPLIED_DOWN" -eq 0 ]; then
+        LAST_APPLIED_DOWN="$DESIRED_DOWN"
+    fi
+
+    APPLY_UP="$LAST_APPLIED_UP"
+    APPLY_DOWN="$LAST_APPLIED_DOWN"
+
+    # Rise fast
+    if [ "$DESIRED_UP" -gt "$LAST_APPLIED_UP" ]; then
+        DIFF=$((DESIRED_UP - LAST_APPLIED_UP))
+        if [ "$DIFF" -ge "$UP_APPLY_THRESHOLD" ]; then
+            APPLY_UP="$DESIRED_UP"
+        fi
+    fi
+
+    if [ "$DESIRED_DOWN" -gt "$LAST_APPLIED_DOWN" ]; then
+        DIFF=$((DESIRED_DOWN - LAST_APPLIED_DOWN))
+        if [ "$DIFF" -ge "$UP_APPLY_THRESHOLD" ]; then
+            APPLY_DOWN="$DESIRED_DOWN"
+        fi
+    fi
+
+    # Release slow
+    if [ "$DESIRED_UP" -lt "$LAST_APPLIED_UP" ]; then
+        DIFF=$((LAST_APPLIED_UP - DESIRED_UP))
+        if [ "$DIFF" -ge "$DOWN_APPLY_THRESHOLD" ]; then
+            APPLY_UP=$((LAST_APPLIED_UP - DOWN_RELEASE_STEP))
+            [ "$APPLY_UP" -lt "$DESIRED_UP" ] && APPLY_UP="$DESIRED_UP"
+        fi
+    fi
+
+    if [ "$DESIRED_DOWN" -lt "$LAST_APPLIED_DOWN" ]; then
+        DIFF=$((LAST_APPLIED_DOWN - DESIRED_DOWN))
+        if [ "$DIFF" -ge "$DOWN_APPLY_THRESHOLD" ]; then
+            APPLY_DOWN=$((LAST_APPLIED_DOWN - DOWN_RELEASE_STEP))
+            [ "$APPLY_DOWN" -lt "$DESIRED_DOWN" ] && APPLY_DOWN="$DESIRED_DOWN"
+        fi
+    fi
+
+    SHOULD_APPLY=0
+    [ "$APPLY_UP" -ne "$LAST_APPLIED_UP" ] && SHOULD_APPLY=1
+    [ "$APPLY_DOWN" -ne "$LAST_APPLIED_DOWN" ] && SHOULD_APPLY=1
+
+    echo "delta=$DELTA avg=$AVG_DELTA deficit=$DEFICIT boost=$BOOST desired_up=$DESIRED_UP desired_down=$DESIRED_DOWN apply_up=$APPLY_UP apply_down=$APPLY_DOWN apply=$SHOULD_APPLY"
 
     if [ "$SHOULD_APPLY" -eq 1 ]; then
         if has_class "$WAN_DEV" "$GAME_CLASS"; then
             tc class change dev "$WAN_DEV" classid "$GAME_CLASS" \
-                hfsc ls rate "${NEW_GAME_UP}kbit" ul rate "${NEW_GAME_UP}kbit"
+                hfsc ls rate "${APPLY_UP}kbit" ul rate "${APPLY_UP}kbit"
         fi
 
         if has_class "$IFB_DEV" "$GAME_CLASS"; then
             tc class change dev "$IFB_DEV" classid "$GAME_CLASS" \
-                hfsc ls rate "${NEW_GAME_DOWN}kbit" ul rate "${NEW_GAME_DOWN}kbit"
+                hfsc ls rate "${APPLY_DOWN}kbit" ul rate "${APPLY_DOWN}kbit"
         fi
 
-        LAST_APPLIED_UP="$NEW_GAME_UP"
-        LAST_APPLIED_DOWN="$NEW_GAME_DOWN"
+        LAST_APPLIED_UP="$APPLY_UP"
+        LAST_APPLIED_DOWN="$APPLY_DOWN"
     fi
 
     LAST_TOTAL="$TOTAL"
