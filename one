@@ -2,7 +2,6 @@
 
 WAN_DEV="eth1"
 IFB_DEV="ifb-eth1"
-
 GAME_CLASS="1:15"
 
 SLEEP_SEC=1
@@ -12,23 +11,25 @@ BASE_GAME_DOWN=12000
 
 MAX_GAME_UP=15000
 MAX_GAME_DOWN=20000
-
 MIN_GAME_UP=5000
 MIN_GAME_DOWN=8000
 
-# Continuous authority controller
 BOOST=0
 AVG_DELTA=0
 
-# proactive tuning
 FACTOR=180
 BASE_PULSE=300
 MAX_BOOST=3000
 
-# smooth memory:
-# BOOST = 0.8 old + 0.2 target
 MEMORY_NUM=8
 MEMORY_DEN=10
+
+# reduce discrete controller movement
+APPLY_THRESHOLD=250
+APPLY_EVERY=3
+LOOP_COUNT=0
+LAST_APPLIED_UP=0
+LAST_APPLIED_DOWN=0
 
 get_pkts() {
     DEV="$1"
@@ -54,23 +55,19 @@ has_class() {
     tc class show dev "$1" 2>/dev/null | grep -q "class hfsc $2"
 }
 
+absdiff() {
+    A="$1"
+    B="$2"
+    D=$((A - B))
+    [ "$D" -lt 0 ] && D=$((0 - D))
+    echo "$D"
+}
+
 LAST_TOTAL=0
 
 while true
 do
-    # --------------------------------------------------
-    # REAL-TIME SENSOR INPUT
-    # --------------------------------------------------
-    # Reads live packet counters from QoSmate HFSC class.
-    #
-    # This does NOT measure:
-    #   - ping
-    #   - actual EA server latency
-    #   - input lag directly
-    #
-    # It measures:
-    #   - packet cadence through game queue
-    # --------------------------------------------------
+    LOOP_COUNT=$((LOOP_COUNT + 1))
 
     WAN_PKTS="$(get_pkts "$WAN_DEV" "$GAME_CLASS")"
     IFB_PKTS="$(get_pkts "$IFB_DEV" "$GAME_CLASS")"
@@ -79,62 +76,20 @@ do
     [ -z "$IFB_PKTS" ] && IFB_PKTS=0
 
     TOTAL=$((WAN_PKTS + IFB_PKTS))
-
-    # packets this second
     DELTA=$((TOTAL - LAST_TOTAL))
 
-    # rolling cadence memory:
-    # 70% old + 30% new
     AVG_DELTA=$(((AVG_DELTA * 7 + DELTA * 3) / 10))
-
-    # --------------------------------------------------
-    # PROACTIVE SIGNAL
-    # --------------------------------------------------
-    # If current cadence falls below recent cadence,
-    # build "authority pressure" BEFORE a hard stall.
-    # --------------------------------------------------
 
     DEFICIT=$((AVG_DELTA - DELTA))
     [ "$DEFICIT" -lt 0 ] && DEFICIT=0
 
-    # warm continuous authority
     SIGNAL=$((DEFICIT + 2))
-
     TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
-
-    # --------------------------------------------------
-    # CONTINUOUS CONTROLLER
-    # --------------------------------------------------
-    # BOOST moves gradually toward TARGET.
-    #
-    # Not discrete spikes.
-    # Not hard intervention.
-    # More like live queue pressure bias.
-    # --------------------------------------------------
 
     BOOST=$(((BOOST * MEMORY_NUM + TARGET * (MEMORY_DEN - MEMORY_NUM)) / MEMORY_DEN))
 
     [ "$BOOST" -lt 0 ] && BOOST=0
     [ "$BOOST" -gt "$MAX_BOOST" ] && BOOST="$MAX_BOOST"
-
-    # --------------------------------------------------
-    # LIVE OUTPUT
-    # --------------------------------------------------
-    # Dynamically changes HFSC game class allowance.
-    #
-    # Output action:
-    #   tc class change ...
-    #
-    # This influences:
-    #   - queue priority persistence
-    #   - scheduling continuity
-    #   - game traffic authority
-    #
-    # PACKETSIZE=150 helps because:
-    #   - less fragmented cadence
-    #   - smoother queue texture
-    #   - less discrete/choppy feel
-    # --------------------------------------------------
 
     NEW_GAME_UP=$((BASE_GAME_UP + BOOST))
     NEW_GAME_DOWN=$((BASE_GAME_DOWN + BOOST))
@@ -145,19 +100,36 @@ do
     [ "$NEW_GAME_UP" -gt "$MAX_GAME_UP" ] && NEW_GAME_UP="$MAX_GAME_UP"
     [ "$NEW_GAME_DOWN" -gt "$MAX_GAME_DOWN" ] && NEW_GAME_DOWN="$MAX_GAME_DOWN"
 
-    echo "delta=$DELTA avg=$AVG_DELTA deficit=$DEFICIT signal=$SIGNAL target=$TARGET boost=$BOOST up=$NEW_GAME_UP down=$NEW_GAME_DOWN"
+    UP_DIFF="$(absdiff "$NEW_GAME_UP" "$LAST_APPLIED_UP")"
+    DOWN_DIFF="$(absdiff "$NEW_GAME_DOWN" "$LAST_APPLIED_DOWN")"
 
-    if has_class "$WAN_DEV" "$GAME_CLASS"; then
-        tc class change dev "$WAN_DEV" classid "$GAME_CLASS" \
-            hfsc ls rate "${NEW_GAME_UP}kbit" ul rate "${NEW_GAME_UP}kbit"
+    SHOULD_APPLY=0
+
+    if [ "$LAST_APPLIED_UP" -eq 0 ] || [ "$LAST_APPLIED_DOWN" -eq 0 ]; then
+        SHOULD_APPLY=1
+    elif [ "$UP_DIFF" -ge "$APPLY_THRESHOLD" ] || [ "$DOWN_DIFF" -ge "$APPLY_THRESHOLD" ]; then
+        SHOULD_APPLY=1
+    elif [ $((LOOP_COUNT % APPLY_EVERY)) -eq 0 ]; then
+        SHOULD_APPLY=1
     fi
 
-    if has_class "$IFB_DEV" "$GAME_CLASS"; then
-        tc class change dev "$IFB_DEV" classid "$GAME_CLASS" \
-            hfsc ls rate "${NEW_GAME_DOWN}kbit" ul rate "${NEW_GAME_DOWN}kbit"
+    echo "delta=$DELTA avg=$AVG_DELTA deficit=$DEFICIT signal=$SIGNAL target=$TARGET boost=$BOOST up=$NEW_GAME_UP down=$NEW_GAME_DOWN apply=$SHOULD_APPLY"
+
+    if [ "$SHOULD_APPLY" -eq 1 ]; then
+        if has_class "$WAN_DEV" "$GAME_CLASS"; then
+            tc class change dev "$WAN_DEV" classid "$GAME_CLASS" \
+                hfsc ls rate "${NEW_GAME_UP}kbit" ul rate "${NEW_GAME_UP}kbit"
+        fi
+
+        if has_class "$IFB_DEV" "$GAME_CLASS"; then
+            tc class change dev "$IFB_DEV" classid "$GAME_CLASS" \
+                hfsc ls rate "${NEW_GAME_DOWN}kbit" ul rate "${NEW_GAME_DOWN}kbit"
+        fi
+
+        LAST_APPLIED_UP="$NEW_GAME_UP"
+        LAST_APPLIED_DOWN="$NEW_GAME_DOWN"
     fi
 
     LAST_TOTAL="$TOTAL"
-
     sleep "$SLEEP_SEC"
 done
