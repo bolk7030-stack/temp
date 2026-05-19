@@ -14,27 +14,31 @@ MAX_GAME_DOWN=20000
 MIN_GAME_UP=5000
 MIN_GAME_DOWN=8000
 
-# Core controller
-BOOST=0
+# GREEN controller
+BOOST=700
 AVG_DELTA=0
 
-FACTOR=180
-BASE_PULSE=300
-MAX_BOOST=3000
+BASE_PULSE=700
+FACTOR=160
+MAX_BOOST=3500
 
-MEMORY_NUM=8
-MEMORY_DEN=10
+# Attack fast, release slow
+ATTACK_NUM=5
+ATTACK_DEN=10
 
-# Vegas/CoDel-style persistence filter
+RELEASE_NUM=9
+RELEASE_DEN=10
+
 DEFICIT_DEADBAND=2
-PERSIST_REQUIRED=3
-RECOVER_REQUIRED=3
+RISE_DEADBAND=3
 
-BAD_COUNT=0
+RECOVER_REQUIRED=7
 GOOD_COUNT=0
 
-# Event-triggered apply
-APPLY_THRESHOLD=400
+# asymmetric apply
+APPLY_UP_THRESHOLD=150
+APPLY_DOWN_THRESHOLD=800
+
 LAST_APPLIED_UP=0
 LAST_APPLIED_DOWN=0
 
@@ -83,7 +87,6 @@ do
 
     TOTAL=$((WAN_PKTS + IFB_PKTS))
 
-    # Seed first sample so startup does not create fake huge delta
     if [ "$SEEDED" -eq 0 ]; then
         LAST_TOTAL="$TOTAL"
         SEEDED=1
@@ -94,57 +97,66 @@ do
 
     DELTA=$((TOTAL - LAST_TOTAL))
 
-    # Counter reset protection
     if [ "$DELTA" -lt 0 ]; then
         DELTA=0
         AVG_DELTA=0
-        BAD_COUNT=0
         GOOD_COUNT=0
         echo "counter-reset detected total=$TOTAL last=$LAST_TOTAL"
     fi
 
-    # expected cadence memory
+    OLD_AVG="$AVG_DELTA"
     AVG_DELTA=$(((AVG_DELTA * 7 + DELTA * 3) / 10))
 
-    # Vegas-style expected vs actual gap
     DEFICIT=$((AVG_DELTA - DELTA))
     [ "$DEFICIT" -lt 0 ] && DEFICIT=0
 
-    # Deadband: tiny mismatch is noise, not obligation
+    RISE=$((DELTA - OLD_AVG))
+    [ "$RISE" -lt 0 ] && RISE=0
+
     if [ "$DEFICIT" -le "$DEFICIT_DEADBAND" ]; then
         EFFECTIVE_DEFICIT=0
     else
         EFFECTIVE_DEFICIT="$DEFICIT"
     fi
 
-    # CoDel-style persistence: badness must persist
-    if [ "$EFFECTIVE_DEFICIT" -gt 0 ]; then
-        BAD_COUNT=$((BAD_COUNT + 1))
+    if [ "$RISE" -le "$RISE_DEADBAND" ]; then
+        EFFECTIVE_RISE=0
+    else
+        EFFECTIVE_RISE="$RISE"
+    fi
+
+    # GREEN LOGIC:
+    # rising packet demand = go now
+    # deficit = recover now
+    if [ "$EFFECTIVE_RISE" -gt 0 ]; then
+        SIGNAL=$((EFFECTIVE_RISE + 3))
+        TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
+        MODE="green-attack"
         GOOD_COUNT=0
+
+        BOOST=$(((BOOST * ATTACK_NUM + TARGET * (ATTACK_DEN - ATTACK_NUM)) / ATTACK_DEN))
+
+    elif [ "$EFFECTIVE_DEFICIT" -gt 0 ]; then
+        SIGNAL=$((EFFECTIVE_DEFICIT + 3))
+        TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
+        MODE="green-reclaim"
+        GOOD_COUNT=0
+
+        BOOST=$(((BOOST * ATTACK_NUM + TARGET * (ATTACK_DEN - ATTACK_NUM)) / ATTACK_DEN))
+
     else
         GOOD_COUNT=$((GOOD_COUNT + 1))
-        BAD_COUNT=0
+        TARGET="$BASE_PULSE"
+
+        if [ "$GOOD_COUNT" -ge "$RECOVER_REQUIRED" ]; then
+            MODE="slow-release"
+            BOOST=$(((BOOST * RELEASE_NUM + TARGET * (RELEASE_DEN - RELEASE_NUM)) / RELEASE_DEN))
+        else
+            MODE="hold-green"
+        fi
     fi
 
-    # Decide target pressure
-    if [ "$BAD_COUNT" -ge "$PERSIST_REQUIRED" ]; then
-        SIGNAL=$((EFFECTIVE_DEFICIT + 2))
-        TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
-        MODE="authority-hold"
-    elif [ "$GOOD_COUNT" -ge "$RECOVER_REQUIRED" ]; then
-        SIGNAL=1
-        TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
-        MODE="release"
-    else
-        SIGNAL=2
-        TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
-        MODE="warm"
-    fi
-
-    # Continuous low-cost correction
-    BOOST=$(((BOOST * MEMORY_NUM + TARGET * (MEMORY_DEN - MEMORY_NUM)) / MEMORY_DEN))
-
-    [ "$BOOST" -lt 0 ] && BOOST=0
+    [ "$BOOST" -lt 700 ] && BOOST=700
     [ "$BOOST" -gt "$MAX_BOOST" ] && BOOST="$MAX_BOOST"
 
     DESIRED_UP=$((BASE_GAME_UP + BOOST))
@@ -160,13 +172,20 @@ do
     DOWN_DIFF="$(absdiff "$DESIRED_DOWN" "$LAST_APPLIED_DOWN")"
 
     SHOULD_APPLY=0
+
     if [ "$LAST_APPLIED_UP" -eq 0 ] || [ "$LAST_APPLIED_DOWN" -eq 0 ]; then
         SHOULD_APPLY=1
-    elif [ "$UP_DIFF" -ge "$APPLY_THRESHOLD" ] || [ "$DOWN_DIFF" -ge "$APPLY_THRESHOLD" ]; then
+    elif [ "$DESIRED_UP" -gt "$LAST_APPLIED_UP" ] && [ "$UP_DIFF" -ge "$APPLY_UP_THRESHOLD" ]; then
+        SHOULD_APPLY=1
+    elif [ "$DESIRED_DOWN" -gt "$LAST_APPLIED_DOWN" ] && [ "$DOWN_DIFF" -ge "$APPLY_UP_THRESHOLD" ]; then
+        SHOULD_APPLY=1
+    elif [ "$DESIRED_UP" -lt "$LAST_APPLIED_UP" ] && [ "$UP_DIFF" -ge "$APPLY_DOWN_THRESHOLD" ]; then
+        SHOULD_APPLY=1
+    elif [ "$DESIRED_DOWN" -lt "$LAST_APPLIED_DOWN" ] && [ "$DOWN_DIFF" -ge "$APPLY_DOWN_THRESHOLD" ]; then
         SHOULD_APPLY=1
     fi
 
-    echo "delta=$DELTA avg=$AVG_DELTA deficit=$DEFICIT eff=$EFFECTIVE_DEFICIT bad=$BAD_COUNT good=$GOOD_COUNT mode=$MODE target=$TARGET boost=$BOOST up=$DESIRED_UP down=$DESIRED_DOWN apply=$SHOULD_APPLY"
+    echo "delta=$DELTA avg=$AVG_DELTA rise=$EFFECTIVE_RISE deficit=$EFFECTIVE_DEFICIT good=$GOOD_COUNT mode=$MODE target=$TARGET boost=$BOOST up=$DESIRED_UP down=$DESIRED_DOWN apply=$SHOULD_APPLY"
 
     if [ "$SHOULD_APPLY" -eq 1 ]; then
         if has_class "$WAN_DEV" "$GAME_CLASS"; then
