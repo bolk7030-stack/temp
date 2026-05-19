@@ -24,10 +24,8 @@ MAX_BOOST=3000
 MEMORY_NUM=8
 MEMORY_DEN=10
 
-# reduce discrete controller movement
-APPLY_THRESHOLD=250
-APPLY_EVERY=3
-LOOP_COUNT=0
+# Event-triggered apply
+APPLY_THRESHOLD=400
 LAST_APPLIED_UP=0
 LAST_APPLIED_DOWN=0
 
@@ -67,8 +65,6 @@ LAST_TOTAL=0
 
 while true
 do
-    LOOP_COUNT=$((LOOP_COUNT + 1))
-
     WAN_PKTS="$(get_pkts "$WAN_DEV" "$GAME_CLASS")"
     IFB_PKTS="$(get_pkts "$IFB_DEV" "$GAME_CLASS")"
 
@@ -109,11 +105,9 @@ do
         SHOULD_APPLY=1
     elif [ "$UP_DIFF" -ge "$APPLY_THRESHOLD" ] || [ "$DOWN_DIFF" -ge "$APPLY_THRESHOLD" ]; then
         SHOULD_APPLY=1
-    elif [ $((LOOP_COUNT % APPLY_EVERY)) -eq 0 ]; then
-        SHOULD_APPLY=1
     fi
 
-    echo "delta=$DELTA avg=$AVG_DELTA deficit=$DEFICIT signal=$SIGNAL target=$TARGET boost=$BOOST up=$NEW_GAME_UP down=$NEW_GAME_DOWN apply=$SHOULD_APPLY"
+    echo "delta=$DELTA avg=$AVG_DELTA deficit=$DEFICIT signal=$SIGNAL target=$TARGET boost=$BOOST up=$NEW_GAME_UP down=$NEW_GAME_DOWN diff_up=$UP_DIFF diff_down=$DOWN_DIFF apply=$SHOULD_APPLY"
 
     if [ "$SHOULD_APPLY" -eq 1 ]; then
         if has_class "$WAN_DEV" "$GAME_CLASS"; then
