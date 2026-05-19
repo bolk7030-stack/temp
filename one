@@ -25,16 +25,16 @@ MAX_BOOST=3000
 MEMORY_NUM=8
 MEMORY_DEN=10
 
-# Persistence filter
-DEFICIT_DEADBAND=5
-PERSIST_REQUIRED=2
-RECOVER_REQUIRED=4
+# Vegas/CoDel-style persistence filter
+DEFICIT_DEADBAND=2
+PERSIST_REQUIRED=3
+RECOVER_REQUIRED=3
 
 BAD_COUNT=0
 GOOD_COUNT=0
 
 # Event-triggered apply
-APPLY_THRESHOLD=250
+APPLY_THRESHOLD=400
 LAST_APPLIED_UP=0
 LAST_APPLIED_DOWN=0
 
@@ -83,9 +83,9 @@ do
 
     TOTAL=$((WAN_PKTS + IFB_PKTS))
 
+    # Seed first sample so startup does not create fake huge delta
     if [ "$SEEDED" -eq 0 ]; then
         LAST_TOTAL="$TOTAL"
-        AVG_DELTA=0
         SEEDED=1
         echo "seed total=$TOTAL"
         sleep "$SLEEP_SEC"
@@ -94,6 +94,7 @@ do
 
     DELTA=$((TOTAL - LAST_TOTAL))
 
+    # Counter reset protection
     if [ "$DELTA" -lt 0 ]; then
         DELTA=0
         AVG_DELTA=0
@@ -102,26 +103,21 @@ do
         echo "counter-reset detected total=$TOTAL last=$LAST_TOTAL"
     fi
 
-    # Compare current delta against PRIOR expectation
-    EXPECTED="$AVG_DELTA"
-
-    # Then update memory after preserving the prior expectation
+    # expected cadence memory
     AVG_DELTA=$(((AVG_DELTA * 7 + DELTA * 3) / 10))
 
-    # Avoid false deficit before memory has formed
-    if [ "$EXPECTED" -eq 0 ]; then
-        DEFICIT=0
-    else
-        DEFICIT=$((EXPECTED - DELTA))
-        [ "$DEFICIT" -lt 0 ] && DEFICIT=0
-    fi
+    # Vegas-style expected vs actual gap
+    DEFICIT=$((AVG_DELTA - DELTA))
+    [ "$DEFICIT" -lt 0 ] && DEFICIT=0
 
+    # Deadband: tiny mismatch is noise, not obligation
     if [ "$DEFICIT" -le "$DEFICIT_DEADBAND" ]; then
         EFFECTIVE_DEFICIT=0
     else
         EFFECTIVE_DEFICIT="$DEFICIT"
     fi
 
+    # CoDel-style persistence: badness must persist
     if [ "$EFFECTIVE_DEFICIT" -gt 0 ]; then
         BAD_COUNT=$((BAD_COUNT + 1))
         GOOD_COUNT=0
@@ -130,6 +126,7 @@ do
         BAD_COUNT=0
     fi
 
+    # Decide target pressure
     if [ "$BAD_COUNT" -ge "$PERSIST_REQUIRED" ]; then
         SIGNAL=$((EFFECTIVE_DEFICIT + 2))
         TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
@@ -144,6 +141,7 @@ do
         MODE="warm"
     fi
 
+    # Continuous low-cost correction
     BOOST=$(((BOOST * MEMORY_NUM + TARGET * (MEMORY_DEN - MEMORY_NUM)) / MEMORY_DEN))
 
     [ "$BOOST" -lt 0 ] && BOOST=0
@@ -168,7 +166,7 @@ do
         SHOULD_APPLY=1
     fi
 
-    echo "delta=$DELTA expected=$EXPECTED avg=$AVG_DELTA deficit=$DEFICIT eff=$EFFECTIVE_DEFICIT bad=$BAD_COUNT good=$GOOD_COUNT mode=$MODE target=$TARGET boost=$BOOST up=$DESIRED_UP down=$DESIRED_DOWN apply=$SHOULD_APPLY"
+    echo "delta=$DELTA avg=$AVG_DELTA deficit=$DEFICIT eff=$EFFECTIVE_DEFICIT bad=$BAD_COUNT good=$GOOD_COUNT mode=$MODE target=$TARGET boost=$BOOST up=$DESIRED_UP down=$DESIRED_DOWN apply=$SHOULD_APPLY"
 
     if [ "$SHOULD_APPLY" -eq 1 ]; then
         if has_class "$WAN_DEV" "$GAME_CLASS"; then
