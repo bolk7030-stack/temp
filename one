@@ -2,45 +2,43 @@
 
 WAN_DEV="eth1"
 IFB_DEV="ifb-eth1"
+
 GAME_CLASS="1:15"
+BULK_CLASS="1:30"
 
 SLEEP_SEC=1
 
-BASE_GAME_UP=8500
-BASE_GAME_DOWN=12000
+# Fixed game authority lane
+GAME_UP=12000
+GAME_DOWN=16000
 
-MAX_GAME_UP=15000
-MAX_GAME_DOWN=20000
-MIN_GAME_UP=5000
-MIN_GAME_DOWN=8000
+# Background traffic control range
+BULK_UP_GREEN=45000
+BULK_DOWN_GREEN=90000
 
-# GREEN controller
-BOOST=700
+BULK_UP_YELLOW=25000
+BULK_DOWN_YELLOW=50000
+
+BULK_UP_RED=12000
+BULK_DOWN_RED=25000
+
+# Sensor memory
 AVG_DELTA=0
+LAST_TOTAL=0
+SEEDED=0
 
-BASE_PULSE=700
-FACTOR=160
-MAX_BOOST=3500
+# Sensitivity
+DROP_DEADBAND=2
+SPIKE_DEADBAND=4
 
-# Attack fast, release slow
-ATTACK_NUM=5
-ATTACK_DEN=10
+YELLOW_REQUIRED=2
+RED_REQUIRED=4
+GREEN_REQUIRED=8
 
-RELEASE_NUM=9
-RELEASE_DEN=10
-
-DEFICIT_DEADBAND=2
-RISE_DEADBAND=3
-
-RECOVER_REQUIRED=7
+BAD_COUNT=0
 GOOD_COUNT=0
 
-# asymmetric apply
-APPLY_UP_THRESHOLD=150
-APPLY_DOWN_THRESHOLD=800
-
-LAST_APPLIED_UP=0
-LAST_APPLIED_DOWN=0
+LAST_MODE="none"
 
 get_pkts() {
     DEV="$1"
@@ -66,16 +64,45 @@ has_class() {
     tc class show dev "$1" 2>/dev/null | grep -q "class hfsc $2"
 }
 
-absdiff() {
-    A="$1"
-    B="$2"
-    D=$((A - B))
-    [ "$D" -lt 0 ] && D=$((0 - D))
-    echo "$D"
+apply_class() {
+    DEV="$1"
+    CLASS="$2"
+    RATE="$3"
+
+    if has_class "$DEV" "$CLASS"; then
+        tc class change dev "$DEV" classid "$CLASS" \
+            hfsc ls rate "${RATE}kbit" ul rate "${RATE}kbit"
+    fi
 }
 
-LAST_TOTAL=0
-SEEDED=0
+apply_mode() {
+    MODE="$1"
+
+    case "$MODE" in
+        green)
+            BULK_UP="$BULK_UP_GREEN"
+            BULK_DOWN="$BULK_DOWN_GREEN"
+            ;;
+        yellow)
+            BULK_UP="$BULK_UP_YELLOW"
+            BULK_DOWN="$BULK_DOWN_YELLOW"
+            ;;
+        red)
+            BULK_UP="$BULK_UP_RED"
+            BULK_DOWN="$BULK_DOWN_RED"
+            ;;
+    esac
+
+    # Keep game lane fixed. No live steering.
+    apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
+    apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
+
+    # Only manipulate non-game pressure.
+    apply_class "$WAN_DEV" "$BULK_CLASS" "$BULK_UP"
+    apply_class "$IFB_DEV" "$BULK_CLASS" "$BULK_DOWN"
+
+    echo "APPLY mode=$MODE game_up=$GAME_UP game_down=$GAME_DOWN bulk_up=$BULK_UP bulk_down=$BULK_DOWN"
+}
 
 while true
 do
@@ -90,6 +117,8 @@ do
     if [ "$SEEDED" -eq 0 ]; then
         LAST_TOTAL="$TOTAL"
         SEEDED=1
+        apply_mode green
+        LAST_MODE="green"
         echo "seed total=$TOTAL"
         sleep "$SLEEP_SEC"
         continue
@@ -100,106 +129,55 @@ do
     if [ "$DELTA" -lt 0 ]; then
         DELTA=0
         AVG_DELTA=0
+        BAD_COUNT=0
         GOOD_COUNT=0
-        echo "counter-reset detected total=$TOTAL last=$LAST_TOTAL"
+        echo "counter-reset detected"
     fi
 
     OLD_AVG="$AVG_DELTA"
-    AVG_DELTA=$(((AVG_DELTA * 7 + DELTA * 3) / 10))
+    AVG_DELTA=$(((AVG_DELTA * 6 + DELTA * 4) / 10))
 
-    DEFICIT=$((AVG_DELTA - DELTA))
-    [ "$DEFICIT" -lt 0 ] && DEFICIT=0
+    DROP=$((OLD_AVG - DELTA))
+    [ "$DROP" -lt 0 ] && DROP=0
 
-    RISE=$((DELTA - OLD_AVG))
-    [ "$RISE" -lt 0 ] && RISE=0
+    SPIKE=$((DELTA - OLD_AVG))
+    [ "$SPIKE" -lt 0 ] && SPIKE=0
 
-    if [ "$DEFICIT" -le "$DEFICIT_DEADBAND" ]; then
-        EFFECTIVE_DEFICIT=0
-    else
-        EFFECTIVE_DEFICIT="$DEFICIT"
+    BAD=0
+
+    # Micro instability: sudden packet drop after expected activity
+    if [ "$DROP" -gt "$DROP_DEADBAND" ]; then
+        BAD=1
     fi
 
-    if [ "$RISE" -le "$RISE_DEADBAND" ]; then
-        EFFECTIVE_RISE=0
-    else
-        EFFECTIVE_RISE="$RISE"
+    # Burst instability: sudden spike means protect lane before queue forms
+    if [ "$SPIKE" -gt "$SPIKE_DEADBAND" ]; then
+        BAD=1
     fi
 
-    # GREEN LOGIC:
-    # rising packet demand = go now
-    # deficit = recover now
-    if [ "$EFFECTIVE_RISE" -gt 0 ]; then
-        SIGNAL=$((EFFECTIVE_RISE + 3))
-        TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
-        MODE="green-attack"
+    if [ "$BAD" -eq 1 ]; then
+        BAD_COUNT=$((BAD_COUNT + 1))
         GOOD_COUNT=0
-
-        BOOST=$(((BOOST * ATTACK_NUM + TARGET * (ATTACK_DEN - ATTACK_NUM)) / ATTACK_DEN))
-
-    elif [ "$EFFECTIVE_DEFICIT" -gt 0 ]; then
-        SIGNAL=$((EFFECTIVE_DEFICIT + 3))
-        TARGET=$((BASE_PULSE + SIGNAL * FACTOR))
-        MODE="green-reclaim"
-        GOOD_COUNT=0
-
-        BOOST=$(((BOOST * ATTACK_NUM + TARGET * (ATTACK_DEN - ATTACK_NUM)) / ATTACK_DEN))
-
     else
         GOOD_COUNT=$((GOOD_COUNT + 1))
-        TARGET="$BASE_PULSE"
-
-        if [ "$GOOD_COUNT" -ge "$RECOVER_REQUIRED" ]; then
-            MODE="slow-release"
-            BOOST=$(((BOOST * RELEASE_NUM + TARGET * (RELEASE_DEN - RELEASE_NUM)) / RELEASE_DEN))
-        else
-            MODE="hold-green"
-        fi
+        BAD_COUNT=0
     fi
 
-    [ "$BOOST" -lt 700 ] && BOOST=700
-    [ "$BOOST" -gt "$MAX_BOOST" ] && BOOST="$MAX_BOOST"
+    MODE="$LAST_MODE"
 
-    DESIRED_UP=$((BASE_GAME_UP + BOOST))
-    DESIRED_DOWN=$((BASE_GAME_DOWN + BOOST))
-
-    [ "$DESIRED_UP" -lt "$MIN_GAME_UP" ] && DESIRED_UP="$MIN_GAME_UP"
-    [ "$DESIRED_DOWN" -lt "$MIN_GAME_DOWN" ] && DESIRED_DOWN="$MIN_GAME_DOWN"
-
-    [ "$DESIRED_UP" -gt "$MAX_GAME_UP" ] && DESIRED_UP="$MAX_GAME_UP"
-    [ "$DESIRED_DOWN" -gt "$MAX_GAME_DOWN" ] && DESIRED_DOWN="$MAX_GAME_DOWN"
-
-    UP_DIFF="$(absdiff "$DESIRED_UP" "$LAST_APPLIED_UP")"
-    DOWN_DIFF="$(absdiff "$DESIRED_DOWN" "$LAST_APPLIED_DOWN")"
-
-    SHOULD_APPLY=0
-
-    if [ "$LAST_APPLIED_UP" -eq 0 ] || [ "$LAST_APPLIED_DOWN" -eq 0 ]; then
-        SHOULD_APPLY=1
-    elif [ "$DESIRED_UP" -gt "$LAST_APPLIED_UP" ] && [ "$UP_DIFF" -ge "$APPLY_UP_THRESHOLD" ]; then
-        SHOULD_APPLY=1
-    elif [ "$DESIRED_DOWN" -gt "$LAST_APPLIED_DOWN" ] && [ "$DOWN_DIFF" -ge "$APPLY_UP_THRESHOLD" ]; then
-        SHOULD_APPLY=1
-    elif [ "$DESIRED_UP" -lt "$LAST_APPLIED_UP" ] && [ "$UP_DIFF" -ge "$APPLY_DOWN_THRESHOLD" ]; then
-        SHOULD_APPLY=1
-    elif [ "$DESIRED_DOWN" -lt "$LAST_APPLIED_DOWN" ] && [ "$DOWN_DIFF" -ge "$APPLY_DOWN_THRESHOLD" ]; then
-        SHOULD_APPLY=1
+    if [ "$BAD_COUNT" -ge "$RED_REQUIRED" ]; then
+        MODE="red"
+    elif [ "$BAD_COUNT" -ge "$YELLOW_REQUIRED" ]; then
+        MODE="yellow"
+    elif [ "$GOOD_COUNT" -ge "$GREEN_REQUIRED" ]; then
+        MODE="green"
     fi
 
-    echo "delta=$DELTA avg=$AVG_DELTA rise=$EFFECTIVE_RISE deficit=$EFFECTIVE_DEFICIT good=$GOOD_COUNT mode=$MODE target=$TARGET boost=$BOOST up=$DESIRED_UP down=$DESIRED_DOWN apply=$SHOULD_APPLY"
+    echo "delta=$DELTA avg=$AVG_DELTA drop=$DROP spike=$SPIKE bad=$BAD bad_count=$BAD_COUNT good_count=$GOOD_COUNT mode=$MODE"
 
-    if [ "$SHOULD_APPLY" -eq 1 ]; then
-        if has_class "$WAN_DEV" "$GAME_CLASS"; then
-            tc class change dev "$WAN_DEV" classid "$GAME_CLASS" \
-                hfsc ls rate "${DESIRED_UP}kbit" ul rate "${DESIRED_UP}kbit"
-        fi
-
-        if has_class "$IFB_DEV" "$GAME_CLASS"; then
-            tc class change dev "$IFB_DEV" classid "$GAME_CLASS" \
-                hfsc ls rate "${DESIRED_DOWN}kbit" ul rate "${DESIRED_DOWN}kbit"
-        fi
-
-        LAST_APPLIED_UP="$DESIRED_UP"
-        LAST_APPLIED_DOWN="$DESIRED_DOWN"
+    if [ "$MODE" != "$LAST_MODE" ]; then
+        apply_mode "$MODE"
+        LAST_MODE="$MODE"
     fi
 
     LAST_TOTAL="$TOTAL"
