@@ -29,14 +29,17 @@ SEEDED=0
 
 # Sensitivity
 DROP_DEADBAND=2
-SPIKE_DEADBAND=4
+SPIKE_DEADBAND=8
+DRIFT_DEADBAND=1
 
+# State thresholds
 YELLOW_REQUIRED=2
 RED_REQUIRED=4
 GREEN_REQUIRED=8
 
 BAD_COUNT=0
 GOOD_COUNT=0
+DRIFT_COUNT=0
 
 LAST_MODE="none"
 
@@ -93,11 +96,11 @@ apply_mode() {
             ;;
     esac
 
-    # Keep game lane fixed. No live steering.
+    # Game lane remains fixed.
     apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
     apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
 
-    # Only manipulate non-game pressure.
+    # Only suppress/release background pressure.
     apply_class "$WAN_DEV" "$BULK_CLASS" "$BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$BULK_DOWN"
 
@@ -131,10 +134,13 @@ do
         AVG_DELTA=0
         BAD_COUNT=0
         GOOD_COUNT=0
+        DRIFT_COUNT=0
         echo "counter-reset detected"
     fi
 
     OLD_AVG="$AVG_DELTA"
+
+    # Responsive, but not twitchy
     AVG_DELTA=$(((AVG_DELTA * 6 + DELTA * 4) / 10))
 
     DROP=$((OLD_AVG - DELTA))
@@ -143,37 +149,69 @@ do
     SPIKE=$((DELTA - OLD_AVG))
     [ "$SPIKE" -lt 0 ] && SPIKE=0
 
-    BAD=0
+    DROP_BAD=0
+    SPIKE_BAD=0
+    DRIFT_BAD=0
 
-    # Micro instability: sudden packet drop after expected activity
+    # Real degradation: game cadence fell below expectation.
     if [ "$DROP" -gt "$DROP_DEADBAND" ]; then
-        BAD=1
+        DROP_BAD=1
     fi
 
-    # Burst instability: sudden spike means protect lane before queue forms
+    # Activity burst: do not panic. This may be your own play.
     if [ "$SPIKE" -gt "$SPIKE_DEADBAND" ]; then
-        BAD=1
+        SPIKE_BAD=1
     fi
 
-    if [ "$BAD" -eq 1 ]; then
+    # Slow congestion drift:
+    # small repeated drop, not big enough for DROP_BAD, but persistent.
+    if [ "$DROP" -gt "$DRIFT_DEADBAND" ] && [ "$DROP_BAD" -eq 0 ]; then
+        DRIFT_BAD=1
+    fi
+
+    # Weighted badness:
+    # DROP is serious.
+    # DRIFT accumulates.
+    # SPIKE alone only lightly protects; it does not force RED.
+    if [ "$DROP_BAD" -eq 1 ]; then
+        BAD_COUNT=$((BAD_COUNT + 2))
+        GOOD_COUNT=0
+        DRIFT_COUNT=0
+        REASON="drop"
+
+    elif [ "$DRIFT_BAD" -eq 1 ]; then
+        BAD_COUNT=$((BAD_COUNT + 1))
+        DRIFT_COUNT=$((DRIFT_COUNT + 1))
+        GOOD_COUNT=0
+        REASON="drift"
+
+    elif [ "$SPIKE_BAD" -eq 1 ]; then
+        # Spike means activity/burst. Hold or lightly protect, but avoid panic.
         BAD_COUNT=$((BAD_COUNT + 1))
         GOOD_COUNT=0
+        REASON="spike"
+
     else
         GOOD_COUNT=$((GOOD_COUNT + 1))
         BAD_COUNT=0
+        DRIFT_COUNT=0
+        REASON="clean"
     fi
 
     MODE="$LAST_MODE"
 
-    if [ "$BAD_COUNT" -ge "$RED_REQUIRED" ]; then
+    # RED should require drop/drift, not spike alone.
+    if [ "$BAD_COUNT" -ge "$RED_REQUIRED" ] && { [ "$DROP_BAD" -eq 1 ] || [ "$DRIFT_COUNT" -ge 2 ]; }; then
         MODE="red"
+
     elif [ "$BAD_COUNT" -ge "$YELLOW_REQUIRED" ]; then
         MODE="yellow"
+
     elif [ "$GOOD_COUNT" -ge "$GREEN_REQUIRED" ]; then
         MODE="green"
     fi
 
-    echo "delta=$DELTA avg=$AVG_DELTA drop=$DROP spike=$SPIKE bad=$BAD bad_count=$BAD_COUNT good_count=$GOOD_COUNT mode=$MODE"
+    echo "delta=$DELTA avg=$AVG_DELTA drop=$DROP spike=$SPIKE drop_bad=$DROP_BAD spike_bad=$SPIKE_BAD drift_bad=$DRIFT_BAD bad_count=$BAD_COUNT drift_count=$DRIFT_COUNT good_count=$GOOD_COUNT reason=$REASON mode=$MODE"
 
     if [ "$MODE" != "$LAST_MODE" ]; then
         apply_mode "$MODE"
