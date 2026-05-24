@@ -3,16 +3,16 @@
 WAN_DEV="eth1"
 IFB_DEV="ifb-eth1"
 
-GAME_CLASS="1:15"
-BULK_CLASS="1:30"
+GAME_CLASS="1:13"
+BULK_CLASS="1:12"
 
 SLEEP_SEC=1
 
-# Fixed game authority lane
+# Sacred game lane: fixed authority
 GAME_UP=12000
 GAME_DOWN=16000
 
-# Background traffic control range
+# Bulk pressure states
 BULK_UP_GREEN=45000
 BULK_DOWN_GREEN=90000
 
@@ -22,24 +22,30 @@ BULK_DOWN_YELLOW=50000
 BULK_UP_RED=12000
 BULK_DOWN_RED=25000
 
-# Sensor memory
+# Optional panic clamp for violent bursts
+BULK_UP_PANIC=8000
+BULK_DOWN_PANIC=16000
+
+# Memory
 AVG_DELTA=0
 LAST_TOTAL=0
 SEEDED=0
 
 # Sensitivity
-DROP_DEADBAND=2
-SPIKE_DEADBAND=8
-DRIFT_DEADBAND=1
+DROP_DEADBAND=80
+SPIKE_DEADBAND=120
+PANIC_SPIKE=300
+PANIC_DROP=220
 
-# State thresholds
-YELLOW_REQUIRED=2
-RED_REQUIRED=4
-GREEN_REQUIRED=8
+# Persistence / hysteresis
+YELLOW_REQUIRED=3
+RED_REQUIRED=7
+PANIC_REQUIRED=2
+GREEN_REQUIRED=18
 
 BAD_COUNT=0
 GOOD_COUNT=0
-DRIFT_COUNT=0
+PANIC_COUNT=0
 
 LAST_MODE="none"
 
@@ -75,6 +81,8 @@ apply_class() {
     if has_class "$DEV" "$CLASS"; then
         tc class change dev "$DEV" classid "$CLASS" \
             hfsc ls rate "${RATE}kbit" ul rate "${RATE}kbit"
+    else
+        echo "WARN missing class dev=$DEV class=$CLASS"
     fi
 }
 
@@ -94,17 +102,25 @@ apply_mode() {
             BULK_UP="$BULK_UP_RED"
             BULK_DOWN="$BULK_DOWN_RED"
             ;;
+        panic)
+            BULK_UP="$BULK_UP_PANIC"
+            BULK_DOWN="$BULK_DOWN_PANIC"
+            ;;
+        *)
+            echo "WARN unknown mode=$MODE"
+            return
+            ;;
     esac
 
-    # Game lane remains fixed.
+    # Environment: game lane stays sacred and fixed
     apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
     apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
 
-    # Only suppress/release background pressure.
+    # Asymmetry: bulk traffic absorbs instability
     apply_class "$WAN_DEV" "$BULK_CLASS" "$BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$BULK_DOWN"
 
-    echo "APPLY mode=$MODE game_up=$GAME_UP game_down=$GAME_DOWN bulk_up=$BULK_UP bulk_down=$BULK_DOWN"
+    echo "APPLY mode=$MODE game=${GAME_UP}/${GAME_DOWN} bulk=${BULK_UP}/${BULK_DOWN}"
 }
 
 while true
@@ -120,8 +136,8 @@ do
     if [ "$SEEDED" -eq 0 ]; then
         LAST_TOTAL="$TOTAL"
         SEEDED=1
-        apply_mode green
         LAST_MODE="green"
+        apply_mode green
         echo "seed total=$TOTAL"
         sleep "$SLEEP_SEC"
         continue
@@ -134,14 +150,14 @@ do
         AVG_DELTA=0
         BAD_COUNT=0
         GOOD_COUNT=0
-        DRIFT_COUNT=0
+        PANIC_COUNT=0
         echo "counter-reset detected"
     fi
 
     OLD_AVG="$AVG_DELTA"
 
-    # Responsive, but not twitchy
-    AVG_DELTA=$(((AVG_DELTA * 6 + DELTA * 4) / 10))
+    # Smooth packet activity memory
+    AVG_DELTA=$(((AVG_DELTA * 7 + DELTA * 3) / 10))
 
     DROP=$((OLD_AVG - DELTA))
     [ "$DROP" -lt 0 ] && DROP=0
@@ -149,69 +165,57 @@ do
     SPIKE=$((DELTA - OLD_AVG))
     [ "$SPIKE" -lt 0 ] && SPIKE=0
 
-    DROP_BAD=0
-    SPIKE_BAD=0
-    DRIFT_BAD=0
+    BAD=0
+    PANIC=0
+    REASON="clean"
 
-    # Real degradation: game cadence fell below expectation.
     if [ "$DROP" -gt "$DROP_DEADBAND" ]; then
-        DROP_BAD=1
-    fi
-
-    # Activity burst: do not panic. This may be your own play.
-    if [ "$SPIKE" -gt "$SPIKE_DEADBAND" ]; then
-        SPIKE_BAD=1
-    fi
-
-    # Slow congestion drift:
-    # small repeated drop, not big enough for DROP_BAD, but persistent.
-    if [ "$DROP" -gt "$DRIFT_DEADBAND" ] && [ "$DROP_BAD" -eq 0 ]; then
-        DRIFT_BAD=1
-    fi
-
-    # Weighted badness:
-    # DROP is serious.
-    # DRIFT accumulates.
-    # SPIKE alone only lightly protects; it does not force RED.
-    if [ "$DROP_BAD" -eq 1 ]; then
-        BAD_COUNT=$((BAD_COUNT + 2))
-        GOOD_COUNT=0
-        DRIFT_COUNT=0
+        BAD=1
         REASON="drop"
+    fi
 
-    elif [ "$DRIFT_BAD" -eq 1 ]; then
-        BAD_COUNT=$((BAD_COUNT + 1))
-        DRIFT_COUNT=$((DRIFT_COUNT + 1))
-        GOOD_COUNT=0
-        REASON="drift"
-
-    elif [ "$SPIKE_BAD" -eq 1 ]; then
-        # Spike means activity/burst. Hold or lightly protect, but avoid panic.
-        BAD_COUNT=$((BAD_COUNT + 1))
-        GOOD_COUNT=0
+    if [ "$SPIKE" -gt "$SPIKE_DEADBAND" ]; then
+        BAD=1
         REASON="spike"
+    fi
 
+    if [ "$DROP" -gt "$PANIC_DROP" ]; then
+        PANIC=1
+        REASON="panic_drop"
+    fi
+
+    if [ "$SPIKE" -gt "$PANIC_SPIKE" ]; then
+        PANIC=1
+        REASON="panic_spike"
+    fi
+
+    if [ "$PANIC" -eq 1 ]; then
+        PANIC_COUNT=$((PANIC_COUNT + 1))
+        BAD_COUNT=$((BAD_COUNT + 1))
+        GOOD_COUNT=0
+    elif [ "$BAD" -eq 1 ]; then
+        BAD_COUNT=$((BAD_COUNT + 1))
+        PANIC_COUNT=0
+        GOOD_COUNT=0
     else
         GOOD_COUNT=$((GOOD_COUNT + 1))
         BAD_COUNT=0
-        DRIFT_COUNT=0
-        REASON="clean"
+        PANIC_COUNT=0
     fi
 
     MODE="$LAST_MODE"
 
-    # RED should require drop/drift, not spike alone.
-    if [ "$BAD_COUNT" -ge "$RED_REQUIRED" ] && { [ "$DROP_BAD" -eq 1 ] || [ "$DRIFT_COUNT" -ge 2 ]; }; then
+    if [ "$PANIC_COUNT" -ge "$PANIC_REQUIRED" ]; then
+        MODE="panic"
+    elif [ "$BAD_COUNT" -ge "$RED_REQUIRED" ]; then
         MODE="red"
-
     elif [ "$BAD_COUNT" -ge "$YELLOW_REQUIRED" ]; then
         MODE="yellow"
-
     elif [ "$GOOD_COUNT" -ge "$GREEN_REQUIRED" ]; then
         MODE="green"
     fi
 
-    echo "delta=$DELTA avg=$AVG_DELTA drop=$DROP spike=$SPIKE drop_bad=$DROP_BAD spike_bad=$SPIKE_BAD drift_bad=$DRIFT_BAD bad_count=$BAD_COUNT drift_count=$DRIFT_COUNT good_count=$GOOD_COUNT reason=$REASON mode=$MODE"
+    echo "delta=$DELTA avg=$AVG_DELTA drop=$DROP spike=$SPIKE reason=$REASON bad_count=$BAD_COUNT panic_count=$PANIC_COUNT good_count=$GOOD_COUNT mode=$MODE"
 
     if [ "$MODE" != "$LAST_MODE" ]; then
         apply_mode "$MODE"
