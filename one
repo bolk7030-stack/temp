@@ -12,7 +12,7 @@ SLEEP_SEC=1
 GAME_UP=12000
 GAME_DOWN=16000
 
-# Bulk states: softer than panic script
+# Bulk states
 BULK_UP_GREEN=45000
 BULK_DOWN_GREEN=90000
 
@@ -22,7 +22,7 @@ BULK_DOWN_YELLOW=65000
 BULK_UP_RED=22000
 BULK_DOWN_RED=45000
 
-# Panic exists, but should rarely trigger
+# Rare panic clamp
 BULK_UP_PANIC=14000
 BULK_DOWN_PANIC=28000
 
@@ -30,23 +30,33 @@ AVG_DELTA=0
 LAST_TOTAL=0
 SEEDED=0
 
-# Wider noise gates for 11v11
-DROP_DEADBAND=220
-SPIKE_DEADBAND=350
+# Keep sensitive spike sensor
+DROP_DEADBAND=180
+SPIKE_DEADBAND=150
 
-# Panic only for violent disruption
 PANIC_DROP=900
 PANIC_SPIKE=1200
 
-# Slower state transitions
+# State thresholds
 YELLOW_REQUIRED=6
-RED_REQUIRED=14
+RED_REQUIRED=18
 PANIC_REQUIRED=3
-GREEN_REQUIRED=35
+GREEN_REQUIRED=16
 
+# Sensor confirmation
+SPIKE_CONFIRM=3
+DROP_CONFIRM=2
+
+SPIKE_COUNT=0
+DROP_COUNT=0
 BAD_COUNT=0
 GOOD_COUNT=0
 PANIC_COUNT=0
+
+# Prevent twitch switching
+MODE_DWELL_REQUIRED=6
+MODE_DWELL=0
+
 LAST_MODE="none"
 
 get_pkts() {
@@ -149,12 +159,15 @@ do
         BAD_COUNT=0
         GOOD_COUNT=0
         PANIC_COUNT=0
+        SPIKE_COUNT=0
+        DROP_COUNT=0
+        MODE_DWELL=0
         echo "counter-reset detected"
     fi
 
     OLD_AVG="$AVG_DELTA"
 
-    # Slower memory for 11s continuity
+    # Mutable memory: stable but not stale
     AVG_DELTA=$(((AVG_DELTA * 85 + DELTA * 15) / 100))
 
     DROP=$((OLD_AVG - DELTA))
@@ -163,28 +176,41 @@ do
     SPIKE=$((DELTA - OLD_AVG))
     [ "$SPIKE" -lt 0 ] && SPIKE=0
 
+    # Sensitive sensors, slower authority
+    if [ "$SPIKE" -gt "$SPIKE_DEADBAND" ]; then
+        SPIKE_COUNT=$((SPIKE_COUNT + 1))
+    else
+        [ "$SPIKE_COUNT" -gt 0 ] && SPIKE_COUNT=$((SPIKE_COUNT - 1))
+    fi
+
+    if [ "$DROP" -gt "$DROP_DEADBAND" ]; then
+        DROP_COUNT=$((DROP_COUNT + 1))
+    else
+        [ "$DROP_COUNT" -gt 0 ] && DROP_COUNT=$((DROP_COUNT - 1))
+    fi
+
     BAD=0
     PANIC=0
     REASON="clean"
 
-    if [ "$DROP" -gt "$DROP_DEADBAND" ]; then
+    if [ "$SPIKE_COUNT" -ge "$SPIKE_CONFIRM" ]; then
         BAD=1
-        REASON="drop"
+        REASON="spike_persist"
     fi
 
-    if [ "$SPIKE" -gt "$SPIKE_DEADBAND" ]; then
+    if [ "$DROP_COUNT" -ge "$DROP_CONFIRM" ]; then
         BAD=1
-        REASON="spike"
-    fi
-
-    if [ "$DROP" -gt "$PANIC_DROP" ]; then
-        PANIC=1
-        REASON="panic_drop"
+        REASON="drop_persist"
     fi
 
     if [ "$SPIKE" -gt "$PANIC_SPIKE" ]; then
         PANIC=1
         REASON="panic_spike"
+    fi
+
+    if [ "$DROP" -gt "$PANIC_DROP" ]; then
+        PANIC=1
+        REASON="panic_drop"
     fi
 
     if [ "$PANIC" -eq 1 ]; then
@@ -213,11 +239,14 @@ do
         MODE="green"
     fi
 
-    echo "delta=$DELTA avg=$AVG_DELTA drop=$DROP spike=$SPIKE reason=$REASON bad_count=$BAD_COUNT panic_count=$PANIC_COUNT good_count=$GOOD_COUNT mode=$MODE"
+    MODE_DWELL=$((MODE_DWELL + 1))
 
-    if [ "$MODE" != "$LAST_MODE" ]; then
+    echo "delta=$DELTA avg=$AVG_DELTA drop=$DROP spike=$SPIKE spike_count=$SPIKE_COUNT drop_count=$DROP_COUNT reason=$REASON bad=$BAD_COUNT panic=$PANIC_COUNT good=$GOOD_COUNT dwell=$MODE_DWELL mode=$MODE"
+
+    if [ "$MODE" != "$LAST_MODE" ] && [ "$MODE_DWELL" -ge "$MODE_DWELL_REQUIRED" ]; then
         apply_mode "$MODE"
         LAST_MODE="$MODE"
+        MODE_DWELL=0
     fi
 
     LAST_TOTAL="$TOTAL"
