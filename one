@@ -8,45 +8,45 @@ BULK_CLASS="1:12"
 
 SLEEP_SEC=1
 
-# Sacred game lane: fixed authority
+# Sacred game lane
 GAME_UP=12000
 GAME_DOWN=16000
 
-# Bulk pressure states
+# Bulk states: softer than panic script
 BULK_UP_GREEN=45000
 BULK_DOWN_GREEN=90000
 
-BULK_UP_YELLOW=25000
-BULK_DOWN_YELLOW=50000
+BULK_UP_YELLOW=32000
+BULK_DOWN_YELLOW=65000
 
-BULK_UP_RED=12000
-BULK_DOWN_RED=25000
+BULK_UP_RED=22000
+BULK_DOWN_RED=45000
 
-# Optional panic clamp for violent bursts
-BULK_UP_PANIC=8000
-BULK_DOWN_PANIC=16000
+# Panic exists, but should rarely trigger
+BULK_UP_PANIC=14000
+BULK_DOWN_PANIC=28000
 
-# Memory
 AVG_DELTA=0
 LAST_TOTAL=0
 SEEDED=0
 
-# Sensitivity
-DROP_DEADBAND=80
-SPIKE_DEADBAND=120
-PANIC_SPIKE=300
-PANIC_DROP=220
+# Wider noise gates for 11v11
+DROP_DEADBAND=220
+SPIKE_DEADBAND=350
 
-# Persistence / hysteresis
-YELLOW_REQUIRED=3
-RED_REQUIRED=7
-PANIC_REQUIRED=2
-GREEN_REQUIRED=18
+# Panic only for violent disruption
+PANIC_DROP=900
+PANIC_SPIKE=1200
+
+# Slower state transitions
+YELLOW_REQUIRED=6
+RED_REQUIRED=14
+PANIC_REQUIRED=3
+GREEN_REQUIRED=35
 
 BAD_COUNT=0
 GOOD_COUNT=0
 PANIC_COUNT=0
-
 LAST_MODE="none"
 
 get_pkts() {
@@ -112,11 +112,9 @@ apply_mode() {
             ;;
     esac
 
-    # Environment: game lane stays sacred and fixed
     apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
     apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
 
-    # Asymmetry: bulk traffic absorbs instability
     apply_class "$WAN_DEV" "$BULK_CLASS" "$BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$BULK_DOWN"
 
@@ -156,8 +154,8 @@ do
 
     OLD_AVG="$AVG_DELTA"
 
-    # Smooth packet activity memory
-    AVG_DELTA=$(((AVG_DELTA * 7 + DELTA * 3) / 10))
+    # Slower memory for 11s continuity
+    AVG_DELTA=$(((AVG_DELTA * 85 + DELTA * 15) / 100))
 
     DROP=$((OLD_AVG - DELTA))
     [ "$DROP" -lt 0 ] && DROP=0
