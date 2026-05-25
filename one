@@ -1,63 +1,120 @@
 #!/bin/sh
 
+# =========================================================
+# NEXT-GEN FLOW / CURVATURE CONTROLLER
+#
+# Goal:
+# - preserve honest acceleration
+# - absorb ugly transitions
+# - avoid artificial steel
+# - preserve micro reachability
+# - reduce sticky opponent feel
+#
+# Philosophy:
+# "Do not punish motion.
+#  Punish unstable curvature."
+# =========================================================
+
 WAN_DEV="eth1"
 IFB_DEV="ifb-eth1"
 
-GAME_CLASS="1:13"
-BULK_CLASS="1:12"
+GAME_CLASS="1:20"
+BULK_CLASS="1:60"
 
 SLEEP_SEC=1
 
+# ---------------------------------------------------------
 # Sacred game lane
+# ---------------------------------------------------------
+
 GAME_UP=12000
 GAME_DOWN=16000
 
+# ---------------------------------------------------------
 # Bulk states
+# ---------------------------------------------------------
+
+# Free movement
 BULK_UP_GREEN=45000
 BULK_DOWN_GREEN=90000
 
-BULK_UP_YELLOW=32000
-BULK_DOWN_YELLOW=65000
+# Jolt absorption
+BULK_UP_YELLOW=36000
+BULK_DOWN_YELLOW=78000
 
-BULK_UP_RED=22000
-BULK_DOWN_RED=45000
+# Structural defense posture
+BULK_UP_RED=28000
+BULK_DOWN_RED=62000
 
-# Rare panic clamp
-BULK_UP_PANIC=14000
-BULK_DOWN_PANIC=28000
+# Panic = same as red (no violent clamp)
+BULK_UP_PANIC=28000
+BULK_DOWN_PANIC=62000
+
+# ---------------------------------------------------------
+# Core memory
+# ---------------------------------------------------------
 
 AVG_DELTA=0
 LAST_TOTAL=0
 SEEDED=0
 
-# Keep sensitive spike sensor
-DROP_DEADBAND=180
+OLD_DELTA=0
+OLD_CURVE=0
+
+# ---------------------------------------------------------
+# Thresholds
+# ---------------------------------------------------------
+
 SPIKE_DEADBAND=150
+DROP_DEADBAND=180
 
-PANIC_DROP=900
+# NEW:
+# jerk = unstable acceleration curvature
+JERK_DEADBAND=120
+
 PANIC_SPIKE=1200
+PANIC_DROP=900
+PANIC_JERK=500
 
-# State thresholds
-YELLOW_REQUIRED=6
-RED_REQUIRED=18
+# ---------------------------------------------------------
+# State persistence
+# ---------------------------------------------------------
+
+YELLOW_REQUIRED=7
+RED_REQUIRED=24
 PANIC_REQUIRED=3
-GREEN_REQUIRED=16
+GREEN_REQUIRED=12
 
-# Sensor confirmation
-SPIKE_CONFIRM=3
+SPIKE_CONFIRM=2
 DROP_CONFIRM=2
+JERK_CONFIRM=2
 
 SPIKE_COUNT=0
 DROP_COUNT=0
+JERK_COUNT=0
+
 BAD_COUNT=0
 GOOD_COUNT=0
 PANIC_COUNT=0
 
-# Prevent twitch switching
-MODE_DWELL_REQUIRED=6
+MODE_DWELL_REQUIRED=1
 MODE_DWELL=0
 
 LAST_MODE="none"
+
+DEBUG=1
+
+# =========================================================
+# LOGGING
+# =========================================================
+
+log() {
+    [ "$DEBUG" -eq 1 ] && echo "$1"
+}
+
+# =========================================================
+# TC HELPERS
+# =========================================================
 
 get_pkts() {
     DEV="$1"
@@ -91,10 +148,12 @@ apply_class() {
     if has_class "$DEV" "$CLASS"; then
         tc class change dev "$DEV" classid "$CLASS" \
             hfsc ls rate "${RATE}kbit" ul rate "${RATE}kbit"
-    else
-        echo "WARN missing class dev=$DEV class=$CLASS"
     fi
 }
+
+# =========================================================
+# MODE APPLICATION
+# =========================================================
 
 apply_mode() {
     MODE="$1"
@@ -117,19 +176,24 @@ apply_mode() {
             BULK_DOWN="$BULK_DOWN_PANIC"
             ;;
         *)
-            echo "WARN unknown mode=$MODE"
             return
             ;;
     esac
 
+    # Sacred lane
     apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
     apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
 
+    # Bulk absorber
     apply_class "$WAN_DEV" "$BULK_CLASS" "$BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$BULK_DOWN"
 
-    echo "APPLY mode=$MODE game=${GAME_UP}/${GAME_DOWN} bulk=${BULK_UP}/${BULK_DOWN}"
+    log "APPLY mode=$MODE game=${GAME_UP}/${GAME_DOWN} bulk=${BULK_UP}/${BULK_DOWN}"
 }
+
+# =========================================================
+# MAIN LOOP
+# =========================================================
 
 while true
 do
@@ -146,29 +210,34 @@ do
         SEEDED=1
         LAST_MODE="green"
         apply_mode green
-        echo "seed total=$TOTAL"
+
+        log "seed total=$TOTAL"
+
         sleep "$SLEEP_SEC"
         continue
     fi
+
+    # -----------------------------------------------------
+    # Core delta
+    # -----------------------------------------------------
 
     DELTA=$((TOTAL - LAST_TOTAL))
 
     if [ "$DELTA" -lt 0 ]; then
         DELTA=0
-        AVG_DELTA=0
-        BAD_COUNT=0
-        GOOD_COUNT=0
-        PANIC_COUNT=0
-        SPIKE_COUNT=0
-        DROP_COUNT=0
-        MODE_DWELL=0
-        echo "counter-reset detected"
     fi
+
+    # -----------------------------------------------------
+    # Stable memory
+    # -----------------------------------------------------
 
     OLD_AVG="$AVG_DELTA"
 
-    # Mutable memory: stable but not stale
     AVG_DELTA=$(((AVG_DELTA * 85 + DELTA * 15) / 100))
+
+    # -----------------------------------------------------
+    # Standard spike/drop
+    # -----------------------------------------------------
 
     DROP=$((OLD_AVG - DELTA))
     [ "$DROP" -lt 0 ] && DROP=0
@@ -176,7 +245,23 @@ do
     SPIKE=$((DELTA - OLD_AVG))
     [ "$SPIKE" -lt 0 ] && SPIKE=0
 
-    # Sensitive sensors, slower authority
+    # -----------------------------------------------------
+    # NEXT-GEN CURVATURE
+    # -----------------------------------------------------
+
+    CURVE=$((DELTA - OLD_DELTA))
+
+    JERK=$((CURVE - OLD_CURVE))
+
+    # absolute jerk
+    if [ "$JERK" -lt 0 ]; then
+        JERK=$((0 - JERK))
+    fi
+
+    # -----------------------------------------------------
+    # SENSOR COUNTS
+    # -----------------------------------------------------
+
     if [ "$SPIKE" -gt "$SPIKE_DEADBAND" ]; then
         SPIKE_COUNT=$((SPIKE_COUNT + 1))
     else
@@ -189,19 +274,42 @@ do
         [ "$DROP_COUNT" -gt 0 ] && DROP_COUNT=$((DROP_COUNT - 1))
     fi
 
+    # NEW:
+    # punish ugly transition curvature
+    if [ "$JERK" -gt "$JERK_DEADBAND" ]; then
+        JERK_COUNT=$((JERK_COUNT + 1))
+    else
+        [ "$JERK_COUNT" -gt 0 ] && JERK_COUNT=$((JERK_COUNT - 1))
+    fi
+
+    # -----------------------------------------------------
+    # CLASSIFICATION
+    # -----------------------------------------------------
+
     BAD=0
     PANIC=0
     REASON="clean"
 
     if [ "$SPIKE_COUNT" -ge "$SPIKE_CONFIRM" ]; then
         BAD=1
-        REASON="spike_persist"
+        REASON="spike"
     fi
 
     if [ "$DROP_COUNT" -ge "$DROP_CONFIRM" ]; then
         BAD=1
-        REASON="drop_persist"
+        REASON="drop"
     fi
+
+    # NEW:
+    # unstable acceleration curvature
+    if [ "$JERK_COUNT" -ge "$JERK_CONFIRM" ]; then
+        BAD=1
+        REASON="jerk"
+    fi
+
+    # -----------------------------------------------------
+    # PANIC
+    # -----------------------------------------------------
 
     if [ "$SPIKE" -gt "$PANIC_SPIKE" ]; then
         PANIC=1
@@ -213,42 +321,82 @@ do
         REASON="panic_drop"
     fi
 
+    if [ "$JERK" -gt "$PANIC_JERK" ]; then
+        PANIC=1
+        REASON="panic_jerk"
+    fi
+
+    # -----------------------------------------------------
+    # STATE MEMORY
+    # -----------------------------------------------------
+
     if [ "$PANIC" -eq 1 ]; then
         PANIC_COUNT=$((PANIC_COUNT + 1))
         BAD_COUNT=$((BAD_COUNT + 1))
         GOOD_COUNT=0
+
     elif [ "$BAD" -eq 1 ]; then
         BAD_COUNT=$((BAD_COUNT + 1))
-        PANIC_COUNT=0
         GOOD_COUNT=0
+        PANIC_COUNT=0
+
     else
         GOOD_COUNT=$((GOOD_COUNT + 1))
-        BAD_COUNT=0
+
+        # instability evaporates faster
+        [ "$BAD_COUNT" -gt 0 ] && BAD_COUNT=$((BAD_COUNT - 1))
+
         PANIC_COUNT=0
     fi
+
+    # -----------------------------------------------------
+    # MODE
+    # -----------------------------------------------------
 
     MODE="$LAST_MODE"
 
     if [ "$PANIC_COUNT" -ge "$PANIC_REQUIRED" ]; then
         MODE="panic"
+
     elif [ "$BAD_COUNT" -ge "$RED_REQUIRED" ]; then
         MODE="red"
+
     elif [ "$BAD_COUNT" -ge "$YELLOW_REQUIRED" ]; then
         MODE="yellow"
+
     elif [ "$GOOD_COUNT" -ge "$GREEN_REQUIRED" ]; then
         MODE="green"
     fi
 
     MODE_DWELL=$((MODE_DWELL + 1))
 
-    echo "delta=$DELTA avg=$AVG_DELTA drop=$DROP spike=$SPIKE spike_count=$SPIKE_COUNT drop_count=$DROP_COUNT reason=$REASON bad=$BAD_COUNT panic=$PANIC_COUNT good=$GOOD_COUNT dwell=$MODE_DWELL mode=$MODE"
+    # -----------------------------------------------------
+    # LOGGING
+    # -----------------------------------------------------
 
-    if [ "$MODE" != "$LAST_MODE" ] && [ "$MODE_DWELL" -ge "$MODE_DWELL_REQUIRED" ]; then
+    log "delta=$DELTA avg=$AVG_DELTA spike=$SPIKE drop=$DROP jerk=$JERK reason=$REASON bad=$BAD_COUNT good=$GOOD_COUNT mode=$MODE"
+
+    # -----------------------------------------------------
+    # APPLY
+    # -----------------------------------------------------
+
+    if [ "$MODE" != "$LAST_MODE" ] && \
+       [ "$MODE_DWELL" -ge "$MODE_DWELL_REQUIRED" ]; then
+
         apply_mode "$MODE"
+
         LAST_MODE="$MODE"
         MODE_DWELL=0
     fi
 
+    # -----------------------------------------------------
+    # MEMORY UPDATE
+    # -----------------------------------------------------
+
+    OLD_DELTA="$DELTA"
+    OLD_CURVE="$CURVE"
+
     LAST_TOTAL="$TOTAL"
+
     sleep "$SLEEP_SEC"
 done
