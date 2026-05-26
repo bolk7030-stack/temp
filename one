@@ -8,11 +8,9 @@ BULK_CLASS="1:60"
 
 SLEEP_SEC=1
 
-# Sacred game lane
 GAME_UP=12000
 GAME_DOWN=16000
 
-# Bulk states
 BULK_UP_GREEN=45000
 BULK_DOWN_GREEN=90000
 
@@ -22,7 +20,6 @@ BULK_DOWN_YELLOW=65000
 BULK_UP_RED=22000
 BULK_DOWN_RED=45000
 
-# Rare panic clamp
 BULK_UP_PANIC=14000
 BULK_DOWN_PANIC=28000
 
@@ -75,19 +72,13 @@ get_pkts() {
     '
 }
 
-has_class() {
-    tc class show dev "$1" 2>/dev/null | grep -q "class hfsc $2"
-}
-
 apply_class() {
     DEV="$1"
     CLASS="$2"
     RATE="$3"
 
-    
     tc class change dev "$DEV" classid "$CLASS" \
-        hfsc ls rate "${RATE}kbit" ul rate "${RATE}kbit"
-    
+        hfsc ls rate "${RATE}kbit" ul rate "${RATE}kbit" 2>/dev/null
 }
 
 apply_mode() {
@@ -111,7 +102,6 @@ apply_mode() {
             BULK_DOWN="$BULK_DOWN_PANIC"
             ;;
         *)
-            echo "WARN unknown mode=$MODE"
             return
             ;;
     esac
@@ -129,17 +119,11 @@ next_mode_graph() {
     CURRENT="$1"
     PRESSURE="$2"
 
-    # PRESSURE:
-    # 0 = clean
-    # 1 = yellow requested
-    # 2 = red requested
-    # 3 = panic requested
-
     case "$CURRENT" in
         green)
             case "$PRESSURE" in
                 0) echo "green" ;;
-                1|2|3) echo "yellow" ;;   # green cannot jump straight to red/panic
+                1|2|3) echo "yellow" ;;
             esac
             ;;
 
@@ -147,14 +131,13 @@ next_mode_graph() {
             case "$PRESSURE" in
                 0) echo "green" ;;
                 1) echo "yellow" ;;
-                2|3) echo "red" ;;        # yellow escalates to red first
+                2|3) echo "red" ;;
             esac
             ;;
 
         red)
             case "$PRESSURE" in
-                0) echo "yellow" ;;       # red must step down through yellow
-                1) echo "yellow" ;;
+                0|1) echo "yellow" ;;
                 2) echo "red" ;;
                 3) echo "panic" ;;
             esac
@@ -162,8 +145,7 @@ next_mode_graph() {
 
         panic)
             case "$PRESSURE" in
-                0|1) echo "red" ;;        # panic cannot jump straight green
-                2) echo "red" ;;
+                0|1|2) echo "red" ;;
                 3) echo "panic" ;;
             esac
             ;;
@@ -269,10 +251,6 @@ do
 
     PRESSURE=0
 
-    if [ "$GOOD_COUNT" -ge "$GREEN_REQUIRED" ]; then
-        PRESSURE=0
-    fi
-
     if [ "$BAD_COUNT" -ge "$YELLOW_REQUIRED" ]; then
         PRESSURE=1
     fi
@@ -285,11 +263,15 @@ do
         PRESSURE=3
     fi
 
+    if [ "$GOOD_COUNT" -ge "$GREEN_REQUIRED" ]; then
+        PRESSURE=0
+    fi
+
     MODE="$(next_mode_graph "$LAST_MODE" "$PRESSURE")"
 
     MODE_DWELL=$((MODE_DWELL + 1))
 
-    echo "delta=$DELTA avg=$AVG_DELTA drop=$DROP spike=$SPIKE spike_count=$SPIKE_COUNT drop_count=$DROP_COUNT reason=$REASON bad=$BAD_COUNT panic=$PANIC_COUNT good=$GOOD_COUNT pressure=$PRESSURE from=$LAST_MODE to=$MODE"
+    echo "delta=$DELTA avg=$AVG_DELTA drop=$DROP spike=$SPIKE reason=$REASON bad=$BAD_COUNT panic=$PANIC_COUNT good=$GOOD_COUNT pressure=$PRESSURE from=$LAST_MODE to=$MODE"
 
     if [ "$MODE" != "$LAST_MODE" ] && [ "$MODE_DWELL" -ge "$MODE_DWELL_REQUIRED" ]; then
         apply_mode "$MODE"
