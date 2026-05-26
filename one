@@ -14,63 +14,44 @@ GAME_DOWN=16000
 BULK_UP_GREEN=45000
 BULK_DOWN_GREEN=90000
 
-BULK_UP_YELLOW=32000
-BULK_DOWN_YELLOW=65000
+BULK_UP_YELLOW=34000
+BULK_DOWN_YELLOW=70000
 
-BULK_UP_RED=22000
-BULK_DOWN_RED=45000
+BULK_UP_RED=24000
+BULK_DOWN_RED=52000
 
-BULK_UP_PANIC=14000
-BULK_DOWN_PANIC=28000
+# Queue-delay thresholds in ms
+YELLOW_DELAY_MS=12
+RED_DELAY_MS=25
 
-AVG_DELTA=0
-LAST_TOTAL=0
-SEEDED=0
+YELLOW_REQUIRED=3
+RED_REQUIRED=6
+GREEN_REQUIRED=8
 
-DROP_DEADBAND=180
-SPIKE_DEADBAND=150
-
-PANIC_DROP=900
-PANIC_SPIKE=1200
-
-YELLOW_REQUIRED=6
-RED_REQUIRED=18
-PANIC_REQUIRED=3
-GREEN_REQUIRED=20
-
-SPIKE_CONFIRM=3
-DROP_CONFIRM=2
-
-SPIKE_COUNT=0
-DROP_COUNT=0
 BAD_COUNT=0
 GOOD_COUNT=0
-PANIC_COUNT=0
-
-MODE_DWELL_REQUIRED=1
-MODE_DWELL=0
-
-IN_TRIAL=0
-TRIAL_COUNT=0
-TRIAL_WINDOW=3
-ROLLBACK_CHECK_AFTER=2
-ROLLBACK_BAD_MARGIN=3
-PREV_MODE="green"
-PREV_BAD_COUNT=0
-PREV_PRESSURE=0
-
 LAST_MODE="none"
 
-get_pkts() {
+get_delay_ms() {
     DEV="$1"
-    CLASS="$2"
 
-    tc -s class show dev "$DEV" 2>/dev/null | awk -v cls="$CLASS" '
-        $0 ~ "class hfsc " cls { found=1; next }
-        found && /Sent/ {
+    tc -s qdisc show dev "$DEV" 2>/dev/null | awk '
+        /delay/ {
             for (i=1; i<=NF; i++) {
-                if ($i == "pkt") {
-                    print $(i-1)
+                if ($i ~ /delay/) {
+                    val=$(i+1)
+                    gsub(/[^0-9.]/, "", val)
+                    print int(val)
+                    exit
+                }
+            }
+        }
+        /avg_delay/ {
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /avg_delay/) {
+                    val=$(i+1)
+                    gsub(/[^0-9.]/, "", val)
+                    print int(val)
                     exit
                 }
             }
@@ -103,10 +84,6 @@ apply_mode() {
             BULK_UP="$BULK_UP_RED"
             BULK_DOWN="$BULK_DOWN_RED"
             ;;
-        panic)
-            BULK_UP="$BULK_UP_PANIC"
-            BULK_DOWN="$BULK_DOWN_PANIC"
-            ;;
         *)
             return
             ;;
@@ -114,208 +91,64 @@ apply_mode() {
 
     apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
     apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
+
     apply_class "$WAN_DEV" "$BULK_CLASS" "$BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$BULK_DOWN"
 
     echo "APPLY mode=$MODE game=${GAME_UP}/${GAME_DOWN} bulk=${BULK_UP}/${BULK_DOWN}"
 }
 
-next_mode_graph() {
-    CURRENT="$1"
-    PRESSURE="$2"
-
-    case "$CURRENT" in
-        green)
-            case "$PRESSURE" in
-                0) echo "green" ;;
-                1|2|3) echo "yellow" ;;
-            esac
-            ;;
-        yellow)
-            case "$PRESSURE" in
-                0) echo "green" ;;
-                1) echo "yellow" ;;
-                2|3) echo "red" ;;
-            esac
-            ;;
-        red)
-            case "$PRESSURE" in
-                0|1) echo "yellow" ;;
-                2) echo "red" ;;
-                3) echo "panic" ;;
-            esac
-            ;;
-        panic)
-            case "$PRESSURE" in
-                0|1|2) echo "red" ;;
-                3) echo "panic" ;;
-            esac
-            ;;
-        *)
-            echo "green"
-            ;;
-    esac
-}
-
 while true
 do
-    WAN_PKTS="$(get_pkts "$WAN_DEV" "$GAME_CLASS")"
-    IFB_PKTS="$(get_pkts "$IFB_DEV" "$GAME_CLASS")"
+    WAN_DELAY="$(get_delay_ms "$WAN_DEV")"
+    IFB_DELAY="$(get_delay_ms "$IFB_DEV")"
 
-    [ -z "$WAN_PKTS" ] && WAN_PKTS=0
-    [ -z "$IFB_PKTS" ] && IFB_PKTS=0
+    [ -z "$WAN_DELAY" ] && WAN_DELAY=0
+    [ -z "$IFB_DELAY" ] && IFB_DELAY=0
 
-    TOTAL=$((WAN_PKTS + IFB_PKTS))
-
-    if [ "$SEEDED" -eq 0 ]; then
-        LAST_TOTAL="$TOTAL"
-        SEEDED=1
-        LAST_MODE="green"
-        apply_mode green
-        echo "seed total=$TOTAL"
-        sleep "$SLEEP_SEC"
-        continue
-    fi
-
-    DELTA=$((TOTAL - LAST_TOTAL))
-
-    if [ "$DELTA" -lt 0 ]; then
-        DELTA=0
-        AVG_DELTA=0
-        BAD_COUNT=0
-        GOOD_COUNT=0
-        PANIC_COUNT=0
-        SPIKE_COUNT=0
-        DROP_COUNT=0
-        MODE_DWELL=0
-        IN_TRIAL=0
-        TRIAL_COUNT=0
-        echo "counter-reset detected"
-    fi
-
-    OLD_AVG="$AVG_DELTA"
-    AVG_DELTA=$(((AVG_DELTA * 85 + DELTA * 15) / 100))
-
-    DROP=$((OLD_AVG - DELTA))
-    [ "$DROP" -lt 0 ] && DROP=0
-
-    SPIKE=$((DELTA - OLD_AVG))
-    [ "$SPIKE" -lt 0 ] && SPIKE=0
-
-    if [ "$SPIKE" -gt "$SPIKE_DEADBAND" ]; then
-        SPIKE_COUNT=$((SPIKE_COUNT + 1))
+    # Use worst local queue delay
+    if [ "$WAN_DELAY" -gt "$IFB_DELAY" ]; then
+        DELAY="$WAN_DELAY"
+        SIDE="wan"
     else
-        [ "$SPIKE_COUNT" -gt 0 ] && SPIKE_COUNT=$((SPIKE_COUNT - 1))
-    fi
-
-    if [ "$DROP" -gt "$DROP_DEADBAND" ]; then
-        DROP_COUNT=$((DROP_COUNT + 1))
-    else
-        [ "$DROP_COUNT" -gt 0 ] && DROP_COUNT=$((DROP_COUNT - 1))
-    fi
-
-    BAD=0
-    PANIC=0
-    REASON="clean"
-
-    if [ "$SPIKE_COUNT" -ge "$SPIKE_CONFIRM" ]; then
-        BAD=1
-        REASON="spike_persist"
-    fi
-
-    if [ "$DROP_COUNT" -ge "$DROP_CONFIRM" ]; then
-        BAD=1
-        REASON="drop_persist"
-    fi
-
-    if [ "$SPIKE" -gt "$PANIC_SPIKE" ]; then
-        PANIC=1
-        REASON="panic_spike"
-    fi
-
-    if [ "$DROP" -gt "$PANIC_DROP" ]; then
-        PANIC=1
-        REASON="panic_drop"
-    fi
-
-    if [ "$PANIC" -eq 1 ]; then
-        PANIC_COUNT=$((PANIC_COUNT + 1))
-        BAD_COUNT=$((BAD_COUNT + 1))
-        GOOD_COUNT=0
-    elif [ "$BAD" -eq 1 ]; then
-        BAD_COUNT=$((BAD_COUNT + 1))
-        PANIC_COUNT=0
-        GOOD_COUNT=0
-    else
-        GOOD_COUNT=$((GOOD_COUNT + 1))
-        BAD_COUNT=0
-        PANIC_COUNT=0
+        DELAY="$IFB_DELAY"
+        SIDE="ifb"
     fi
 
     PRESSURE=0
 
-    if [ "$BAD_COUNT" -ge "$YELLOW_REQUIRED" ]; then
+    if [ "$DELAY" -ge "$YELLOW_DELAY_MS" ]; then
         PRESSURE=1
     fi
 
-    if [ "$BAD_COUNT" -ge "$RED_REQUIRED" ]; then
+    if [ "$DELAY" -ge "$RED_DELAY_MS" ]; then
         PRESSURE=2
     fi
 
-    if [ "$PANIC_COUNT" -ge "$PANIC_REQUIRED" ]; then
-        PRESSURE=3
+    if [ "$PRESSURE" -gt 0 ]; then
+        BAD_COUNT=$((BAD_COUNT + 1))
+        GOOD_COUNT=0
+    else
+        GOOD_COUNT=$((GOOD_COUNT + 1))
+        BAD_COUNT=0
     fi
 
-    if [ "$GOOD_COUNT" -ge "$GREEN_REQUIRED" ]; then
-        PRESSURE=0
+    MODE="$LAST_MODE"
+
+    if [ "$BAD_COUNT" -ge "$RED_REQUIRED" ] && [ "$PRESSURE" -eq 2 ]; then
+        MODE="red"
+    elif [ "$BAD_COUNT" -ge "$YELLOW_REQUIRED" ]; then
+        MODE="yellow"
+    elif [ "$GOOD_COUNT" -ge "$GREEN_REQUIRED" ]; then
+        MODE="green"
     fi
 
-    MODE="$(next_mode_graph "$LAST_MODE" "$PRESSURE")"
+    echo "delay=${DELAY}ms side=$SIDE wan=${WAN_DELAY}ms ifb=${IFB_DELAY}ms pressure=$PRESSURE bad=$BAD_COUNT good=$GOOD_COUNT mode=$MODE"
 
-    MODE_DWELL=$((MODE_DWELL + 1))
-
-    echo "delta=$DELTA avg=$AVG_DELTA drop=$DROP spike=$SPIKE reason=$REASON bad=$BAD_COUNT panic=$PANIC_COUNT good=$GOOD_COUNT pressure=$PRESSURE from=$LAST_MODE to=$MODE trial=$IN_TRIAL trial_count=$TRIAL_COUNT"
-
-    if [ "$IN_TRIAL" -eq 1 ]; then
-        TRIAL_COUNT=$((TRIAL_COUNT + 1))
-
-        if [ "$TRIAL_COUNT" -ge "$ROLLBACK_CHECK_AFTER" ]; then
-            if [ "$PRESSURE" -gt "$PREV_PRESSURE" ] && \
-               [ "$BAD_COUNT" -ge $((PREV_BAD_COUNT + ROLLBACK_BAD_MARGIN)) ]; then
-
-                echo "ROLLBACK from=$LAST_MODE to=$PREV_MODE bad_now=$BAD_COUNT bad_prev=$PREV_BAD_COUNT pressure_now=$PRESSURE pressure_prev=$PREV_PRESSURE"
-
-                apply_mode "$PREV_MODE"
-                LAST_MODE="$PREV_MODE"
-
-                IN_TRIAL=0
-                TRIAL_COUNT=0
-                MODE_DWELL=0
-            fi
-        fi
-
-        if [ "$TRIAL_COUNT" -ge "$TRIAL_WINDOW" ]; then
-            IN_TRIAL=0
-            TRIAL_COUNT=0
-        fi
-    fi
-
-    if [ "$IN_TRIAL" -eq 0 ] && \
-       [ "$MODE" != "$LAST_MODE" ] && \
-       [ "$MODE_DWELL" -ge "$MODE_DWELL_REQUIRED" ]; then
-
-        PREV_MODE="$LAST_MODE"
-        PREV_BAD_COUNT="$BAD_COUNT"
-        PREV_PRESSURE="$PRESSURE"
-
+    if [ "$MODE" != "$LAST_MODE" ]; then
         apply_mode "$MODE"
         LAST_MODE="$MODE"
-        MODE_DWELL=0
-
-        IN_TRIAL=1
-        TRIAL_COUNT=0
     fi
 
-    LAST_TOTAL="$TOTAL"
     sleep "$SLEEP_SEC"
 done
