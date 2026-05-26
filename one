@@ -84,12 +84,10 @@ apply_class() {
     CLASS="$2"
     RATE="$3"
 
-    if has_class "$DEV" "$CLASS"; then
-        tc class change dev "$DEV" classid "$CLASS" \
-            hfsc ls rate "${RATE}kbit" ul rate "${RATE}kbit"
-    else
-        echo "WARN missing class dev=$DEV class=$CLASS"
-    fi
+    
+    tc class change dev "$DEV" classid "$CLASS" \
+        hfsc ls rate "${RATE}kbit" ul rate "${RATE}kbit"
+    
 }
 
 apply_mode() {
