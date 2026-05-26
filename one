@@ -50,6 +50,15 @@ PANIC_COUNT=0
 MODE_DWELL_REQUIRED=1
 MODE_DWELL=0
 
+IN_TRIAL=0
+TRIAL_COUNT=0
+TRIAL_WINDOW=3
+ROLLBACK_CHECK_AFTER=2
+ROLLBACK_BAD_MARGIN=3
+PREV_MODE="green"
+PREV_BAD_COUNT=0
+PREV_PRESSURE=0
+
 LAST_MODE="none"
 
 get_pkts() {
@@ -57,10 +66,7 @@ get_pkts() {
     CLASS="$2"
 
     tc -s class show dev "$DEV" 2>/dev/null | awk -v cls="$CLASS" '
-        $0 ~ "class hfsc " cls {
-            found=1
-            next
-        }
+        $0 ~ "class hfsc " cls { found=1; next }
         found && /Sent/ {
             for (i=1; i<=NF; i++) {
                 if ($i == "pkt") {
@@ -108,7 +114,6 @@ apply_mode() {
 
     apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
     apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
-
     apply_class "$WAN_DEV" "$BULK_CLASS" "$BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$BULK_DOWN"
 
@@ -126,7 +131,6 @@ next_mode_graph() {
                 1|2|3) echo "yellow" ;;
             esac
             ;;
-
         yellow)
             case "$PRESSURE" in
                 0) echo "green" ;;
@@ -134,7 +138,6 @@ next_mode_graph() {
                 2|3) echo "red" ;;
             esac
             ;;
-
         red)
             case "$PRESSURE" in
                 0|1) echo "yellow" ;;
@@ -142,14 +145,12 @@ next_mode_graph() {
                 3) echo "panic" ;;
             esac
             ;;
-
         panic)
             case "$PRESSURE" in
                 0|1|2) echo "red" ;;
                 3) echo "panic" ;;
             esac
             ;;
-
         *)
             echo "green"
             ;;
@@ -187,6 +188,8 @@ do
         SPIKE_COUNT=0
         DROP_COUNT=0
         MODE_DWELL=0
+        IN_TRIAL=0
+        TRIAL_COUNT=0
         echo "counter-reset detected"
     fi
 
@@ -271,12 +274,46 @@ do
 
     MODE_DWELL=$((MODE_DWELL + 1))
 
-    echo "delta=$DELTA avg=$AVG_DELTA drop=$DROP spike=$SPIKE reason=$REASON bad=$BAD_COUNT panic=$PANIC_COUNT good=$GOOD_COUNT pressure=$PRESSURE from=$LAST_MODE to=$MODE"
+    echo "delta=$DELTA avg=$AVG_DELTA drop=$DROP spike=$SPIKE reason=$REASON bad=$BAD_COUNT panic=$PANIC_COUNT good=$GOOD_COUNT pressure=$PRESSURE from=$LAST_MODE to=$MODE trial=$IN_TRIAL trial_count=$TRIAL_COUNT"
 
-    if [ "$MODE" != "$LAST_MODE" ] && [ "$MODE_DWELL" -ge "$MODE_DWELL_REQUIRED" ]; then
+    if [ "$IN_TRIAL" -eq 1 ]; then
+        TRIAL_COUNT=$((TRIAL_COUNT + 1))
+
+        if [ "$TRIAL_COUNT" -ge "$ROLLBACK_CHECK_AFTER" ]; then
+            if [ "$PRESSURE" -gt "$PREV_PRESSURE" ] && \
+               [ "$BAD_COUNT" -ge $((PREV_BAD_COUNT + ROLLBACK_BAD_MARGIN)) ]; then
+
+                echo "ROLLBACK from=$LAST_MODE to=$PREV_MODE bad_now=$BAD_COUNT bad_prev=$PREV_BAD_COUNT pressure_now=$PRESSURE pressure_prev=$PREV_PRESSURE"
+
+                apply_mode "$PREV_MODE"
+                LAST_MODE="$PREV_MODE"
+
+                IN_TRIAL=0
+                TRIAL_COUNT=0
+                MODE_DWELL=0
+            fi
+        fi
+
+        if [ "$TRIAL_COUNT" -ge "$TRIAL_WINDOW" ]; then
+            IN_TRIAL=0
+            TRIAL_COUNT=0
+        fi
+    fi
+
+    if [ "$IN_TRIAL" -eq 0 ] && \
+       [ "$MODE" != "$LAST_MODE" ] && \
+       [ "$MODE_DWELL" -ge "$MODE_DWELL_REQUIRED" ]; then
+
+        PREV_MODE="$LAST_MODE"
+        PREV_BAD_COUNT="$BAD_COUNT"
+        PREV_PRESSURE="$PRESSURE"
+
         apply_mode "$MODE"
         LAST_MODE="$MODE"
         MODE_DWELL=0
+
+        IN_TRIAL=1
+        TRIAL_COUNT=0
     fi
 
     LAST_TOTAL="$TOTAL"
