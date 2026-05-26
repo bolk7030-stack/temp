@@ -8,44 +8,35 @@ BULK_CLASS="1:60"
 
 SLEEP_SEC=1
 
+# Fixed intent lane
 GAME_UP=12000
 GAME_DOWN=16000
 
-BULK_UP_GREEN=45000
-BULK_DOWN_GREEN=90000
+# Bulk valve limits
+BULK_UP_BASE=45000
+BULK_DOWN_BASE=90000
 
-BULK_UP_YELLOW=34000
-BULK_DOWN_YELLOW=70000
+BULK_UP_MIN=24000
+BULK_DOWN_MIN=52000
 
-BULK_UP_RED=24000
-BULK_DOWN_RED=52000
+# Queue-delay target
+TARGET_DELAY_MS=12
 
-# Queue-delay thresholds in ms
-YELLOW_DELAY_MS=12
-RED_DELAY_MS=25
+# Trim strength per ms above target
+UP_TRIM_PER_MS=900
+DOWN_TRIM_PER_MS=1400
 
-YELLOW_REQUIRED=3
-RED_REQUIRED=6
-GREEN_REQUIRED=8
+# Slow restore when clean
+UP_RESTORE_PER_TICK=1500
+DOWN_RESTORE_PER_TICK=2500
 
-BAD_COUNT=0
-GOOD_COUNT=0
-LAST_MODE="none"
+CUR_BULK_UP="$BULK_UP_BASE"
+CUR_BULK_DOWN="$BULK_DOWN_BASE"
 
 get_delay_ms() {
     DEV="$1"
 
     tc -s qdisc show dev "$DEV" 2>/dev/null | awk '
-        /delay/ {
-            for (i=1; i<=NF; i++) {
-                if ($i ~ /delay/) {
-                    val=$(i+1)
-                    gsub(/[^0-9.]/, "", val)
-                    print int(val)
-                    exit
-                }
-            }
-        }
         /avg_delay/ {
             for (i=1; i<=NF; i++) {
                 if ($i ~ /avg_delay/) {
@@ -56,7 +47,28 @@ get_delay_ms() {
                 }
             }
         }
+        /delay/ {
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /delay/) {
+                    val=$(i+1)
+                    gsub(/[^0-9.]/, "", val)
+                    print int(val)
+                    exit
+                }
+            }
+        }
     '
+}
+
+clamp() {
+    VAL="$1"
+    MIN="$2"
+    MAX="$3"
+
+    [ "$VAL" -lt "$MIN" ] && VAL="$MIN"
+    [ "$VAL" -gt "$MAX" ] && VAL="$MAX"
+
+    echo "$VAL"
 }
 
 apply_class() {
@@ -68,35 +80,18 @@ apply_class() {
         hfsc ls rate "${RATE}kbit" ul rate "${RATE}kbit" 2>/dev/null
 }
 
-apply_mode() {
-    MODE="$1"
-
-    case "$MODE" in
-        green)
-            BULK_UP="$BULK_UP_GREEN"
-            BULK_DOWN="$BULK_DOWN_GREEN"
-            ;;
-        yellow)
-            BULK_UP="$BULK_UP_YELLOW"
-            BULK_DOWN="$BULK_DOWN_YELLOW"
-            ;;
-        red)
-            BULK_UP="$BULK_UP_RED"
-            BULK_DOWN="$BULK_DOWN_RED"
-            ;;
-        *)
-            return
-            ;;
-    esac
-
+apply_rates() {
     apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
     apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
 
-    apply_class "$WAN_DEV" "$BULK_CLASS" "$BULK_UP"
-    apply_class "$IFB_DEV" "$BULK_CLASS" "$BULK_DOWN"
+    apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
+    apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY mode=$MODE game=${GAME_UP}/${GAME_DOWN} bulk=${BULK_UP}/${BULK_DOWN}"
+    echo "APPLY delay=${DELAY}ms side=$SIDE game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
+
+# Initial baseline
+apply_rates
 
 while true
 do
@@ -106,7 +101,6 @@ do
     [ -z "$WAN_DELAY" ] && WAN_DELAY=0
     [ -z "$IFB_DELAY" ] && IFB_DELAY=0
 
-    # Use worst local queue delay
     if [ "$WAN_DELAY" -gt "$IFB_DELAY" ]; then
         DELAY="$WAN_DELAY"
         SIDE="wan"
@@ -115,40 +109,24 @@ do
         SIDE="ifb"
     fi
 
-    PRESSURE=0
+    if [ "$DELAY" -gt "$TARGET_DELAY_MS" ]; then
+        EXCESS=$((DELAY - TARGET_DELAY_MS))
 
-    if [ "$DELAY" -ge "$YELLOW_DELAY_MS" ]; then
-        PRESSURE=1
-    fi
+        NEW_UP=$((BULK_UP_BASE - EXCESS * UP_TRIM_PER_MS))
+        NEW_DOWN=$((BULK_DOWN_BASE - EXCESS * DOWN_TRIM_PER_MS))
 
-    if [ "$DELAY" -ge "$RED_DELAY_MS" ]; then
-        PRESSURE=2
-    fi
+        CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
+        CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
 
-    if [ "$PRESSURE" -gt 0 ]; then
-        BAD_COUNT=$((BAD_COUNT + 1))
-        GOOD_COUNT=0
     else
-        GOOD_COUNT=$((GOOD_COUNT + 1))
-        BAD_COUNT=0
+        CUR_BULK_UP=$((CUR_BULK_UP + UP_RESTORE_PER_TICK))
+        CUR_BULK_DOWN=$((CUR_BULK_DOWN + DOWN_RESTORE_PER_TICK))
+
+        CUR_BULK_UP="$(clamp "$CUR_BULK_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
+        CUR_BULK_DOWN="$(clamp "$CUR_BULK_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
     fi
 
-    MODE="$LAST_MODE"
-
-    if [ "$BAD_COUNT" -ge "$RED_REQUIRED" ] && [ "$PRESSURE" -eq 2 ]; then
-        MODE="red"
-    elif [ "$BAD_COUNT" -ge "$YELLOW_REQUIRED" ]; then
-        MODE="yellow"
-    elif [ "$GOOD_COUNT" -ge "$GREEN_REQUIRED" ]; then
-        MODE="green"
-    fi
-
-    echo "delay=${DELAY}ms side=$SIDE wan=${WAN_DELAY}ms ifb=${IFB_DELAY}ms pressure=$PRESSURE bad=$BAD_COUNT good=$GOOD_COUNT mode=$MODE"
-
-    if [ "$MODE" != "$LAST_MODE" ]; then
-        apply_mode "$MODE"
-        LAST_MODE="$MODE"
-    fi
+    apply_rates
 
     sleep "$SLEEP_SEC"
 done
