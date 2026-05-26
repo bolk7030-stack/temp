@@ -4,52 +4,66 @@ WAN_DEV="eth1"
 IFB_DEV="ifb-eth1"
 
 GAME_CLASS="1:20"
-
-# Bulk ladder pockets
-BULK_LIGHT="1:30"
-BULK_SUSPECT="1:31"
-BULK_PRESSURE="1:32"
-BULK_QUARANTINE="1:60"
+BULK_CLASS="1:60"
 
 SLEEP_SEC=1
 
+# Sacred game lane
 GAME_UP=12000
 GAME_DOWN=16000
 
-# Sensors
-DROP_DEADBAND=180
-SPIKE_DEADBAND=150
+# Bulk states
+BULK_UP_GREEN=45000
+BULK_DOWN_GREEN=90000
 
-SPIKE_CONFIRM=2
-DROP_CONFIRM=2
+BULK_UP_YELLOW=32000
+BULK_DOWN_YELLOW=65000
 
-YELLOW_REQUIRED=6
-RED_REQUIRED=18
-GREEN_REQUIRED=12
+BULK_UP_RED=22000
+BULK_DOWN_RED=45000
+
+# Rare panic clamp
+BULK_UP_PANIC=14000
+BULK_DOWN_PANIC=28000
 
 AVG_DELTA=0
 LAST_TOTAL=0
 SEEDED=0
 
+DROP_DEADBAND=180
+SPIKE_DEADBAND=150
+
+PANIC_DROP=900
+PANIC_SPIKE=1200
+
+YELLOW_REQUIRED=6
+RED_REQUIRED=18
+PANIC_REQUIRED=3
+GREEN_REQUIRED=20
+
+SPIKE_CONFIRM=3
+DROP_CONFIRM=2
+
 SPIKE_COUNT=0
 DROP_COUNT=0
 BAD_COUNT=0
 GOOD_COUNT=0
+PANIC_COUNT=0
+
+MODE_DWELL_REQUIRED=1
+MODE_DWELL=0
 
 LAST_MODE="none"
-
-DEBUG=1
-
-log() {
-    [ "$DEBUG" -eq 1 ] && echo "$1"
-}
 
 get_pkts() {
     DEV="$1"
     CLASS="$2"
 
     tc -s class show dev "$DEV" 2>/dev/null | awk -v cls="$CLASS" '
-        $0 ~ "class hfsc " cls { found=1; next }
+        $0 ~ "class hfsc " cls {
+            found=1
+            next
+        }
         found && /Sent/ {
             for (i=1; i<=NF; i++) {
                 if ($i == "pkt") {
@@ -81,58 +95,85 @@ apply_class() {
 apply_mode() {
     MODE="$1"
 
-    # Always protect game lane
-    apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
-    apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
-
     case "$MODE" in
         green)
-            # coexistence: most room, no artificial steel
-            apply_class "$WAN_DEV" "$BULK_LIGHT" 45000
-            apply_class "$IFB_DEV" "$BULK_LIGHT" 90000
-
-            apply_class "$WAN_DEV" "$BULK_SUSPECT" 40000
-            apply_class "$IFB_DEV" "$BULK_SUSPECT" 85000
-
-            apply_class "$WAN_DEV" "$BULK_PRESSURE" 36000
-            apply_class "$IFB_DEV" "$BULK_PRESSURE" 78000
-
-            apply_class "$WAN_DEV" "$BULK_QUARANTINE" 30000
-            apply_class "$IFB_DEV" "$BULK_QUARANTINE" 70000
+            BULK_UP="$BULK_UP_GREEN"
+            BULK_DOWN="$BULK_DOWN_GREEN"
             ;;
-
         yellow)
-            # separation: suspect pocket absorbs pressure first
-            apply_class "$WAN_DEV" "$BULK_LIGHT" 45000
-            apply_class "$IFB_DEV" "$BULK_LIGHT" 90000
-
-            apply_class "$WAN_DEV" "$BULK_SUSPECT" 33000
-            apply_class "$IFB_DEV" "$BULK_SUSPECT" 72000
-
-            apply_class "$WAN_DEV" "$BULK_PRESSURE" 30000
-            apply_class "$IFB_DEV" "$BULK_PRESSURE" 65000
-
-            apply_class "$WAN_DEV" "$BULK_QUARANTINE" 26000
-            apply_class "$IFB_DEV" "$BULK_QUARANTINE" 60000
+            BULK_UP="$BULK_UP_YELLOW"
+            BULK_DOWN="$BULK_DOWN_YELLOW"
             ;;
-
         red)
-            # quarantine: staged pressure, not one violent clamp
-            apply_class "$WAN_DEV" "$BULK_LIGHT" 43000
-            apply_class "$IFB_DEV" "$BULK_LIGHT" 85000
-
-            apply_class "$WAN_DEV" "$BULK_SUSPECT" 30000
-            apply_class "$IFB_DEV" "$BULK_SUSPECT" 65000
-
-            apply_class "$WAN_DEV" "$BULK_PRESSURE" 26000
-            apply_class "$IFB_DEV" "$BULK_PRESSURE" 58000
-
-            apply_class "$WAN_DEV" "$BULK_QUARANTINE" 22000
-            apply_class "$IFB_DEV" "$BULK_QUARANTINE" 52000
+            BULK_UP="$BULK_UP_RED"
+            BULK_DOWN="$BULK_DOWN_RED"
+            ;;
+        panic)
+            BULK_UP="$BULK_UP_PANIC"
+            BULK_DOWN="$BULK_DOWN_PANIC"
+            ;;
+        *)
+            echo "WARN unknown mode=$MODE"
+            return
             ;;
     esac
 
-    echo "APPLY mode=$MODE game=$GAME_UP/$GAME_DOWN ladder=${BULK_LIGHT},${BULK_SUSPECT},${BULK_PRESSURE},${BULK_QUARANTINE}"
+    apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
+    apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
+
+    apply_class "$WAN_DEV" "$BULK_CLASS" "$BULK_UP"
+    apply_class "$IFB_DEV" "$BULK_CLASS" "$BULK_DOWN"
+
+    echo "APPLY mode=$MODE game=${GAME_UP}/${GAME_DOWN} bulk=${BULK_UP}/${BULK_DOWN}"
+}
+
+next_mode_graph() {
+    CURRENT="$1"
+    PRESSURE="$2"
+
+    # PRESSURE:
+    # 0 = clean
+    # 1 = yellow requested
+    # 2 = red requested
+    # 3 = panic requested
+
+    case "$CURRENT" in
+        green)
+            case "$PRESSURE" in
+                0) echo "green" ;;
+                1|2|3) echo "yellow" ;;   # green cannot jump straight to red/panic
+            esac
+            ;;
+
+        yellow)
+            case "$PRESSURE" in
+                0) echo "green" ;;
+                1) echo "yellow" ;;
+                2|3) echo "red" ;;        # yellow escalates to red first
+            esac
+            ;;
+
+        red)
+            case "$PRESSURE" in
+                0) echo "yellow" ;;       # red must step down through yellow
+                1) echo "yellow" ;;
+                2) echo "red" ;;
+                3) echo "panic" ;;
+            esac
+            ;;
+
+        panic)
+            case "$PRESSURE" in
+                0|1) echo "red" ;;        # panic cannot jump straight green
+                2) echo "red" ;;
+                3) echo "panic" ;;
+            esac
+            ;;
+
+        *)
+            echo "green"
+            ;;
+    esac
 }
 
 while true
@@ -150,13 +191,24 @@ do
         SEEDED=1
         LAST_MODE="green"
         apply_mode green
-        log "seed total=$TOTAL"
+        echo "seed total=$TOTAL"
         sleep "$SLEEP_SEC"
         continue
     fi
 
     DELTA=$((TOTAL - LAST_TOTAL))
-    [ "$DELTA" -lt 0 ] && DELTA=0
+
+    if [ "$DELTA" -lt 0 ]; then
+        DELTA=0
+        AVG_DELTA=0
+        BAD_COUNT=0
+        GOOD_COUNT=0
+        PANIC_COUNT=0
+        SPIKE_COUNT=0
+        DROP_COUNT=0
+        MODE_DWELL=0
+        echo "counter-reset detected"
+    fi
 
     OLD_AVG="$AVG_DELTA"
     AVG_DELTA=$(((AVG_DELTA * 85 + DELTA * 15) / 100))
@@ -180,41 +232,71 @@ do
     fi
 
     BAD=0
+    PANIC=0
     REASON="clean"
 
     if [ "$SPIKE_COUNT" -ge "$SPIKE_CONFIRM" ]; then
         BAD=1
-        REASON="spike"
+        REASON="spike_persist"
     fi
 
     if [ "$DROP_COUNT" -ge "$DROP_CONFIRM" ]; then
         BAD=1
-        REASON="drop"
+        REASON="drop_persist"
     fi
 
-    if [ "$BAD" -eq 1 ]; then
+    if [ "$SPIKE" -gt "$PANIC_SPIKE" ]; then
+        PANIC=1
+        REASON="panic_spike"
+    fi
+
+    if [ "$DROP" -gt "$PANIC_DROP" ]; then
+        PANIC=1
+        REASON="panic_drop"
+    fi
+
+    if [ "$PANIC" -eq 1 ]; then
+        PANIC_COUNT=$((PANIC_COUNT + 1))
         BAD_COUNT=$((BAD_COUNT + 1))
+        GOOD_COUNT=0
+    elif [ "$BAD" -eq 1 ]; then
+        BAD_COUNT=$((BAD_COUNT + 1))
+        PANIC_COUNT=0
         GOOD_COUNT=0
     else
         GOOD_COUNT=$((GOOD_COUNT + 1))
-        [ "$BAD_COUNT" -gt 0 ] && BAD_COUNT=$((BAD_COUNT - 1))
+        BAD_COUNT=0
+        PANIC_COUNT=0
     fi
 
-    MODE="$LAST_MODE"
+    PRESSURE=0
+
+    if [ "$GOOD_COUNT" -ge "$GREEN_REQUIRED" ]; then
+        PRESSURE=0
+    fi
+
+    if [ "$BAD_COUNT" -ge "$YELLOW_REQUIRED" ]; then
+        PRESSURE=1
+    fi
 
     if [ "$BAD_COUNT" -ge "$RED_REQUIRED" ]; then
-        MODE="red"
-    elif [ "$BAD_COUNT" -ge "$YELLOW_REQUIRED" ]; then
-        MODE="yellow"
-    elif [ "$GOOD_COUNT" -ge "$GREEN_REQUIRED" ]; then
-        MODE="green"
+        PRESSURE=2
     fi
 
-    log "delta=$DELTA avg=$AVG_DELTA spike=$SPIKE drop=$DROP spike_count=$SPIKE_COUNT drop_count=$DROP_COUNT reason=$REASON bad=$BAD_COUNT good=$GOOD_COUNT mode=$MODE"
+    if [ "$PANIC_COUNT" -ge "$PANIC_REQUIRED" ]; then
+        PRESSURE=3
+    fi
 
-    if [ "$MODE" != "$LAST_MODE" ]; then
+    MODE="$(next_mode_graph "$LAST_MODE" "$PRESSURE")"
+
+    MODE_DWELL=$((MODE_DWELL + 1))
+
+    echo "delta=$DELTA avg=$AVG_DELTA drop=$DROP spike=$SPIKE spike_count=$SPIKE_COUNT drop_count=$DROP_COUNT reason=$REASON bad=$BAD_COUNT panic=$PANIC_COUNT good=$GOOD_COUNT pressure=$PRESSURE from=$LAST_MODE to=$MODE"
+
+    if [ "$MODE" != "$LAST_MODE" ] && [ "$MODE_DWELL" -ge "$MODE_DWELL_REQUIRED" ]; then
         apply_mode "$MODE"
         LAST_MODE="$MODE"
+        MODE_DWELL=0
     fi
 
     LAST_TOTAL="$TOTAL"
