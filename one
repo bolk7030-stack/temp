@@ -8,27 +8,25 @@ BULK_CLASS="1:60"
 
 SLEEP_SEC=1
 
-# Fixed intent lane
 GAME_UP=12000
 GAME_DOWN=16000
 
-# Bulk valve limits
 BULK_UP_BASE=45000
 BULK_DOWN_BASE=90000
 
 BULK_UP_MIN=24000
 BULK_DOWN_MIN=52000
 
-# Queue-delay target
 TARGET_DELAY_MS=12
 
-# Trim strength per ms above target
-UP_TRIM_PER_MS=900
-DOWN_TRIM_PER_MS=1400
+# Trim strength per unit of sustained pressure debt
+UP_TRIM_PER_DEBT=450
+DOWN_TRIM_PER_DEBT=700
 
-# Slow restore when clean
-UP_RESTORE_PER_TICK=1500
-DOWN_RESTORE_PER_TICK=2500
+# Pressure debt behavior
+PRESSURE_DEBT=0
+PRESSURE_DEBT_MAX=60
+PRESSURE_DECAY_PER_TICK=3
 
 CUR_BULK_UP="$BULK_UP_BASE"
 CUR_BULK_DOWN="$BULK_DOWN_BASE"
@@ -87,10 +85,9 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY delay=${DELAY}ms side=$SIDE game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
-# Initial baseline
 apply_rates
 
 while true
@@ -109,22 +106,21 @@ do
         SIDE="ifb"
     fi
 
-    if [ "$DELAY" -gt "$TARGET_DELAY_MS" ]; then
-        EXCESS=$((DELAY - TARGET_DELAY_MS))
+    EXCESS=$((DELAY - TARGET_DELAY_MS))
 
-        NEW_UP=$((BULK_UP_BASE - EXCESS * UP_TRIM_PER_MS))
-        NEW_DOWN=$((BULK_DOWN_BASE - EXCESS * DOWN_TRIM_PER_MS))
-
-        CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
-        CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
-
+    if [ "$EXCESS" -gt 0 ]; then
+        PRESSURE_DEBT=$((PRESSURE_DEBT + EXCESS))
     else
-        CUR_BULK_UP=$((CUR_BULK_UP + UP_RESTORE_PER_TICK))
-        CUR_BULK_DOWN=$((CUR_BULK_DOWN + DOWN_RESTORE_PER_TICK))
-
-        CUR_BULK_UP="$(clamp "$CUR_BULK_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
-        CUR_BULK_DOWN="$(clamp "$CUR_BULK_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
+        PRESSURE_DEBT=$((PRESSURE_DEBT - PRESSURE_DECAY_PER_TICK))
     fi
+
+    PRESSURE_DEBT="$(clamp "$PRESSURE_DEBT" 0 "$PRESSURE_DEBT_MAX")"
+
+    NEW_UP=$((BULK_UP_BASE - PRESSURE_DEBT * UP_TRIM_PER_DEBT))
+    NEW_DOWN=$((BULK_DOWN_BASE - PRESSURE_DEBT * DOWN_TRIM_PER_DEBT))
+
+    CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
+    CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
 
     apply_rates
 
