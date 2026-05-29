@@ -19,14 +19,14 @@ BULK_DOWN_MIN=52000
 
 TARGET_DELAY_MS=12
 
-# Trim strength per unit of sustained pressure debt
+# Trim strength per unit of curved sustained pressure
 UP_TRIM_PER_DEBT=450
 DOWN_TRIM_PER_DEBT=700
 
 # Pressure debt behavior
 PRESSURE_DEBT=0
 PRESSURE_DEBT_MAX=60
-PRESSURE_DECAY_PER_TICK=3
+PRESSURE_DECAY_PER_TICK=2
 
 CUR_BULK_UP="$BULK_UP_BASE"
 CUR_BULK_DOWN="$BULK_DOWN_BASE"
@@ -85,7 +85,7 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT kin=$KIN_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
@@ -116,8 +116,14 @@ do
 
     PRESSURE_DEBT="$(clamp "$PRESSURE_DEBT" 0 "$PRESSURE_DEBT_MAX")"
 
-    NEW_UP=$((BULK_UP_BASE - PRESSURE_DEBT * UP_TRIM_PER_DEBT))
-    NEW_DOWN=$((BULK_DOWN_BASE - PRESSURE_DEBT * DOWN_TRIM_PER_DEBT))
+    # Kinematic pressure curve:
+    # low debt = freer glide
+    # medium debt = smooth tightening
+    # high debt = real protection
+    KIN_DEBT=$((PRESSURE_DEBT * PRESSURE_DEBT / PRESSURE_DEBT_MAX))
+
+    NEW_UP=$((BULK_UP_BASE - KIN_DEBT * UP_TRIM_PER_DEBT))
+    NEW_DOWN=$((BULK_DOWN_BASE - KIN_DEBT * DOWN_TRIM_PER_DEBT))
 
     CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
     CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
