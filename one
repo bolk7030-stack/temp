@@ -19,12 +19,13 @@ BULK_DOWN_MIN=52000
 
 TARGET_DELAY_MS=12
 
-# Trim strength per unit of curved sustained pressure
+# Trim strength per unit of edge pressure
 UP_TRIM_PER_DEBT=450
 DOWN_TRIM_PER_DEBT=700
 
 # Pressure debt behavior
 PRESSURE_DEBT=0
+LAST_PRESSURE_DEBT=0
 PRESSURE_DEBT_MAX=60
 PRESSURE_DECAY_PER_TICK=2
 
@@ -85,7 +86,7 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT kin=$KIN_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT vel=$DEBT_VELOCITY kin=$KIN_DEBT edge=$EDGE_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
@@ -116,19 +117,29 @@ do
 
     PRESSURE_DEBT="$(clamp "$PRESSURE_DEBT" 0 "$PRESSURE_DEBT_MAX")"
 
+    # Debt velocity: only positive growth matters.
+    # This gives a small edge when pressure starts building quickly.
+    DEBT_VELOCITY=$((PRESSURE_DEBT - LAST_PRESSURE_DEBT))
+    [ "$DEBT_VELOCITY" -lt 0 ] && DEBT_VELOCITY=0
+
     # Kinematic pressure curve:
     # low debt = freer glide
     # medium debt = smooth tightening
     # high debt = real protection
     KIN_DEBT=$((PRESSURE_DEBT * PRESSURE_DEBT / PRESSURE_DEBT_MAX))
 
-    NEW_UP=$((BULK_UP_BASE - KIN_DEBT * UP_TRIM_PER_DEBT))
-    NEW_DOWN=$((BULK_DOWN_BASE - KIN_DEBT * DOWN_TRIM_PER_DEBT))
+    # Mostly kinematic, with a small velocity edge for fast-opening pressure windows.
+    EDGE_DEBT=$((KIN_DEBT + DEBT_VELOCITY))
+
+    NEW_UP=$((BULK_UP_BASE - EDGE_DEBT * UP_TRIM_PER_DEBT))
+    NEW_DOWN=$((BULK_DOWN_BASE - EDGE_DEBT * DOWN_TRIM_PER_DEBT))
 
     CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
     CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
 
     apply_rates
+
+    LAST_PRESSURE_DEBT="$PRESSURE_DEBT"
 
     sleep "$SLEEP_SEC"
 done
