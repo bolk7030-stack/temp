@@ -11,7 +11,6 @@ SLEEP_SEC=1
 GAME_UP=12000
 GAME_DOWN=16000
 
-# Stable operating envelope
 BULK_UP_BASE=45000
 BULK_DOWN_BASE=90000
 
@@ -20,25 +19,20 @@ BULK_DOWN_MIN=52000
 
 TARGET_DELAY_MS=12
 
-# Desired steering aggressiveness
-UP_RESPONSE_GAIN=650
-DOWN_RESPONSE_GAIN=950
+# Flywheel authority
+FLYWHEEL=0
+FLYWHEEL_MAX=60
+FLYWHEEL_DECAY_PER_TICK=1
 
-# Curvature limiter:
-# maximum allowed rate movement per tick
-MAX_UP_STEP=1800
-MAX_DOWN_STEP=3200
+# How fast pressure loads the flywheel
+LOAD_GAIN=1
 
-# Smooth graph memory
-SMOOTH_DELAY=0
-SMOOTH_FACTOR_NUM=8
-SMOOTH_FACTOR_DEN=10
+# Trim strength per flywheel authority
+UP_TRIM_PER_FLYWHEEL=450
+DOWN_TRIM_PER_FLYWHEEL=700
 
 CUR_BULK_UP="$BULK_UP_BASE"
 CUR_BULK_DOWN="$BULK_DOWN_BASE"
-
-TARGET_BULK_UP="$BULK_UP_BASE"
-TARGET_BULK_DOWN="$BULK_DOWN_BASE"
 
 get_delay_ms() {
     DEV="$1"
@@ -78,29 +72,6 @@ clamp() {
     echo "$VAL"
 }
 
-approach_target() {
-    CURRENT="$1"
-    TARGET="$2"
-    STEP="$3"
-
-    if [ "$CURRENT" -lt "$TARGET" ]; then
-        CURRENT=$((CURRENT + STEP))
-
-        if [ "$CURRENT" -gt "$TARGET" ]; then
-            CURRENT="$TARGET"
-        fi
-
-    elif [ "$CURRENT" -gt "$TARGET" ]; then
-        CURRENT=$((CURRENT - STEP))
-
-        if [ "$CURRENT" -lt "$TARGET" ]; then
-            CURRENT="$TARGET"
-        fi
-    fi
-
-    echo "$CURRENT"
-}
-
 apply_class() {
     DEV="$1"
     CLASS="$2"
@@ -117,7 +88,7 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY raw=${DELAY}ms smooth=${SMOOTH_DELAY}ms excess=${EXCESS} up=${CUR_BULK_UP} down=${CUR_BULK_DOWN}"
+    echo "APPLY delay=${DELAY}ms side=$SIDE excess=$EXCESS flywheel=$FLYWHEEL game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
@@ -132,28 +103,27 @@ do
 
     if [ "$WAN_DELAY" -gt "$IFB_DELAY" ]; then
         DELAY="$WAN_DELAY"
+        SIDE="wan"
     else
         DELAY="$IFB_DELAY"
+        SIDE="ifb"
     fi
 
-    # Curvature smoothing:
-    # avoid violent graph transitions
-    SMOOTH_DELAY=$(((SMOOTH_DELAY * SMOOTH_FACTOR_NUM + DELAY * (SMOOTH_FACTOR_DEN - SMOOTH_FACTOR_NUM)) / SMOOTH_FACTOR_DEN))
+    EXCESS=$((DELAY - TARGET_DELAY_MS))
 
-    EXCESS=$((SMOOTH_DELAY - TARGET_DELAY_MS))
+    if [ "$EXCESS" -gt 0 ]; then
+        FLYWHEEL=$((FLYWHEEL + EXCESS * LOAD_GAIN))
+    else
+        FLYWHEEL=$((FLYWHEEL - FLYWHEEL_DECAY_PER_TICK))
+    fi
 
-    [ "$EXCESS" -lt 0 ] && EXCESS=0
+    FLYWHEEL="$(clamp "$FLYWHEEL" 0 "$FLYWHEEL_MAX")"
 
-    TARGET_BULK_UP=$((BULK_UP_BASE - EXCESS * UP_RESPONSE_GAIN))
-    TARGET_BULK_DOWN=$((BULK_DOWN_BASE - EXCESS * DOWN_RESPONSE_GAIN))
+    NEW_UP=$((BULK_UP_BASE - FLYWHEEL * UP_TRIM_PER_FLYWHEEL))
+    NEW_DOWN=$((BULK_DOWN_BASE - FLYWHEEL * DOWN_TRIM_PER_FLYWHEEL))
 
-    TARGET_BULK_UP="$(clamp "$TARGET_BULK_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
-    TARGET_BULK_DOWN="$(clamp "$TARGET_BULK_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
-
-    # Graph trajectory minimization:
-    # bounded slope movement only
-    CUR_BULK_UP="$(approach_target "$CUR_BULK_UP" "$TARGET_BULK_UP" "$MAX_UP_STEP")"
-    CUR_BULK_DOWN="$(approach_target "$CUR_BULK_DOWN" "$TARGET_BULK_DOWN" "$MAX_DOWN_STEP")"
+    CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
+    CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
 
     apply_rates
 
