@@ -19,15 +19,19 @@ BULK_DOWN_MIN=52000
 
 TARGET_DELAY_MS=12
 
-# Trim strength per unit of edge pressure
-UP_TRIM_PER_DEBT=450
-DOWN_TRIM_PER_DEBT=700
+# Trim strength per unit of effective pressure
+UP_TRIM_PER_PRESSURE=450
+DOWN_TRIM_PER_PRESSURE=700
 
-# Pressure debt behavior
-PRESSURE_DEBT=0
-LAST_PRESSURE_DEBT=0
-PRESSURE_DEBT_MAX=60
-PRESSURE_DECAY_PER_TICK=2
+# Long-memory sustained pressure
+LONG_DEBT=0
+LONG_DEBT_MAX=60
+LONG_DECAY_PER_TICK=3
+
+# Short-memory pressure density
+SHORT_DEBT=0
+SHORT_DEBT_MAX=30
+SHORT_DECAY_PER_TICK=8
 
 CUR_BULK_UP="$BULK_UP_BASE"
 CUR_BULK_DOWN="$BULK_DOWN_BASE"
@@ -86,7 +90,7 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT vel=$DEBT_VELOCITY kin=$KIN_DEBT edge=$EDGE_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY delay=${DELAY}ms side=$SIDE excess=$EXCESS long=$LONG_DEBT short=$SHORT_DEBT eff=$EFFECTIVE_PRESSURE game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
@@ -110,36 +114,34 @@ do
     EXCESS=$((DELAY - TARGET_DELAY_MS))
 
     if [ "$EXCESS" -gt 0 ]; then
-        PRESSURE_DEBT=$((PRESSURE_DEBT + EXCESS))
+        # Long debt = sustained unresolved pressure
+        LONG_DEBT=$((LONG_DEBT + EXCESS))
+
+        # Short debt = recent pressure density / compact pressure
+        SHORT_DEBT=$((SHORT_DEBT + EXCESS))
     else
-        PRESSURE_DEBT=$((PRESSURE_DEBT - PRESSURE_DECAY_PER_TICK))
+        LONG_DEBT=$((LONG_DEBT - LONG_DECAY_PER_TICK))
+        SHORT_DEBT=$((SHORT_DEBT - SHORT_DECAY_PER_TICK))
     fi
 
-    PRESSURE_DEBT="$(clamp "$PRESSURE_DEBT" 0 "$PRESSURE_DEBT_MAX")"
+    LONG_DEBT="$(clamp "$LONG_DEBT" 0 "$LONG_DEBT_MAX")"
+    SHORT_DEBT="$(clamp "$SHORT_DEBT" 0 "$SHORT_DEBT_MAX")"
 
-    # Debt velocity: only positive growth matters.
-    # This gives a small edge when pressure starts building quickly.
-    DEBT_VELOCITY=$((PRESSURE_DEBT - LAST_PRESSURE_DEBT))
-    [ "$DEBT_VELOCITY" -lt 0 ] && DEBT_VELOCITY=0
+    # Effective pressure:
+    # long debt gives structure,
+    # short density gives urgency only when pressure is compact/recent.
+    EFFECTIVE_PRESSURE=$((LONG_DEBT + SHORT_DEBT))
 
-    # Kinematic pressure curve:
-    # low debt = freer glide
-    # medium debt = smooth tightening
-    # high debt = real protection
-    KIN_DEBT=$((PRESSURE_DEBT * PRESSURE_DEBT / PRESSURE_DEBT_MAX))
+    # Clamp effective pressure so response cannot become ridiculous.
+    EFFECTIVE_PRESSURE="$(clamp "$EFFECTIVE_PRESSURE" 0 75)"
 
-    # Mostly kinematic, with a small velocity edge for fast-opening pressure windows.
-    EDGE_DEBT=$((KIN_DEBT + DEBT_VELOCITY))
-
-    NEW_UP=$((BULK_UP_BASE - EDGE_DEBT * UP_TRIM_PER_DEBT))
-    NEW_DOWN=$((BULK_DOWN_BASE - EDGE_DEBT * DOWN_TRIM_PER_DEBT))
+    NEW_UP=$((BULK_UP_BASE - EFFECTIVE_PRESSURE * UP_TRIM_PER_PRESSURE))
+    NEW_DOWN=$((BULK_DOWN_BASE - EFFECTIVE_PRESSURE * DOWN_TRIM_PER_PRESSURE))
 
     CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
     CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
 
     apply_rates
-
-    LAST_PRESSURE_DEBT="$PRESSURE_DEBT"
 
     sleep "$SLEEP_SEC"
 done
