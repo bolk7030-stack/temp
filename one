@@ -28,9 +28,14 @@ LAST_PRESSURE_DEBT=0
 PRESSURE_DEBT_MAX=60
 PRESSURE_DECAY_PER_TICK=2
 
-# Looser saturation
+# Saturation + hardness restore
 SAT_NUM=60
 SAT_DIVISOR=36
+
+# How much of the saturated-away edge to restore
+# 2 = restore half
+# 3 = restore one-third
+HARDNESS_RESTORE_DIV=2
 
 CUR_BULK_UP="$BULK_UP_BASE"
 CUR_BULK_DOWN="$BULK_DOWN_BASE"
@@ -89,7 +94,7 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT vel=$DEBT_VELOCITY kin=$KIN_DEBT raw=$RAW_EDGE sat=$SAT_EDGE game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT vel=$DEBT_VELOCITY kin=$KIN_DEBT raw=$RAW_EDGE sat=$SAT_EDGE hard=$HARDNESS final=$FINAL_EDGE game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
@@ -127,12 +132,20 @@ do
 
     RAW_EDGE=$((KIN_DEBT + DEBT_VELOCITY))
 
-    # Looser saturating edge:
-    # preserves edge but avoids over-controlled squeeze.
+    # Saturation controls flooding / over-tightening
     SAT_EDGE=$((RAW_EDGE * SAT_NUM / (RAW_EDGE + SAT_DIVISOR)))
 
-    NEW_UP=$((BULK_UP_BASE - SAT_EDGE * UP_TRIM_PER_DEBT))
-    NEW_DOWN=$((BULK_DOWN_BASE - SAT_EDGE * DOWN_TRIM_PER_DEBT))
+    # Reverse-saturation hardness:
+    # restore part of the edge that saturation removed,
+    # so high-end bite is not deprived.
+    HARDNESS=$((RAW_EDGE - SAT_EDGE))
+    [ "$HARDNESS" -lt 0 ] && HARDNESS=0
+
+    FINAL_EDGE=$((SAT_EDGE + HARDNESS / HARDNESS_RESTORE_DIV))
+    FINAL_EDGE="$(clamp "$FINAL_EDGE" 0 "$PRESSURE_DEBT_MAX")"
+
+    NEW_UP=$((BULK_UP_BASE - FINAL_EDGE * UP_TRIM_PER_DEBT))
+    NEW_DOWN=$((BULK_DOWN_BASE - FINAL_EDGE * DOWN_TRIM_PER_DEBT))
 
     CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
     CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
