@@ -19,17 +19,18 @@ BULK_DOWN_MIN=52000
 
 TARGET_DELAY_MS=12
 
-# Flywheel authority
-FLYWHEEL=0
-FLYWHEEL_MAX=60
-FLYWHEEL_DECAY_PER_TICK=1
+# Trim strength per unit of edge pressure
+UP_TRIM_PER_DEBT=450
+DOWN_TRIM_PER_DEBT=700
 
-# How fast pressure loads the flywheel
-LOAD_GAIN=1
+# Pressure debt behavior
+PRESSURE_DEBT=0
+LAST_PRESSURE_DEBT=0
+PRESSURE_DEBT_MAX=60
+PRESSURE_DECAY_PER_TICK=2
 
-# Trim strength per flywheel authority
-UP_TRIM_PER_FLYWHEEL=450
-DOWN_TRIM_PER_FLYWHEEL=700
+# Gate velocity edge so tiny pressure changes do not get predator authority
+EDGE_GATE=8
 
 CUR_BULK_UP="$BULK_UP_BASE"
 CUR_BULK_DOWN="$BULK_DOWN_BASE"
@@ -88,7 +89,7 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY delay=${DELAY}ms side=$SIDE excess=$EXCESS flywheel=$FLYWHEEL game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT vel=$DEBT_VELOCITY kin=$KIN_DEBT edge=$EDGE_DEBT gate=$EDGE_GATE game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
@@ -112,20 +113,38 @@ do
     EXCESS=$((DELAY - TARGET_DELAY_MS))
 
     if [ "$EXCESS" -gt 0 ]; then
-        FLYWHEEL=$((FLYWHEEL + EXCESS * LOAD_GAIN))
+        PRESSURE_DEBT=$((PRESSURE_DEBT + EXCESS))
     else
-        FLYWHEEL=$((FLYWHEEL - FLYWHEEL_DECAY_PER_TICK))
+        PRESSURE_DEBT=$((PRESSURE_DEBT - PRESSURE_DECAY_PER_TICK))
     fi
 
-    FLYWHEEL="$(clamp "$FLYWHEEL" 0 "$FLYWHEEL_MAX")"
+    PRESSURE_DEBT="$(clamp "$PRESSURE_DEBT" 0 "$PRESSURE_DEBT_MAX")"
 
-    NEW_UP=$((BULK_UP_BASE - FLYWHEEL * UP_TRIM_PER_FLYWHEEL))
-    NEW_DOWN=$((BULK_DOWN_BASE - FLYWHEEL * DOWN_TRIM_PER_FLYWHEEL))
+    # Debt velocity: only positive growth matters.
+    DEBT_VELOCITY=$((PRESSURE_DEBT - LAST_PRESSURE_DEBT))
+    [ "$DEBT_VELOCITY" -lt 0 ] && DEBT_VELOCITY=0
+
+    # Kinematic pressure curve.
+    KIN_DEBT=$((PRESSURE_DEBT * PRESSURE_DEBT / PRESSURE_DEBT_MAX))
+
+    # Graph-gated edge:
+    # below EDGE_GATE, preserve chemistry and ignore velocity twitch.
+    # above EDGE_GATE, allow velocity edge for fast-opening pressure windows.
+    if [ "$PRESSURE_DEBT" -ge "$EDGE_GATE" ]; then
+        EDGE_DEBT=$((KIN_DEBT + DEBT_VELOCITY))
+    else
+        EDGE_DEBT="$KIN_DEBT"
+    fi
+
+    NEW_UP=$((BULK_UP_BASE - EDGE_DEBT * UP_TRIM_PER_DEBT))
+    NEW_DOWN=$((BULK_DOWN_BASE - EDGE_DEBT * DOWN_TRIM_PER_DEBT))
 
     CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
     CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
 
     apply_rates
+
+    LAST_PRESSURE_DEBT="$PRESSURE_DEBT"
 
     sleep "$SLEEP_SEC"
 done
