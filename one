@@ -19,7 +19,7 @@ BULK_DOWN_MIN=52000
 
 TARGET_DELAY_MS=12
 
-# Trim strength per unit of edge pressure
+# Base edge pressure response
 UP_TRIM_PER_DEBT=450
 DOWN_TRIM_PER_DEBT=700
 
@@ -29,8 +29,17 @@ LAST_PRESSURE_DEBT=0
 PRESSURE_DEBT_MAX=60
 PRESSURE_DECAY_PER_TICK=2
 
-# Gate velocity edge so tiny pressure changes do not get predator authority
-EDGE_GATE=8
+# Curvature band:
+# Too flat = add a little exploration/edge
+# Too sharp = damp it
+CURVATURE_FLOOR=2
+CURVATURE_CEILING=10
+
+# How much to boost when too flat
+CURVATURE_FLOOR_BOOST=1
+
+# How much to damp when too sharp
+CURVATURE_DAMP_DIV=2
 
 CUR_BULK_UP="$BULK_UP_BASE"
 CUR_BULK_DOWN="$BULK_DOWN_BASE"
@@ -73,6 +82,12 @@ clamp() {
     echo "$VAL"
 }
 
+abs_val() {
+    VAL="$1"
+    [ "$VAL" -lt 0 ] && VAL=$((0 - VAL))
+    echo "$VAL"
+}
+
 apply_class() {
     DEV="$1"
     CLASS="$2"
@@ -89,7 +104,7 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT vel=$DEBT_VELOCITY kin=$KIN_DEBT edge=$EDGE_DEBT gate=$EDGE_GATE game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT vel=$DEBT_VELOCITY curv=$CURVATURE kin=$KIN_DEBT edge=$EDGE_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
@@ -120,20 +135,29 @@ do
 
     PRESSURE_DEBT="$(clamp "$PRESSURE_DEBT" 0 "$PRESSURE_DEBT_MAX")"
 
-    # Debt velocity: only positive growth matters.
+    # Positive debt velocity = pressure building.
     DEBT_VELOCITY=$((PRESSURE_DEBT - LAST_PRESSURE_DEBT))
     [ "$DEBT_VELOCITY" -lt 0 ] && DEBT_VELOCITY=0
+
+    # Curvature = magnitude of pressure-path change.
+    RAW_CURVATURE=$((PRESSURE_DEBT - LAST_PRESSURE_DEBT))
+    CURVATURE="$(abs_val "$RAW_CURVATURE")"
 
     # Kinematic pressure curve.
     KIN_DEBT=$((PRESSURE_DEBT * PRESSURE_DEBT / PRESSURE_DEBT_MAX))
 
-    # Graph-gated edge:
-    # below EDGE_GATE, preserve chemistry and ignore velocity twitch.
-    # above EDGE_GATE, allow velocity edge for fast-opening pressure windows.
-    if [ "$PRESSURE_DEBT" -ge "$EDGE_GATE" ]; then
-        EDGE_DEBT=$((KIN_DEBT + DEBT_VELOCITY))
-    else
-        EDGE_DEBT="$KIN_DEBT"
+    # Start from your working edge formula.
+    EDGE_DEBT=$((KIN_DEBT + DEBT_VELOCITY))
+
+    # Curvature band logic:
+    # If too flat while pressure exists, add tiny exploration/branch authority.
+    if [ "$PRESSURE_DEBT" -gt 0 ] && [ "$CURVATURE" -lt "$CURVATURE_FLOOR" ]; then
+        EDGE_DEBT=$((EDGE_DEBT + CURVATURE_FLOOR_BOOST))
+    fi
+
+    # If too jagged, damp edge instead of letting it spike.
+    if [ "$CURVATURE" -gt "$CURVATURE_CEILING" ]; then
+        EDGE_DEBT=$((EDGE_DEBT / CURVATURE_DAMP_DIV))
     fi
 
     NEW_UP=$((BULK_UP_BASE - EDGE_DEBT * UP_TRIM_PER_DEBT))
