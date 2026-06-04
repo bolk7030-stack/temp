@@ -19,19 +19,25 @@ BULK_DOWN_MIN=52000
 
 TARGET_DELAY_MS=12
 
+# Base trim strength
 UP_TRIM_PER_DEBT=450
 DOWN_TRIM_PER_DEBT=700
 
+# Pressure debt behavior
 PRESSURE_DEBT=0
 LAST_PRESSURE_DEBT=0
 PRESSURE_DEBT_MAX=60
 PRESSURE_DECAY_PER_TICK=2
 
-# Softplus-ish tuning
-# Higher SOFT_SHIFT = freer low pressure
-# Lower SOFT_SHIFT = more active early
-SOFT_SHIFT=6
-SOFT_GAIN=2
+# Pressurized saturation:
+# Keeps saturation, but compresses authority instead of flooding it.
+SAT_NUM=60
+SAT_DIVISOR=28
+
+# Compression tuning:
+# Higher COMPRESS_GAIN = more focused authority under pressure.
+COMPRESS_GAIN=2
+COMPRESS_DIV=3
 
 CUR_BULK_UP="$BULK_UP_BASE"
 CUR_BULK_DOWN="$BULK_DOWN_BASE"
@@ -90,7 +96,7 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT vel=$DEBT_VELOCITY kin=$KIN_DEBT raw=$RAW_EDGE soft=$SOFT_EDGE game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT vel=$DEBT_VELOCITY kin=$KIN_DEBT raw=$RAW_EDGE sat=$SAT_EDGE comp=$COMP_EDGE game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
@@ -121,26 +127,29 @@ do
 
     PRESSURE_DEBT="$(clamp "$PRESSURE_DEBT" 0 "$PRESSURE_DEBT_MAX")"
 
+    # Positive debt velocity only
     DEBT_VELOCITY=$((PRESSURE_DEBT - LAST_PRESSURE_DEBT))
     [ "$DEBT_VELOCITY" -lt 0 ] && DEBT_VELOCITY=0
 
+    # Kinematic core
     KIN_DEBT=$((PRESSURE_DEBT * PRESSURE_DEBT / PRESSURE_DEBT_MAX))
 
+    # Working edge model
     RAW_EDGE=$((KIN_DEBT + DEBT_VELOCITY))
 
-    # Integer softplus-like curve:
-    # below shift = gentle response
-    # above shift = progressively more active
-    if [ "$RAW_EDGE" -le "$SOFT_SHIFT" ]; then
-        SOFT_EDGE=$((RAW_EDGE / SOFT_GAIN))
-    else
-        SOFT_EDGE=$(((RAW_EDGE - SOFT_SHIFT) + (SOFT_SHIFT / SOFT_GAIN)))
-    fi
+    # Saturating edge:
+    # prevents runaway tightening.
+    SAT_EDGE=$((RAW_EDGE * SAT_NUM / (RAW_EDGE + SAT_DIVISOR)))
 
-    SOFT_EDGE="$(clamp "$SOFT_EDGE" 0 "$PRESSURE_DEBT_MAX")"
+    # Pressurized compression:
+    # at higher debt, authority focuses instead of spreading loosely.
+    COMP_BOOST=$((PRESSURE_DEBT * COMPRESS_GAIN / COMPRESS_DIV))
+    COMP_EDGE=$((SAT_EDGE + COMP_BOOST))
 
-    NEW_UP=$((BULK_UP_BASE - SOFT_EDGE * UP_TRIM_PER_DEBT))
-    NEW_DOWN=$((BULK_DOWN_BASE - SOFT_EDGE * DOWN_TRIM_PER_DEBT))
+    COMP_EDGE="$(clamp "$COMP_EDGE" 0 "$PRESSURE_DEBT_MAX")"
+
+    NEW_UP=$((BULK_UP_BASE - COMP_EDGE * UP_TRIM_PER_DEBT))
+    NEW_DOWN=$((BULK_DOWN_BASE - COMP_EDGE * DOWN_TRIM_PER_DEBT))
 
     CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
     CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
