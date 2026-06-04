@@ -19,19 +19,21 @@ BULK_DOWN_MIN=52000
 
 TARGET_DELAY_MS=12
 
+# Base trim strength
 UP_TRIM_PER_DEBT=450
 DOWN_TRIM_PER_DEBT=700
 
+# Pressure debt behavior
 PRESSURE_DEBT=0
 LAST_PRESSURE_DEBT=0
 PRESSURE_DEBT_MAX=60
 PRESSURE_DECAY_PER_TICK=2
 
-# Phase-lag authority
-# Higher old weight = smoother, less readable transition
-PHASE_EDGE=0
-PHASE_NUM=7
-PHASE_DEN=10
+# Saturation tuning
+# Lower SAT_DIVISOR = tighter earlier
+# Higher SAT_DIVISOR = more freedom before tightening
+SAT_NUM=60
+SAT_DIVISOR=20
 
 CUR_BULK_UP="$BULK_UP_BASE"
 CUR_BULK_DOWN="$BULK_DOWN_BASE"
@@ -90,7 +92,7 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT vel=$DEBT_VELOCITY kin=$KIN_DEBT raw_edge=$RAW_EDGE phase_edge=$PHASE_EDGE game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT vel=$DEBT_VELOCITY kin=$KIN_DEBT raw=$RAW_EDGE sat=$SAT_EDGE game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
@@ -121,20 +123,23 @@ do
 
     PRESSURE_DEBT="$(clamp "$PRESSURE_DEBT" 0 "$PRESSURE_DEBT_MAX")"
 
+    # Positive debt velocity only
     DEBT_VELOCITY=$((PRESSURE_DEBT - LAST_PRESSURE_DEBT))
     [ "$DEBT_VELOCITY" -lt 0 ] && DEBT_VELOCITY=0
 
+    # Kinematic core
     KIN_DEBT=$((PRESSURE_DEBT * PRESSURE_DEBT / PRESSURE_DEBT_MAX))
 
-    # Your working edge model
+    # Working edge model
     RAW_EDGE=$((KIN_DEBT + DEBT_VELOCITY))
 
-    # Phase-lag wrapper:
-    # Instead of instantly applying RAW_EDGE, drift toward it.
-    PHASE_EDGE=$(((PHASE_EDGE * PHASE_NUM + RAW_EDGE * (PHASE_DEN - PHASE_NUM)) / PHASE_DEN))
+    # Saturating edge:
+    # strong early response,
+    # but avoids runaway tightening.
+    SAT_EDGE=$((RAW_EDGE * SAT_NUM / (RAW_EDGE + SAT_DIVISOR)))
 
-    NEW_UP=$((BULK_UP_BASE - PHASE_EDGE * UP_TRIM_PER_DEBT))
-    NEW_DOWN=$((BULK_DOWN_BASE - PHASE_EDGE * DOWN_TRIM_PER_DEBT))
+    NEW_UP=$((BULK_UP_BASE - SAT_EDGE * UP_TRIM_PER_DEBT))
+    NEW_DOWN=$((BULK_DOWN_BASE - SAT_EDGE * DOWN_TRIM_PER_DEBT))
 
     CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
     CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
