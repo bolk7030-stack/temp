@@ -19,23 +19,15 @@ BULK_DOWN_MIN=52000
 
 TARGET_DELAY_MS=12
 
-# Softer trim strength
-UP_TRIM_PER_DEBT=400
-DOWN_TRIM_PER_DEBT=620
+# Directional trim strength
+UP_TRIM_PER_DEBT=450
+DOWN_TRIM_PER_DEBT=700
 
-PRESSURE_DEBT=0
-LAST_PRESSURE_DEBT=0
-PRESSURE_DEBT_MAX=60
-PRESSURE_DECAY_PER_TICK=2
-
-# Saturation + hardness restore
-SAT_NUM=60
-SAT_DIVISOR=36
-
-# How much of the saturated-away edge to restore
-# 2 = restore half
-# 3 = restore one-third
-HARDNESS_RESTORE_DIV=2
+# Directional pressure debt
+UP_DEBT=0
+DOWN_DEBT=0
+DEBT_MAX=60
+DEBT_DECAY_PER_TICK=3
 
 CUR_BULK_UP="$BULK_UP_BASE"
 CUR_BULK_DOWN="$BULK_DOWN_BASE"
@@ -94,7 +86,7 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY delay=${DELAY}ms side=$SIDE debt=$PRESSURE_DEBT vel=$DEBT_VELOCITY kin=$KIN_DEBT raw=$RAW_EDGE sat=$SAT_EDGE hard=$HARDNESS final=$FINAL_EDGE game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY wan=${WAN_DELAY}ms ifb=${IFB_DELAY}ms up_debt=$UP_DEBT down_debt=$DOWN_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
@@ -107,52 +99,31 @@ do
     [ -z "$WAN_DELAY" ] && WAN_DELAY=0
     [ -z "$IFB_DELAY" ] && IFB_DELAY=0
 
-    if [ "$WAN_DELAY" -gt "$IFB_DELAY" ]; then
-        DELAY="$WAN_DELAY"
-        SIDE="wan"
+    WAN_EXCESS=$((WAN_DELAY - TARGET_DELAY_MS))
+    IFB_EXCESS=$((IFB_DELAY - TARGET_DELAY_MS))
+
+    if [ "$WAN_EXCESS" -gt 0 ]; then
+        UP_DEBT=$((UP_DEBT + WAN_EXCESS))
     else
-        DELAY="$IFB_DELAY"
-        SIDE="ifb"
+        UP_DEBT=$((UP_DEBT - DEBT_DECAY_PER_TICK))
     fi
 
-    EXCESS=$((DELAY - TARGET_DELAY_MS))
-
-    if [ "$EXCESS" -gt 0 ]; then
-        PRESSURE_DEBT=$((PRESSURE_DEBT + EXCESS))
+    if [ "$IFB_EXCESS" -gt 0 ]; then
+        DOWN_DEBT=$((DOWN_DEBT + IFB_EXCESS))
     else
-        PRESSURE_DEBT=$((PRESSURE_DEBT - PRESSURE_DECAY_PER_TICK))
+        DOWN_DEBT=$((DOWN_DEBT - DEBT_DECAY_PER_TICK))
     fi
 
-    PRESSURE_DEBT="$(clamp "$PRESSURE_DEBT" 0 "$PRESSURE_DEBT_MAX")"
+    UP_DEBT="$(clamp "$UP_DEBT" 0 "$DEBT_MAX")"
+    DOWN_DEBT="$(clamp "$DOWN_DEBT" 0 "$DEBT_MAX")"
 
-    DEBT_VELOCITY=$((PRESSURE_DEBT - LAST_PRESSURE_DEBT))
-    [ "$DEBT_VELOCITY" -lt 0 ] && DEBT_VELOCITY=0
-
-    KIN_DEBT=$((PRESSURE_DEBT * PRESSURE_DEBT / PRESSURE_DEBT_MAX))
-
-    RAW_EDGE=$((KIN_DEBT + DEBT_VELOCITY))
-
-    # Saturation controls flooding / over-tightening
-    SAT_EDGE=$((RAW_EDGE * SAT_NUM / (RAW_EDGE + SAT_DIVISOR)))
-
-    # Reverse-saturation hardness:
-    # restore part of the edge that saturation removed,
-    # so high-end bite is not deprived.
-    HARDNESS=$((RAW_EDGE - SAT_EDGE))
-    [ "$HARDNESS" -lt 0 ] && HARDNESS=0
-
-    FINAL_EDGE=$((SAT_EDGE + HARDNESS / HARDNESS_RESTORE_DIV))
-    FINAL_EDGE="$(clamp "$FINAL_EDGE" 0 "$PRESSURE_DEBT_MAX")"
-
-    NEW_UP=$((BULK_UP_BASE - FINAL_EDGE * UP_TRIM_PER_DEBT))
-    NEW_DOWN=$((BULK_DOWN_BASE - FINAL_EDGE * DOWN_TRIM_PER_DEBT))
+    NEW_UP=$((BULK_UP_BASE - UP_DEBT * UP_TRIM_PER_DEBT))
+    NEW_DOWN=$((BULK_DOWN_BASE - DOWN_DEBT * DOWN_TRIM_PER_DEBT))
 
     CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
     CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
 
     apply_rates
-
-    LAST_PRESSURE_DEBT="$PRESSURE_DEBT"
 
     sleep "$SLEEP_SEC"
 done
