@@ -27,11 +27,22 @@ TARGET_FIELD=18
 FIELD_FILL_GAIN=1
 FIELD_DRY_PER_TICK=2
 
-UP_TRIM_PER_FIELD=450
-DOWN_TRIM_PER_FIELD=700
+# Dielectric resistance:
+# repeated pressure charges the tunnel
+DIELECTRIC_CHARGE=0
+DIELECTRIC_MAX=40
+DIELECTRIC_FILL_GAIN=1
+DIELECTRIC_LEAK_PER_TICK=1
+
+# Dielectric only charges after pressure is actually meaningful
+DIELECTRIC_EXCESS_GATE=3
+
+# Blend strength
+UP_TRIM_PER_CONTROL=450
+DOWN_TRIM_PER_CONTROL=700
 
 # Viscosity mandate:
-# output cannot teleport; it must seep toward target
+# output seeps toward target instead of teleporting
 MAX_UP_STEP=1200
 MAX_DOWN_STEP=2200
 
@@ -108,7 +119,7 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY delay=${DELAY}ms side=$SIDE excess=$EXCESS field=$FIELD_ENERGY target=$TARGET_FIELD imbalance=$FIELD_IMBALANCE target_bulk=${TARGET_UP}/${TARGET_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY delay=${DELAY}ms side=$SIDE excess=$EXCESS field=$FIELD_ENERGY imbalance=$FIELD_IMBALANCE dielectric=$DIELECTRIC_CHARGE control=$FIELD_CONTROL target_bulk=${TARGET_UP}/${TARGET_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
@@ -132,6 +143,7 @@ do
     EXCESS=$((DELAY - TARGET_DELAY_MS))
     [ "$EXCESS" -lt 0 ] && EXCESS=0
 
+    # Irrigation field: sustained playable flow
     if [ "$EXCESS" -gt 0 ]; then
         FIELD_ENERGY=$((FIELD_ENERGY + EXCESS * FIELD_FILL_GAIN))
     else
@@ -143,12 +155,28 @@ do
     FIELD_IMBALANCE=$((FIELD_ENERGY - TARGET_FIELD))
     [ "$FIELD_IMBALANCE" -lt 0 ] && FIELD_IMBALANCE=0
 
-    NEW_UP=$((BULK_UP_BASE - FIELD_IMBALANCE * UP_TRIM_PER_FIELD))
-    NEW_DOWN=$((BULK_DOWN_BASE - FIELD_IMBALANCE * DOWN_TRIM_PER_FIELD))
+    # Dielectric tunnel:
+    # repeated meaningful excess charges resistance.
+    # clean periods leak charge slowly.
+    if [ "$EXCESS" -ge "$DIELECTRIC_EXCESS_GATE" ]; then
+        DIELECTRIC_CHARGE=$((DIELECTRIC_CHARGE + EXCESS * DIELECTRIC_FILL_GAIN))
+    else
+        DIELECTRIC_CHARGE=$((DIELECTRIC_CHARGE - DIELECTRIC_LEAK_PER_TICK))
+    fi
+
+    DIELECTRIC_CHARGE="$(clamp "$DIELECTRIC_CHARGE" 0 "$DIELECTRIC_MAX")"
+
+    # Control = irrigation imbalance + stored tunnel resistance
+    FIELD_CONTROL=$((FIELD_IMBALANCE + DIELECTRIC_CHARGE))
+    FIELD_CONTROL="$(clamp "$FIELD_CONTROL" 0 "$FIELD_MAX")"
+
+    NEW_UP=$((BULK_UP_BASE - FIELD_CONTROL * UP_TRIM_PER_CONTROL))
+    NEW_DOWN=$((BULK_DOWN_BASE - FIELD_CONTROL * DOWN_TRIM_PER_CONTROL))
 
     TARGET_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
     TARGET_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
 
+    # Viscosity: tunnel control seeps into effect
     CUR_BULK_UP="$(approach_target "$CUR_BULK_UP" "$TARGET_UP" "$MAX_UP_STEP")"
     CUR_BULK_DOWN="$(approach_target "$CUR_BULK_DOWN" "$TARGET_DOWN" "$MAX_DOWN_STEP")"
 
