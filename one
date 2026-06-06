@@ -30,10 +30,10 @@ FIELD_DRY_PER_TICK=2
 UP_TRIM_PER_FIELD=450
 DOWN_TRIM_PER_FIELD=700
 
-# Small living vibration
+# Positive periodic authority pulse
 PULSE_ENABLED=1
-PULSE_STRENGTH=2
-PULSE_PERIOD=6
+PULSE_STRENGTH=3
+PULSE_PERIOD=3
 PULSE_COUNT=0
 PULSE_BIAS=0
 
@@ -131,8 +131,6 @@ do
     FIELD_IMBALANCE=$((FIELD_ENERGY - TARGET_FIELD))
     [ "$FIELD_IMBALANCE" -lt 0 ] && FIELD_IMBALANCE=0
 
-    # Tiny controlled vibration around field pressure.
-    # It only applies once the field exists, not when fully clean.
     PULSE_BIAS=0
 
     if [ "$PULSE_ENABLED" -eq 1 ] && [ "$FIELD_ENERGY" -gt 0 ]; then
@@ -140,8 +138,6 @@ do
 
         if [ "$PHASE" -eq 0 ]; then
             PULSE_BIAS="$PULSE_STRENGTH"
-        elif [ "$PHASE" -eq $((PULSE_PERIOD / 2)) ]; then
-            PULSE_BIAS=$((0 - PULSE_STRENGTH))
         fi
     fi
 
