@@ -19,12 +19,22 @@ BULK_DOWN_MIN=52000
 
 TARGET_DELAY_MS=12
 
-UP_TRIM_PER_DEBT=450
-DOWN_TRIM_PER_DEBT=700
+# Irrigation field:
+# We do not chase zero pressure.
+# We maintain a useful sustained field.
+FIELD_ENERGY=0
+FIELD_MAX=80
+TARGET_FIELD=18
 
-PRESSURE_DEBT=0
-PRESSURE_DEBT_MAX=60
-PRESSURE_DECAY_PER_TICK=3
+# How quickly pressure irrigates into the field
+FIELD_FILL_GAIN=1
+
+# How slowly the field dries out when clean
+FIELD_DRY_PER_TICK=2
+
+# How strongly field imbalance trims bulk
+UP_TRIM_PER_FIELD=450
+DOWN_TRIM_PER_FIELD=700
 
 CUR_BULK_UP="$BULK_UP_BASE"
 CUR_BULK_DOWN="$BULK_DOWN_BASE"
@@ -83,7 +93,7 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY wan=${WAN_DELAY}ms ifb=${IFB_DELAY}ms field_excess=$FIELD_EXCESS debt=$PRESSURE_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY delay=${DELAY}ms side=$SIDE excess=$EXCESS field=$FIELD_ENERGY target=$TARGET_FIELD imbalance=$FIELD_IMBALANCE game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
@@ -96,42 +106,33 @@ do
     [ -z "$WAN_DELAY" ] && WAN_DELAY=0
     [ -z "$IFB_DELAY" ] && IFB_DELAY=0
 
-    WAN_EXCESS=$((WAN_DELAY - TARGET_DELAY_MS))
-    IFB_EXCESS=$((IFB_DELAY - TARGET_DELAY_MS))
-
-    [ "$WAN_EXCESS" -lt 0 ] && WAN_EXCESS=0
-    [ "$IFB_EXCESS" -lt 0 ] && IFB_EXCESS=0
-
-    if [ "$WAN_EXCESS" -gt "$IFB_EXCESS" ]; then
-        MAX_EXCESS="$WAN_EXCESS"
-        MIN_EXCESS="$IFB_EXCESS"
+    if [ "$WAN_DELAY" -gt "$IFB_DELAY" ]; then
+        DELAY="$WAN_DELAY"
         SIDE="wan"
     else
-        MAX_EXCESS="$IFB_EXCESS"
-        MIN_EXCESS="$WAN_EXCESS"
+        DELAY="$IFB_DELAY"
         SIDE="ifb"
     fi
 
-    # Shared-field translation:
-    # both sides pressured = full obligation
-    # one side pressured = partial obligation
-    if [ "$MAX_EXCESS" -gt 0 ]; then
-        if [ "$MIN_EXCESS" -gt 0 ]; then
-            FIELD_EXCESS="$MAX_EXCESS"
-        else
-            FIELD_EXCESS=$(((MAX_EXCESS + 1) / 2))
-        fi
+    EXCESS=$((DELAY - TARGET_DELAY_MS))
+    [ "$EXCESS" -lt 0 ] && EXCESS=0
 
-        PRESSURE_DEBT=$((PRESSURE_DEBT + FIELD_EXCESS))
+    if [ "$EXCESS" -gt 0 ]; then
+        FIELD_ENERGY=$((FIELD_ENERGY + EXCESS * FIELD_FILL_GAIN))
     else
-        FIELD_EXCESS=0
-        PRESSURE_DEBT=$((PRESSURE_DEBT - PRESSURE_DECAY_PER_TICK))
+        FIELD_ENERGY=$((FIELD_ENERGY - FIELD_DRY_PER_TICK))
     fi
 
-    PRESSURE_DEBT="$(clamp "$PRESSURE_DEBT" 0 "$PRESSURE_DEBT_MAX")"
+    FIELD_ENERGY="$(clamp "$FIELD_ENERGY" 0 "$FIELD_MAX")"
 
-    NEW_UP=$((BULK_UP_BASE - PRESSURE_DEBT * UP_TRIM_PER_DEBT))
-    NEW_DOWN=$((BULK_DOWN_BASE - PRESSURE_DEBT * DOWN_TRIM_PER_DEBT))
+    # Irrigation logic:
+    # Below target field = do not over-trim; keep playable flow.
+    # Above target field = trim only the excess field.
+    FIELD_IMBALANCE=$((FIELD_ENERGY - TARGET_FIELD))
+    [ "$FIELD_IMBALANCE" -lt 0 ] && FIELD_IMBALANCE=0
+
+    NEW_UP=$((BULK_UP_BASE - FIELD_IMBALANCE * UP_TRIM_PER_FIELD))
+    NEW_DOWN=$((BULK_DOWN_BASE - FIELD_IMBALANCE * DOWN_TRIM_PER_FIELD))
 
     CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
     CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
