@@ -30,12 +30,10 @@ FIELD_DRY_PER_TICK=2
 UP_TRIM_PER_FIELD=450
 DOWN_TRIM_PER_FIELD=700
 
-# Positive periodic authority pulse
-PULSE_ENABLED=1
-PULSE_STRENGTH=3
-PULSE_PERIOD=3
-PULSE_COUNT=0
-PULSE_BIAS=0
+# Viscosity mandate:
+# output cannot teleport; it must seep toward target
+MAX_UP_STEP=1200
+MAX_DOWN_STEP=2200
 
 CUR_BULK_UP="$BULK_UP_BASE"
 CUR_BULK_DOWN="$BULK_DOWN_BASE"
@@ -78,6 +76,22 @@ clamp() {
     echo "$VAL"
 }
 
+approach_target() {
+    CURRENT="$1"
+    TARGET="$2"
+    STEP="$3"
+
+    if [ "$CURRENT" -lt "$TARGET" ]; then
+        CURRENT=$((CURRENT + STEP))
+        [ "$CURRENT" -gt "$TARGET" ] && CURRENT="$TARGET"
+    elif [ "$CURRENT" -gt "$TARGET" ]; then
+        CURRENT=$((CURRENT - STEP))
+        [ "$CURRENT" -lt "$TARGET" ] && CURRENT="$TARGET"
+    fi
+
+    echo "$CURRENT"
+}
+
 apply_class() {
     DEV="$1"
     CLASS="$2"
@@ -94,15 +108,13 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY delay=${DELAY}ms side=$SIDE excess=$EXCESS field=$FIELD_ENERGY target=$TARGET_FIELD imbalance=$FIELD_IMBALANCE pulse=$PULSE_BIAS control=$FIELD_CONTROL game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY delay=${DELAY}ms side=$SIDE excess=$EXCESS field=$FIELD_ENERGY target=$TARGET_FIELD imbalance=$FIELD_IMBALANCE target_bulk=${TARGET_UP}/${TARGET_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
 
 while true
 do
-    PULSE_COUNT=$((PULSE_COUNT + 1))
-
     WAN_DELAY="$(get_delay_ms "$WAN_DEV")"
     IFB_DELAY="$(get_delay_ms "$IFB_DEV")"
 
@@ -131,24 +143,14 @@ do
     FIELD_IMBALANCE=$((FIELD_ENERGY - TARGET_FIELD))
     [ "$FIELD_IMBALANCE" -lt 0 ] && FIELD_IMBALANCE=0
 
-    PULSE_BIAS=0
+    NEW_UP=$((BULK_UP_BASE - FIELD_IMBALANCE * UP_TRIM_PER_FIELD))
+    NEW_DOWN=$((BULK_DOWN_BASE - FIELD_IMBALANCE * DOWN_TRIM_PER_FIELD))
 
-    if [ "$PULSE_ENABLED" -eq 1 ] && [ "$FIELD_ENERGY" -gt 0 ]; then
-        PHASE=$((PULSE_COUNT % PULSE_PERIOD))
+    TARGET_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
+    TARGET_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
 
-        if [ "$PHASE" -eq 0 ]; then
-            PULSE_BIAS="$PULSE_STRENGTH"
-        fi
-    fi
-
-    FIELD_CONTROL=$((FIELD_IMBALANCE + PULSE_BIAS))
-    [ "$FIELD_CONTROL" -lt 0 ] && FIELD_CONTROL=0
-
-    NEW_UP=$((BULK_UP_BASE - FIELD_CONTROL * UP_TRIM_PER_FIELD))
-    NEW_DOWN=$((BULK_DOWN_BASE - FIELD_CONTROL * DOWN_TRIM_PER_FIELD))
-
-    CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
-    CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
+    CUR_BULK_UP="$(approach_target "$CUR_BULK_UP" "$TARGET_UP" "$MAX_UP_STEP")"
+    CUR_BULK_DOWN="$(approach_target "$CUR_BULK_DOWN" "$TARGET_DOWN" "$MAX_DOWN_STEP")"
 
     apply_rates
 
