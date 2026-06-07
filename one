@@ -26,12 +26,10 @@ PRESSURE_DEBT=0
 PRESSURE_DEBT_MAX=60
 PRESSURE_DECAY_PER_TICK=3
 
-# Authority validation:
-# pressure must persist before it earns control rights
-BAD_COUNT=0
-GOOD_COUNT=0
-AUTH_REQUIRED=2
-CLEAN_REQUIRED=2
+# Artificial launch ramp:
+# real pressure still leads, but authority arrives faster
+LAUNCH_GAIN=2
+LAUNCH_MAX=6
 
 CUR_BULK_UP="$BULK_UP_BASE"
 CUR_BULK_DOWN="$BULK_DOWN_BASE"
@@ -90,7 +88,7 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY wan=${WAN_DELAY}ms ifb=${IFB_DELAY}ms field_excess=$FIELD_EXCESS bad=$BAD_COUNT good=$GOOD_COUNT authorized=$AUTHORIZED debt=$PRESSURE_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY wan=${WAN_DELAY}ms ifb=${IFB_DELAY}ms field_excess=$FIELD_EXCESS launch=$LAUNCH debt=$PRESSURE_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
@@ -129,23 +127,13 @@ do
             FIELD_EXCESS=$(((MAX_EXCESS + 1) / 2))
         fi
 
-        BAD_COUNT=$((BAD_COUNT + 1))
-        GOOD_COUNT=0
+        LAUNCH=$((FIELD_EXCESS * LAUNCH_GAIN))
+        LAUNCH="$(clamp "$LAUNCH" 0 "$LAUNCH_MAX")"
+
+        PRESSURE_DEBT=$((PRESSURE_DEBT + FIELD_EXCESS + LAUNCH))
     else
         FIELD_EXCESS=0
-        GOOD_COUNT=$((GOOD_COUNT + 1))
-        BAD_COUNT=0
-    fi
-
-    AUTHORIZED=0
-
-    if [ "$BAD_COUNT" -ge "$AUTH_REQUIRED" ]; then
-        AUTHORIZED=1
-    fi
-
-    if [ "$AUTHORIZED" -eq 1 ]; then
-        PRESSURE_DEBT=$((PRESSURE_DEBT + FIELD_EXCESS))
-    elif [ "$GOOD_COUNT" -ge "$CLEAN_REQUIRED" ]; then
+        LAUNCH=0
         PRESSURE_DEBT=$((PRESSURE_DEBT - PRESSURE_DECAY_PER_TICK))
     fi
 
