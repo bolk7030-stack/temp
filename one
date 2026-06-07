@@ -1,48 +1,66 @@
 #!/bin/sh
+# HFSC gaming controller -- "untrappable" rewrite.
+#
+# Design principle: the control law has NO memory it can hold against you.
+#   - At rest (clean link) it is byte-for-byte equivalent to no script:
+#     full base rate, zero tc traffic, nothing held.
+#   - It bites instantly when real pressure exists (soft-knee, no windup).
+#   - It RELEASES INSTANTLY -- the moment pressure drops below a floor,
+#     bulk snaps straight back to base in one step. No decay, no leak, no I.
+#   - The only smoothing is a light ease on the ATTACK (clamping harder),
+#     so a transient blip doesn't yank the rate. Release is never smoothed.
+#
+# Net: grab fast, let go faster, idle invisibly. Sensing stays fast for
+# accurate bite, but no resolution choice can trap you because nothing lingers.
+
 WAN_DEV="eth1"; IFB_DEV="ifb-eth1"
 GAME_CLASS="1:20"; BULK_CLASS="1:60"
 
 GAME_UP=12000; GAME_DOWN=16000
-BULK_UP_BASE=42000; BULK_DOWN_BASE=84000   # standing reservation kept
+BULK_UP_BASE=42000; BULK_DOWN_BASE=84000
 BULK_UP_MIN=24000;  BULK_DOWN_MIN=52000
 
 TARGET_DELAY_DMS=120          # 12.0 ms
 
-# Soft-knee shape: CONTROL = FIELD*A/(FIELD+B). Bites early, saturates gently.
-SHAPE_A=70                    # asymptotic ceiling of P
-SHAPE_B=80                    # half-bite at +8ms excess; lower B = earlier bite
+# Soft-knee bite: control = field*A/(field+B). Early bite, gentle saturation.
+SHAPE_A=70
+SHAPE_B=80
 
-# Light field filter: noise rejection only (keep 0.3 old / 0.7 new on RELEASE).
-# Attack is instant (rising edge punches through the filter) -- see loop.
-FIELD=0; FIELD_OLD_NUM=3; FIELD_DEN=10
+# Pressure floor (deci-ms of excess). Below this, the controller is OFF:
+# bulk snaps to base, no tc calls issued. This is the hard idle / hard release.
+FIELD_FLOOR=8                 # 0.8 ms of excess -- below this = clean = no-op
 
-# Tiny leaky-I in centi-units: residual trim, NOT a co-controller
-I_ACC=0; I_MAX=80
+# Attack ease (rising clamp only). Higher num = snappier attack.
+# Release is NEVER eased -- it always snaps in one step.
+# Attack time constant in REAL TIME, not ticks. ~250 ms to cover most of a
+# clamp regardless of loop rate. Release is always instant (snap), so this
+# only governs how fast it grabs. Lower = snappier grab.
+ATK_TC_MS=250
 
 UP_TRIM_PER_CONTROL=450; DOWN_TRIM_PER_CONTROL=700
 
-# Viscosity = first-order lag at the actuator. 1/2 = half the move on tick one,
-# so small single changes reach the dataplane fast instead of crawling.
-EMA_NUM=1; EMA_DEN=2
-
-# Apply quantum: round rate to this grid and apply whenever the rounded value
-# changes. Small real moves still get through (no fixed-kbit suppression);
-# identical calls are skipped. Raise to 200 if a weak CPU can't keep 10 Hz.
+# Apply quantum: round rate to grid, apply only when rounded value changes.
 APPLY_Q=100
 
-# --- pick a sub-second sleep method once, at startup ---
-SLEEP_US=100000     # 100 ms = 10 Hz target
-if sleep 0.1 2>/dev/null; then
-    nap() { sleep 0.1; }
-    echo "pacing: sleep 0.1 (10 Hz)" >&2
+# --- run FAST; untrappability comes from the math (no memory), not slow ticks.
+# Loop period in ms; attack fraction is derived from it so feel is rate-independent.
+LOOP_MS=50                    # 20 Hz target on a box with CPU headroom
+if sleep 0.05 2>/dev/null; then
+    nap() { sleep 0.05; }; echo "pacing: sleep 0.05 (20 Hz)" >&2
 elif usleep 1 2>/dev/null; then
-    nap() { usleep "$SLEEP_US"; }
-    echo "pacing: usleep ${SLEEP_US} (10 Hz)" >&2
+    nap() { usleep 50000; }; echo "pacing: usleep 50000 (20 Hz)" >&2
 else
-    echo "WARN: no sub-second sleep; falling back to 1 Hz" >&2
-    nap() { sleep 1; }
+    LOOP_MS=1000
+    nap() { sleep 1; }; echo "WARN: no sub-second sleep; 1 Hz fallback" >&2
 fi
 
+# Per-tick attack fraction = LOOP_MS / ATK_TC_MS, expressed as NUM/DEN.
+# Clamped so a single tick never covers the whole move (keeps the ease).
+ATK_NUM="$LOOP_MS"; ATK_DEN="$ATK_TC_MS"
+[ "$ATK_NUM" -gt "$ATK_DEN" ] && ATK_NUM="$ATK_DEN"
+echo "attack: ${ATK_NUM}/${ATK_DEN} per tick (~${ATK_TC_MS}ms real)" >&2
+
+FIELD=0
 CUR_BULK_UP="$BULK_UP_BASE"; CUR_BULK_DOWN="$BULK_DOWN_BASE"
 APPLIED_UP=-1; APPLIED_DOWN=-1
 LAST_WAN=0; LAST_IFB=0
@@ -55,16 +73,9 @@ get_delay_dms() {
         }'
 }
 clamp() { v="$1"; [ "$v" -lt "$2" ] && v="$2"; [ "$v" -gt "$3" ] && v="$3"; echo "$v"; }
-
-# First-order lag toward target, with guaranteed convergence (min step 1)
-ema_step() {
-    cur="$1"; tgt="$2"; d=$((tgt - cur)); s=$((d * EMA_NUM / EMA_DEN))
-    if [ "$s" -eq 0 ] && [ "$d" -ne 0 ]; then [ "$d" -gt 0 ] && s=1 || s=-1; fi
-    echo $((cur + s))
-}
 apply_class() { tc class change dev "$1" classid "$2" hfsc ls rate "${3}kbit" ul rate "${3}kbit" 2>/dev/null; }
 
-# Game lane is static -- set once, never touched in the loop
+# Game lane is static -- set once.
 apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
 apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
 
@@ -77,31 +88,52 @@ while true; do
     [ "$WE" -lt 0 ] && WE=0; [ "$IE" -lt 0 ] && IE=0
     if [ "$WE" -gt "$IE" ]; then MAXE="$WE"; MINE="$IE"; else MAXE="$IE"; MINE="$WE"; fi
 
-    # Smooth shared combine (contraharmonic): mostly worst side, C1 at crossover
+    # Shared field (contraharmonic): mostly worst side, smooth at crossover.
     FE=$(( (MAXE*MAXE + MINE*MINE) / (MAXE + MINE + 1) ))
 
-    # Field filter governs RELEASE only; a rising edge attacks instantly.
-    FIELD=$(( (FIELD*FIELD_OLD_NUM + FE*(FIELD_DEN-FIELD_OLD_NUM)) / FIELD_DEN ))
-    [ "$FE" -gt "$FIELD" ] && FIELD="$FE"
+    # MEMORYLESS field: attack eases up, but it tracks FE directly -- no decay
+    # state. If FE drops, FIELD follows immediately (this is what frees you).
+    if [ "$FE" -gt "$FIELD" ]; then
+        step=$(( (FE - FIELD) * ATK_NUM / ATK_DEN ))
+        [ "$step" -eq 0 ] && step=1
+        FIELD=$(( FIELD + step ))
+        [ "$FIELD" -gt "$FE" ] && FIELD="$FE"
+    else
+        FIELD="$FE"          # RELEASE: snap. No lag, ever.
+    fi
 
-    # Soft-knee shape: instant, early-biting, self-saturating
-    P_CONTROL=$(( FIELD * SHAPE_A / (FIELD + SHAPE_B) ))
+    # HARD IDLE: below the floor the controller does not exist.
+    if [ "$FIELD" -lt "$FIELD_FLOOR" ]; then
+        FIELD=0; CONTROL=0
+        TARGET_UP="$BULK_UP_BASE"; TARGET_DOWN="$BULK_DOWN_BASE"
+    else
+        CONTROL=$(( FIELD * SHAPE_A / (FIELD + SHAPE_B) ))
+        CONTROL="$(clamp "$CONTROL" 0 60)"
+        TARGET_UP="$(clamp $((BULK_UP_BASE   - CONTROL*UP_TRIM_PER_CONTROL))   "$BULK_UP_MIN"   "$BULK_UP_BASE")"
+        TARGET_DOWN="$(clamp $((BULK_DOWN_BASE - CONTROL*DOWN_TRIM_PER_CONTROL)) "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
+    fi
 
-    # Tiny leaky-I, residual only (centi-units so it can't truncate to 0)
-    I_ACC=$(( I_ACC * 90 / 100 ))
-    [ "$FIELD" -gt 0 ] && I_ACC=$(( I_ACC + FIELD/30 ))
-    I_ACC="$(clamp "$I_ACC" 0 "$I_MAX")"
-    I_CONTROL=$(( I_ACC / 10 ))
+    # Actuator: ease toward target only when CLAMPING (target < current).
+    # When RELEASING (target > current, i.e. toward base), snap in one step.
+    # Min-step-1 on the ease so integer truncation never stalls the grab.
+    if [ "$TARGET_UP" -lt "$CUR_BULK_UP" ]; then
+        d=$(( (TARGET_UP - CUR_BULK_UP) * ATK_NUM / ATK_DEN ))
+        [ "$d" -eq 0 ] && d=-1
+        CUR_BULK_UP=$(( CUR_BULK_UP + d ))
+        [ "$CUR_BULK_UP" -lt "$TARGET_UP" ] && CUR_BULK_UP="$TARGET_UP"
+    else
+        CUR_BULK_UP="$TARGET_UP"
+    fi
+    if [ "$TARGET_DOWN" -lt "$CUR_BULK_DOWN" ]; then
+        d=$(( (TARGET_DOWN - CUR_BULK_DOWN) * ATK_NUM / ATK_DEN ))
+        [ "$d" -eq 0 ] && d=-1
+        CUR_BULK_DOWN=$(( CUR_BULK_DOWN + d ))
+        [ "$CUR_BULK_DOWN" -lt "$TARGET_DOWN" ] && CUR_BULK_DOWN="$TARGET_DOWN"
+    else
+        CUR_BULK_DOWN="$TARGET_DOWN"
+    fi
 
-    CONTROL="$(clamp $((P_CONTROL + I_CONTROL)) 0 60)"
-
-    TARGET_UP="$(clamp $((BULK_UP_BASE   - CONTROL*UP_TRIM_PER_CONTROL))   "$BULK_UP_MIN"   "$BULK_UP_BASE")"
-    TARGET_DOWN="$(clamp $((BULK_DOWN_BASE - CONTROL*DOWN_TRIM_PER_CONTROL)) "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
-
-    CUR_BULK_UP="$(ema_step "$CUR_BULK_UP" "$TARGET_UP")"
-    CUR_BULK_DOWN="$(ema_step "$CUR_BULK_DOWN" "$TARGET_DOWN")"
-
-    # Apply on grid change: small real moves pass through, identical calls skipped
+    # Apply on grid change only.
     QU=$(( (CUR_BULK_UP   + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
     QD=$(( (CUR_BULK_DOWN + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
     if [ "$QU" -ne "$APPLIED_UP" ]; then
@@ -109,6 +141,6 @@ while true; do
     if [ "$QD" -ne "$APPLIED_DOWN" ]; then
         apply_class "$IFB_DEV" "$BULK_CLASS" "$QD"; APPLIED_DOWN="$QD"; fi
 
-    echo "W=${W} I=${I} field=$FIELD p=$P_CONTROL i=$I_CONTROL ctl=$CONTROL bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "W=${W} I=${I} field=$FIELD ctl=$CONTROL bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
     nap
 done
