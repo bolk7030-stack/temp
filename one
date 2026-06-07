@@ -1,152 +1,160 @@
 #!/bin/sh
-# HFSC gaming controller -- proprioception-ONLY build (commit layer removed).
-#
-# ISOLATION EXPERIMENT: this build tests ONE hypothesis -- does self-echo
-# correction improve "coincidence" (1:1 feel) -- by removing the commit/posture
-# dwell layer entirely. The eased actuator drives tc directly, with only grid
-# rounding + a small deadband to avoid redundant calls.
-#
-# Pipeline:
-#   raw delay field
-#   -> self-echo residual correction  (the hypothesis under test)
-#   -> smoothed FIELD (fast attack / faster release)
-#   -> soft-knee CONTROL
-#   -> eased actuator -> tc directly
-#
-# Removed vs prior build: commit/posture dwell. (That layer solves game-state
-# legibility, a DIFFERENT problem; it's tested separately later.)
-#
-# Why the self-model matters (the bug it kills):
-#   clamp -> delay improves -> naive controller reads "world clean" -> releases
-#   -> delay returns -> repeat. That self-chasing limit cycle is the
-#   "almost right but not coinciding" feel. The self-model refuses to read its
-#   OWN clamp's effect as the world clearing.
 
-WAN_DEV="eth1"; IFB_DEV="ifb-eth1"
-GAME_CLASS="1:20"; BULK_CLASS="1:60"
+WAN_DEV="eth1"
+IFB_DEV="ifb-eth1"
 
-GAME_UP=12000; GAME_DOWN=16000
-BULK_UP_BASE=42000; BULK_DOWN_BASE=84000      # standing reservation kept
-BULK_UP_MIN=24000;  BULK_DOWN_MIN=52000
+GAME_CLASS="1:20"
+BULK_CLASS="1:60"
 
-TARGET_DELAY_DMS=120          # 12.0 ms
+SLEEP_SEC=1
 
-SHAPE_A=70; SHAPE_B=80        # soft-knee
-FIELD_FLOOR=8                 # 0.8 ms excess; below = clean
+GAME_UP=12000
+GAME_DOWN=16000
 
-ATK_TC_MS=250                 # ease IN  ~250 ms
-REL_TC_MS=120                 # ease OUT ~120 ms (faster -- never trapped)
+BULK_UP_BASE=45000
+BULK_DOWN_BASE=90000
 
-UP_TRIM_PER_CONTROL=450; DOWN_TRIM_PER_CONTROL=700
+BULK_UP_MIN=24000
+BULK_DOWN_MIN=52000
 
-# --- SELF-MODEL (proprioception) -- the variable under test ---
-# Discount at most ECHO_FRAC of a self-explainable delay IMPROVEMENT, for
-# ECHO_TICKS after our control last rose. Worsening is NEVER discounted.
-ECHO_FRAC_NUM=1; ECHO_FRAC_DEN=2     # conservative: half
-ECHO_TICKS=3                          # ~150 ms at 20 Hz
+TARGET_DELAY_MS=12
 
-# Direct actuator apply: grid + small deadband, NO commit dwell.
-APPLY_Q=100
-APPLY_EPS=150                 # don't re-issue tc for sub-150kbit wiggle
+UP_TRIM_PER_DEBT=450
+DOWN_TRIM_PER_DEBT=700
 
-LOOP_MS=50
-if sleep 0.05 2>/dev/null; then
-    nap() { sleep 0.05; }; echo "pacing: sleep 0.05 (20 Hz)" >&2
-elif usleep 1 2>/dev/null; then
-    nap() { usleep 50000; }; echo "pacing: usleep 50000 (20 Hz)" >&2
-else
-    LOOP_MS=1000; nap() { sleep 1; }; echo "WARN: no sub-second sleep; 1 Hz fallback" >&2
-fi
+PRESSURE_DEBT=0
+LAST_DEBT=0
+PRESSURE_DEBT_MAX=60
+PRESSURE_DECAY_PER_TICK=3
 
-ATK_NUM="$LOOP_MS"; ATK_DEN="$ATK_TC_MS"; [ "$ATK_NUM" -gt "$ATK_DEN" ] && ATK_NUM="$ATK_DEN"
-REL_NUM="$LOOP_MS"; REL_DEN="$REL_TC_MS"; [ "$REL_NUM" -gt "$REL_DEN" ] && REL_NUM="$REL_DEN"
-echo "atk ${ATK_NUM}/${ATK_DEN} rel ${REL_NUM}/${REL_DEN} echo ${ECHO_FRAC_NUM}/${ECHO_FRAC_DEN}x${ECHO_TICKS}t [NO commit layer]" >&2
-
-FIELD=0
-PREV_RAW=0
-PREV_CONTROL=0
+# Minimal proprioception:
+# Don't release too quickly on delay improvement caused by our own last clamp.
+PREV_EXCESS=0
 ECHO_AGE=99
-CUR_BULK_UP="$BULK_UP_BASE"; CUR_BULK_DOWN="$BULK_DOWN_BASE"
-APPLIED_UP=-1; APPLIED_DOWN=-1
-LAST_WAN=0; LAST_IFB=0
+ECHO_TICKS=2
+ECHO_FRAC_NUM=1
+ECHO_FRAC_DEN=2
 
-get_delay_dms() {
-    tc -s qdisc show dev "$1" 2>/dev/null | awk '
-        /avg_delay/ || /delay/ {
-            for (i=1;i<=NF;i++) if ($i ~ /delay/) {
-                v=$(i+1); gsub(/[^0-9.]/,"",v); printf "%d\n", int(v*10+0.5); exit }
-        }'
+CUR_BULK_UP="$BULK_UP_BASE"
+CUR_BULK_DOWN="$BULK_DOWN_BASE"
+
+get_delay_ms() {
+    DEV="$1"
+
+    tc -s qdisc show dev "$DEV" 2>/dev/null | awk '
+        /avg_delay/ {
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /avg_delay/) {
+                    val=$(i+1)
+                    gsub(/[^0-9.]/, "", val)
+                    print int(val)
+                    exit
+                }
+            }
+        }
+        /delay/ {
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /delay/) {
+                    val=$(i+1)
+                    gsub(/[^0-9.]/, "", val)
+                    print int(val)
+                    exit
+                }
+            }
+        }
+    '
 }
-clamp() { v="$1"; [ "$v" -lt "$2" ] && v="$2"; [ "$v" -gt "$3" ] && v="$3"; echo "$v"; }
-apply_class() { tc class change dev "$1" classid "$2" hfsc ls rate "${3}kbit" ul rate "${3}kbit" 2>/dev/null; }
-ease() {
-    cur="$1"; tgt="$2"; n="$3"; dn="$4"
-    diff=$((tgt - cur)); [ "$diff" -eq 0 ] && { echo "$cur"; return; }
-    step=$(( diff * n / dn ))
-    if [ "$step" -eq 0 ]; then [ "$diff" -gt 0 ] && step=1 || step=-1; fi
-    newv=$((cur + step))
-    if [ "$diff" -gt 0 ]; then [ "$newv" -gt "$tgt" ] && newv="$tgt"
-    else                       [ "$newv" -lt "$tgt" ] && newv="$tgt"; fi
-    echo "$newv"
+
+clamp() {
+    VAL="$1"
+    MIN="$2"
+    MAX="$3"
+
+    [ "$VAL" -lt "$MIN" ] && VAL="$MIN"
+    [ "$VAL" -gt "$MAX" ] && VAL="$MAX"
+
+    echo "$VAL"
 }
 
-apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
-apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
+apply_class() {
+    DEV="$1"
+    CLASS="$2"
+    RATE="$3"
 
-while true; do
-    W="$(get_delay_dms "$WAN_DEV")"; I="$(get_delay_dms "$IFB_DEV")"
-    [ -z "$W" ] && W="$LAST_WAN"; [ -z "$I" ] && I="$LAST_IFB"
-    LAST_WAN="$W"; LAST_IFB="$I"
+    tc class change dev "$DEV" classid "$CLASS" \
+        hfsc ls rate "${RATE}kbit" ul rate "${RATE}kbit" 2>/dev/null
+}
 
-    WE=$((W - TARGET_DELAY_DMS)); IE=$((I - TARGET_DELAY_DMS))
-    [ "$WE" -lt 0 ] && WE=0; [ "$IE" -lt 0 ] && IE=0
-    if [ "$WE" -gt "$IE" ]; then MAXE="$WE"; MINE="$IE"; else MAXE="$IE"; MINE="$WE"; fi
-    RAW=$(( (MAXE*MAXE + MINE*MINE) / (MAXE + MINE + 1) ))
+apply_rates() {
+    apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
+    apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
 
-    # ---- SELF-MODEL: residual the field should respond to ----
-    DELTA=$(( RAW - PREV_RAW ))
-    EFFECTIVE="$RAW"
-    if [ "$DELTA" -lt 0 ] && [ "$ECHO_AGE" -lt "$ECHO_TICKS" ]; then
-        IMPROVE=$(( -DELTA ))
-        ECHO=$(( IMPROVE * ECHO_FRAC_NUM / ECHO_FRAC_DEN ))
-        EFFECTIVE=$(( RAW + ECHO ))     # don't release on our own echo
-    fi
-    [ "$EFFECTIVE" -lt 0 ] && EFFECTIVE=0
-    PREV_RAW="$RAW"
+    apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
+    apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    # ---- FIELD ----
-    if [ "$EFFECTIVE" -gt "$FIELD" ]; then FIELD="$(ease "$FIELD" "$EFFECTIVE" "$ATK_NUM" "$ATK_DEN")"
-    else                                   FIELD="$(ease "$FIELD" "$EFFECTIVE" "$REL_NUM" "$REL_DEN")"; fi
+    echo "APPLY delay=${DELAY}ms side=$SIDE raw=${RAW_EXCESS}ms excess=${EXCESS}ms echoAge=${ECHO_AGE} debt=$PRESSURE_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+}
 
-    # ---- soft-knee TARGET ----
-    if [ "$FIELD" -lt "$FIELD_FLOOR" ]; then
-        CONTROL=0; TGT_UP="$BULK_UP_BASE"; TGT_DOWN="$BULK_DOWN_BASE"
+apply_rates
+
+while true
+do
+    WAN_DELAY="$(get_delay_ms "$WAN_DEV")"
+    IFB_DELAY="$(get_delay_ms "$IFB_DEV")"
+
+    [ -z "$WAN_DELAY" ] && WAN_DELAY=0
+    [ -z "$IFB_DELAY" ] && IFB_DELAY=0
+
+    if [ "$WAN_DELAY" -gt "$IFB_DELAY" ]; then
+        DELAY="$WAN_DELAY"
+        SIDE="wan"
     else
-        CONTROL=$(( FIELD * SHAPE_A / (FIELD + SHAPE_B) )); CONTROL="$(clamp "$CONTROL" 0 60)"
-        TGT_UP="$(clamp $((BULK_UP_BASE   - CONTROL*UP_TRIM_PER_CONTROL))   "$BULK_UP_MIN"   "$BULK_UP_BASE")"
-        TGT_DOWN="$(clamp $((BULK_DOWN_BASE - CONTROL*DOWN_TRIM_PER_CONTROL)) "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
+        DELAY="$IFB_DELAY"
+        SIDE="ifb"
     fi
 
-    # ---- track our own action for the self-model ----
-    if [ "$CONTROL" -gt "$PREV_CONTROL" ]; then ECHO_AGE=0; else ECHO_AGE=$(( ECHO_AGE + 1 )); fi
-    PREV_CONTROL="$CONTROL"
+    RAW_EXCESS=$((DELAY - TARGET_DELAY_MS))
+    [ "$RAW_EXCESS" -lt 0 ] && RAW_EXCESS=0
 
-    # ---- eased actuator -> tc DIRECTLY (no commit/posture dwell) ----
-    if [ "$TGT_UP" -lt "$CUR_BULK_UP" ]; then CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TGT_UP" "$ATK_NUM" "$ATK_DEN")"
-    else                                      CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TGT_UP" "$REL_NUM" "$REL_DEN")"; fi
-    if [ "$TGT_DOWN" -lt "$CUR_BULK_DOWN" ]; then CUR_BULK_DOWN="$(ease "$CUR_BULK_DOWN" "$TGT_DOWN" "$ATK_NUM" "$ATK_DEN")"
-    else                                          CUR_BULK_DOWN="$(ease "$CUR_BULK_DOWN" "$TGT_DOWN" "$REL_NUM" "$REL_DEN")"; fi
+    DELTA=$((RAW_EXCESS - PREV_EXCESS))
+    EXCESS="$RAW_EXCESS"
 
-    # grid + deadband apply (no plateau)
-    QU=$(( (CUR_BULK_UP   + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
-    QD=$(( (CUR_BULK_DOWN + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
-    dU=$(( QU - APPLIED_UP ));   [ "$dU" -lt 0 ] && dU=$(( -dU ))
-    dD=$(( QD - APPLIED_DOWN )); [ "$dD" -lt 0 ] && dD=$(( -dD ))
-    if [ "$APPLIED_UP" -lt 0 ] || [ "$dU" -ge "$APPLY_EPS" ] || { [ "$CUR_BULK_UP" -eq "$TGT_UP" ] && [ "$QU" -ne "$APPLIED_UP" ]; }; then
-        apply_class "$WAN_DEV" "$BULK_CLASS" "$QU"; APPLIED_UP="$QU"; fi
-    if [ "$APPLIED_DOWN" -lt 0 ] || [ "$dD" -ge "$APPLY_EPS" ] || { [ "$CUR_BULK_DOWN" -eq "$TGT_DOWN" ] && [ "$QD" -ne "$APPLIED_DOWN" ]; }; then
-        apply_class "$IFB_DEV" "$BULK_CLASS" "$QD"; APPLIED_DOWN="$QD"; fi
+    # Self-echo correction:
+    # If delay improved shortly after our own clamp increased,
+    # discount part of that improvement so we don't release on our own echo.
+    if [ "$DELTA" -lt 0 ] && [ "$ECHO_AGE" -lt "$ECHO_TICKS" ]; then
+        IMPROVE=$((0 - DELTA))
+        ECHO=$((IMPROVE * ECHO_FRAC_NUM / ECHO_FRAC_DEN))
+        EXCESS=$((RAW_EXCESS + ECHO))
+    fi
 
-    echo "W=${W} I=${I} raw=$RAW eff=$EFFECTIVE echoAge=$ECHO_AGE field=$FIELD ctl=$CONTROL bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
-    nap
+    PREV_EXCESS="$RAW_EXCESS"
+
+    if [ "$EXCESS" -gt 0 ]; then
+        PRESSURE_DEBT=$((PRESSURE_DEBT + EXCESS))
+    else
+        PRESSURE_DEBT=$((PRESSURE_DEBT - PRESSURE_DECAY_PER_TICK))
+    fi
+
+    PRESSURE_DEBT="$(clamp "$PRESSURE_DEBT" 0 "$PRESSURE_DEBT_MAX")"
+
+    # Track whether we just increased control authority.
+    # That arms short echo protection for the next few ticks.
+    if [ "$PRESSURE_DEBT" -gt "$LAST_DEBT" ]; then
+        ECHO_AGE=0
+    else
+        ECHO_AGE=$((ECHO_AGE + 1))
+    fi
+
+    LAST_DEBT="$PRESSURE_DEBT"
+
+    NEW_UP=$((BULK_UP_BASE - PRESSURE_DEBT * UP_TRIM_PER_DEBT))
+    NEW_DOWN=$((BULK_DOWN_BASE - PRESSURE_DEBT * DOWN_TRIM_PER_DEBT))
+
+    CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
+    CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
+
+    apply_rates
+
+    sleep "$SLEEP_SEC"
 done
