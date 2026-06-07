@@ -2,8 +2,6 @@
 WAN_DEV="eth1"; IFB_DEV="ifb-eth1"
 GAME_CLASS="1:20"; BULK_CLASS="1:60"
 
-SLEEP_SEC=0.1                 # sense fast; actuate on change (deadband below)
-
 GAME_UP=12000; GAME_DOWN=16000
 BULK_UP_BASE=42000; BULK_DOWN_BASE=84000   # standing reservation kept
 BULK_UP_MIN=24000;  BULK_DOWN_MIN=52000
@@ -26,6 +24,19 @@ UP_TRIM_PER_CONTROL=450; DOWN_TRIM_PER_CONTROL=700
 EMA_NUM=1; EMA_DEN=3
 
 APPLY_EPS_UP=200; APPLY_EPS_DOWN=350   # deadband to cut tc churn at 10 Hz
+
+# --- pick a sub-second sleep method once, at startup ---
+SLEEP_US=100000     # 100 ms = 10 Hz target
+if sleep 0.1 2>/dev/null; then
+    nap() { sleep 0.1; }
+    echo "pacing: sleep 0.1 (10 Hz)" >&2
+elif usleep 1 2>/dev/null; then
+    nap() { usleep "$SLEEP_US"; }
+    echo "pacing: usleep ${SLEEP_US} (10 Hz)" >&2
+else
+    echo "WARN: no sub-second sleep; falling back to 1 Hz" >&2
+    nap() { sleep 1; }
+fi
 
 CUR_BULK_UP="$BULK_UP_BASE"; CUR_BULK_DOWN="$BULK_DOWN_BASE"
 APPLIED_UP=-1; APPLIED_DOWN=-1
@@ -93,5 +104,5 @@ while true; do
         apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"; APPLIED_DOWN="$CUR_BULK_DOWN"; fi
 
     echo "W=${W} I=${I} field=$FIELD p=$P_CONTROL i=$I_CONTROL ctl=$CONTROL bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
-    sleep "$SLEEP_SEC"
+    nap
 done
