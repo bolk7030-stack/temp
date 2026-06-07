@@ -19,15 +19,12 @@ BULK_DOWN_MIN=52000
 
 TARGET_DELAY_MS=12
 
-# Directional trim strength
 UP_TRIM_PER_DEBT=450
 DOWN_TRIM_PER_DEBT=700
 
-# Directional pressure debt
-UP_DEBT=0
-DOWN_DEBT=0
-DEBT_MAX=60
-DEBT_DECAY_PER_TICK=3
+PRESSURE_DEBT=0
+PRESSURE_DEBT_MAX=60
+PRESSURE_DECAY_PER_TICK=3
 
 CUR_BULK_UP="$BULK_UP_BASE"
 CUR_BULK_DOWN="$BULK_DOWN_BASE"
@@ -86,7 +83,7 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY wan=${WAN_DELAY}ms ifb=${IFB_DELAY}ms up_debt=$UP_DEBT down_debt=$DOWN_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY wan=${WAN_DELAY}ms ifb=${IFB_DELAY}ms field_excess=$FIELD_EXCESS debt=$PRESSURE_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
@@ -102,23 +99,39 @@ do
     WAN_EXCESS=$((WAN_DELAY - TARGET_DELAY_MS))
     IFB_EXCESS=$((IFB_DELAY - TARGET_DELAY_MS))
 
-    if [ "$WAN_EXCESS" -gt 0 ]; then
-        UP_DEBT=$((UP_DEBT + WAN_EXCESS))
+    [ "$WAN_EXCESS" -lt 0 ] && WAN_EXCESS=0
+    [ "$IFB_EXCESS" -lt 0 ] && IFB_EXCESS=0
+
+    if [ "$WAN_EXCESS" -gt "$IFB_EXCESS" ]; then
+        MAX_EXCESS="$WAN_EXCESS"
+        MIN_EXCESS="$IFB_EXCESS"
+        SIDE="wan"
     else
-        UP_DEBT=$((UP_DEBT - DEBT_DECAY_PER_TICK))
+        MAX_EXCESS="$IFB_EXCESS"
+        MIN_EXCESS="$WAN_EXCESS"
+        SIDE="ifb"
     fi
 
-    if [ "$IFB_EXCESS" -gt 0 ]; then
-        DOWN_DEBT=$((DOWN_DEBT + IFB_EXCESS))
+    # Shared-field translation:
+    # both sides pressured = full obligation
+    # one side pressured = partial obligation
+    if [ "$MAX_EXCESS" -gt 0 ]; then
+        if [ "$MIN_EXCESS" -gt 0 ]; then
+            FIELD_EXCESS="$MAX_EXCESS"
+        else
+            FIELD_EXCESS=$(((MAX_EXCESS + 1) / 2))
+        fi
+
+        PRESSURE_DEBT=$((PRESSURE_DEBT + FIELD_EXCESS))
     else
-        DOWN_DEBT=$((DOWN_DEBT - DEBT_DECAY_PER_TICK))
+        FIELD_EXCESS=0
+        PRESSURE_DEBT=$((PRESSURE_DEBT - PRESSURE_DECAY_PER_TICK))
     fi
 
-    UP_DEBT="$(clamp "$UP_DEBT" 0 "$DEBT_MAX")"
-    DOWN_DEBT="$(clamp "$DOWN_DEBT" 0 "$DEBT_MAX")"
+    PRESSURE_DEBT="$(clamp "$PRESSURE_DEBT" 0 "$PRESSURE_DEBT_MAX")"
 
-    NEW_UP=$((BULK_UP_BASE - UP_DEBT * UP_TRIM_PER_DEBT))
-    NEW_DOWN=$((BULK_DOWN_BASE - DOWN_DEBT * DOWN_TRIM_PER_DEBT))
+    NEW_UP=$((BULK_UP_BASE - PRESSURE_DEBT * UP_TRIM_PER_DEBT))
+    NEW_DOWN=$((BULK_DOWN_BASE - PRESSURE_DEBT * DOWN_TRIM_PER_DEBT))
 
     CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
     CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
