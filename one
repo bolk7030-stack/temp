@@ -1,25 +1,26 @@
 #!/bin/sh
-# HFSC gaming controller -- proprioceptive build.
+# HFSC gaming controller -- proprioception-ONLY build (commit layer removed).
 #
-# Layers (each unchanged from prior build except the new self-model):
-#   1. FIELD   (sense):  delay-only, fast, soft attack / faster release. ANCHOR.
-#   2. SELF-MODEL (NEW): predicts how much of the latest delay change is our own
-#                        last action settling in (efference copy), and responds
-#                        only to the RESIDUAL = environment minus self-echo.
-#   3. TARGET  (shape):  soft-knee bite -> eased soft target.
-#   4. POSTURE (commit): external transport identity, holds for a dwell.
+# ISOLATION EXPERIMENT: this build tests ONE hypothesis -- does self-echo
+# correction improve "coincidence" (1:1 feel) -- by removing the commit/posture
+# dwell layer entirely. The eased actuator drives tc directly, with only grid
+# rounding + a small deadband to avoid redundant calls.
 #
-# SELF-MODEL design (proprioception, NOT a settle/cooldown gate):
-#   - The controller never blinds itself. It always senses at full rate.
-#   - It only discounts delay IMPROVEMENTS that its own last clamp could explain
-#     -- so it won't mistake "my own action working" for "world went clean" and
-#     release too early (the self-chasing failure).
-#   - It NEVER discounts delay WORSENING. Worsening is always treated as real
-#     environment -> full, instant response. The asymmetry guarantees the worst
-#     case of a wrong self-model is "slightly slow to RELEASE" (safe), never
-#     "slow to RESPOND" (dangerous).
-#   - Conservative: discounts at most ECHO_FRAC of a self-explainable improvement.
-#   - Short memory: the echo estimate decays over ~ECHO_TICKS, never lingers.
+# Pipeline:
+#   raw delay field
+#   -> self-echo residual correction  (the hypothesis under test)
+#   -> smoothed FIELD (fast attack / faster release)
+#   -> soft-knee CONTROL
+#   -> eased actuator -> tc directly
+#
+# Removed vs prior build: commit/posture dwell. (That layer solves game-state
+# legibility, a DIFFERENT problem; it's tested separately later.)
+#
+# Why the self-model matters (the bug it kills):
+#   clamp -> delay improves -> naive controller reads "world clean" -> releases
+#   -> delay returns -> repeat. That self-chasing limit cycle is the
+#   "almost right but not coinciding" feel. The self-model refuses to read its
+#   OWN clamp's effect as the world clearing.
 
 WAN_DEV="eth1"; IFB_DEV="ifb-eth1"
 GAME_CLASS="1:20"; BULK_CLASS="1:60"
@@ -34,23 +35,19 @@ SHAPE_A=70; SHAPE_B=80        # soft-knee
 FIELD_FLOOR=8                 # 0.8 ms excess; below = clean
 
 ATK_TC_MS=250                 # ease IN  ~250 ms
-REL_TC_MS=120                 # ease OUT ~120 ms
+REL_TC_MS=120                 # ease OUT ~120 ms (faster -- never trapped)
 
 UP_TRIM_PER_CONTROL=450; DOWN_TRIM_PER_CONTROL=700
 
-# --- SELF-MODEL (proprioception) ---
-# When our control rises (we clamp harder) and delay then falls, up to
-# ECHO_FRAC_NUM/DEN of that fall is attributed to our own action and is NOT
-# allowed to accelerate release. Conservative default = half.
-ECHO_FRAC_NUM=1; ECHO_FRAC_DEN=2
-ECHO_TICKS=3                  # our action presumed settling for ~3 ticks (~150ms)
+# --- SELF-MODEL (proprioception) -- the variable under test ---
+# Discount at most ECHO_FRAC of a self-explainable delay IMPROVEMENT, for
+# ECHO_TICKS after our control last rose. Worsening is NEVER discounted.
+ECHO_FRAC_NUM=1; ECHO_FRAC_DEN=2     # conservative: half
+ECHO_TICKS=3                          # ~150 ms at 20 Hz
 
-# --- COMMIT LAYER ---
-DWELL_MS=200
-COMMIT_BAND_UP=4000
-COMMIT_BAND_DOWN=8000
-
+# Direct actuator apply: grid + small deadband, NO commit dwell.
 APPLY_Q=100
+APPLY_EPS=150                 # don't re-issue tc for sub-150kbit wiggle
 
 LOOP_MS=50
 if sleep 0.05 2>/dev/null; then
@@ -63,16 +60,13 @@ fi
 
 ATK_NUM="$LOOP_MS"; ATK_DEN="$ATK_TC_MS"; [ "$ATK_NUM" -gt "$ATK_DEN" ] && ATK_NUM="$ATK_DEN"
 REL_NUM="$LOOP_MS"; REL_DEN="$REL_TC_MS"; [ "$REL_NUM" -gt "$REL_DEN" ] && REL_NUM="$REL_DEN"
-DWELL_TICKS=$(( DWELL_MS / LOOP_MS )); [ "$DWELL_TICKS" -lt 1 ] && DWELL_TICKS=1
-echo "atk ${ATK_NUM}/${ATK_DEN} rel ${REL_NUM}/${REL_DEN} dwell ${DWELL_TICKS}t echo ${ECHO_FRAC_NUM}/${ECHO_FRAC_DEN}x${ECHO_TICKS}t" >&2
+echo "atk ${ATK_NUM}/${ATK_DEN} rel ${REL_NUM}/${REL_DEN} echo ${ECHO_FRAC_NUM}/${ECHO_FRAC_DEN}x${ECHO_TICKS}t [NO commit layer]" >&2
 
 FIELD=0
-PREV_RAW=0                    # last raw shared-excess reading (pre-self-model)
-PREV_CONTROL=0               # control level last tick (proxy for our action)
-ECHO_AGE=99                  # ticks since our control last increased (>=ECHO_TICKS = no active echo)
+PREV_RAW=0
+PREV_CONTROL=0
+ECHO_AGE=99
 CUR_BULK_UP="$BULK_UP_BASE"; CUR_BULK_DOWN="$BULK_DOWN_BASE"
-POSTURE_UP="$BULK_UP_BASE"; POSTURE_DOWN="$BULK_DOWN_BASE"
-DWELL_UP=0; DWELL_DOWN=0
 APPLIED_UP=-1; APPLIED_DOWN=-1
 LAST_WAN=0; LAST_IFB=0
 
@@ -95,13 +89,6 @@ ease() {
     else                       [ "$newv" -lt "$tgt" ] && newv="$tgt"; fi
     echo "$newv"
 }
-absdiff() { a=$(( $1 - $2 )); [ "$a" -lt 0 ] && a=$(( -a )); echo "$a"; }
-commit() {
-    post="$1"; tgt="$2"; dwell="$3"; band="$4"
-    mv="$(absdiff "$tgt" "$post")"
-    if [ "$mv" -ge "$band" ] || [ "$dwell" -ge "$DWELL_TICKS" ]; then echo "$tgt 0"
-    else echo "$post $((dwell + 1))"; fi
-}
 
 apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
 apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
@@ -114,31 +101,24 @@ while true; do
     WE=$((W - TARGET_DELAY_DMS)); IE=$((I - TARGET_DELAY_DMS))
     [ "$WE" -lt 0 ] && WE=0; [ "$IE" -lt 0 ] && IE=0
     if [ "$WE" -gt "$IE" ]; then MAXE="$WE"; MINE="$IE"; else MAXE="$IE"; MINE="$WE"; fi
-    RAW=$(( (MAXE*MAXE + MINE*MINE) / (MAXE + MINE + 1) ))    # raw shared excess
+    RAW=$(( (MAXE*MAXE + MINE*MINE) / (MAXE + MINE + 1) ))
 
-    # ---- SELF-MODEL: compute residual the field should respond to ----
-    # delta of raw reading since last tick
+    # ---- SELF-MODEL: residual the field should respond to ----
     DELTA=$(( RAW - PREV_RAW ))
     EFFECTIVE="$RAW"
     if [ "$DELTA" -lt 0 ] && [ "$ECHO_AGE" -lt "$ECHO_TICKS" ]; then
-        # delay IMPROVED while our own recent clamp is still settling.
-        # Attribute ECHO_FRAC of the improvement to ourselves: don't let that
-        # part pull the field down (don't release on our own echo).
         IMPROVE=$(( -DELTA ))
         ECHO=$(( IMPROVE * ECHO_FRAC_NUM / ECHO_FRAC_DEN ))
-        # Hold the field up by the echo amount: effective excess = raw + echo,
-        # i.e. we pretend things are echo-units less improved than measured.
-        EFFECTIVE=$(( RAW + ECHO ))
+        EFFECTIVE=$(( RAW + ECHO ))     # don't release on our own echo
     fi
-    # Worsening (DELTA>=0) is NEVER discounted -- full environmental response.
     [ "$EFFECTIVE" -lt 0 ] && EFFECTIVE=0
     PREV_RAW="$RAW"
 
-    # ---- Layer 1: FIELD on the residual-corrected signal ----
+    # ---- FIELD ----
     if [ "$EFFECTIVE" -gt "$FIELD" ]; then FIELD="$(ease "$FIELD" "$EFFECTIVE" "$ATK_NUM" "$ATK_DEN")"
     else                                   FIELD="$(ease "$FIELD" "$EFFECTIVE" "$REL_NUM" "$REL_DEN")"; fi
 
-    # ---- Layer 3: TARGET (soft-knee) ----
+    # ---- soft-knee TARGET ----
     if [ "$FIELD" -lt "$FIELD_FLOOR" ]; then
         CONTROL=0; TGT_UP="$BULK_UP_BASE"; TGT_DOWN="$BULK_DOWN_BASE"
     else
@@ -147,26 +127,26 @@ while true; do
         TGT_DOWN="$(clamp $((BULK_DOWN_BASE - CONTROL*DOWN_TRIM_PER_CONTROL)) "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
     fi
 
-    # ---- track our own action for the self-model: did control just rise? ----
-    if [ "$CONTROL" -gt "$PREV_CONTROL" ]; then ECHO_AGE=0
-    else ECHO_AGE=$(( ECHO_AGE + 1 )); fi
+    # ---- track our own action for the self-model ----
+    if [ "$CONTROL" -gt "$PREV_CONTROL" ]; then ECHO_AGE=0; else ECHO_AGE=$(( ECHO_AGE + 1 )); fi
     PREV_CONTROL="$CONTROL"
 
-    # ---- actuator ease ----
+    # ---- eased actuator -> tc DIRECTLY (no commit/posture dwell) ----
     if [ "$TGT_UP" -lt "$CUR_BULK_UP" ]; then CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TGT_UP" "$ATK_NUM" "$ATK_DEN")"
     else                                      CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TGT_UP" "$REL_NUM" "$REL_DEN")"; fi
     if [ "$TGT_DOWN" -lt "$CUR_BULK_DOWN" ]; then CUR_BULK_DOWN="$(ease "$CUR_BULK_DOWN" "$TGT_DOWN" "$ATK_NUM" "$ATK_DEN")"
     else                                          CUR_BULK_DOWN="$(ease "$CUR_BULK_DOWN" "$TGT_DOWN" "$REL_NUM" "$REL_DEN")"; fi
 
-    # ---- Layer 4: COMMIT ----
-    set -- $(commit "$POSTURE_UP"   "$CUR_BULK_UP"   "$DWELL_UP"   "$COMMIT_BAND_UP");   POSTURE_UP="$1";   DWELL_UP="$2"
-    set -- $(commit "$POSTURE_DOWN" "$CUR_BULK_DOWN" "$DWELL_DOWN" "$COMMIT_BAND_DOWN"); POSTURE_DOWN="$1"; DWELL_DOWN="$2"
+    # grid + deadband apply (no plateau)
+    QU=$(( (CUR_BULK_UP   + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
+    QD=$(( (CUR_BULK_DOWN + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
+    dU=$(( QU - APPLIED_UP ));   [ "$dU" -lt 0 ] && dU=$(( -dU ))
+    dD=$(( QD - APPLIED_DOWN )); [ "$dD" -lt 0 ] && dD=$(( -dD ))
+    if [ "$APPLIED_UP" -lt 0 ] || [ "$dU" -ge "$APPLY_EPS" ] || { [ "$CUR_BULK_UP" -eq "$TGT_UP" ] && [ "$QU" -ne "$APPLIED_UP" ]; }; then
+        apply_class "$WAN_DEV" "$BULK_CLASS" "$QU"; APPLIED_UP="$QU"; fi
+    if [ "$APPLIED_DOWN" -lt 0 ] || [ "$dD" -ge "$APPLY_EPS" ] || { [ "$CUR_BULK_DOWN" -eq "$TGT_DOWN" ] && [ "$QD" -ne "$APPLIED_DOWN" ]; }; then
+        apply_class "$IFB_DEV" "$BULK_CLASS" "$QD"; APPLIED_DOWN="$QD"; fi
 
-    QU=$(( (POSTURE_UP   + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
-    QD=$(( (POSTURE_DOWN + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
-    if [ "$QU" -ne "$APPLIED_UP" ]; then apply_class "$WAN_DEV" "$BULK_CLASS" "$QU"; APPLIED_UP="$QU"; fi
-    if [ "$QD" -ne "$APPLIED_DOWN" ]; then apply_class "$IFB_DEV" "$BULK_CLASS" "$QD"; APPLIED_DOWN="$QD"; fi
-
-    echo "W=${W} I=${I} raw=$RAW eff=$EFFECTIVE echoAge=$ECHO_AGE field=$FIELD ctl=$CONTROL posture=${POSTURE_UP}/${POSTURE_DOWN}"
+    echo "W=${W} I=${I} raw=$RAW eff=$EFFECTIVE echoAge=$ECHO_AGE field=$FIELD ctl=$CONTROL bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
     nap
 done
