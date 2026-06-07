@@ -12,7 +12,8 @@ TARGET_DELAY_DMS=120          # 12.0 ms
 SHAPE_A=70                    # asymptotic ceiling of P
 SHAPE_B=80                    # half-bite at +8ms excess; lower B = earlier bite
 
-# Light field filter: noise rejection only (keep 0.3 old / 0.7 new)
+# Light field filter: noise rejection only (keep 0.3 old / 0.7 new on RELEASE).
+# Attack is instant (rising edge punches through the filter) -- see loop.
 FIELD=0; FIELD_OLD_NUM=3; FIELD_DEN=10
 
 # Tiny leaky-I in centi-units: residual trim, NOT a co-controller
@@ -20,10 +21,14 @@ I_ACC=0; I_MAX=80
 
 UP_TRIM_PER_CONTROL=450; DOWN_TRIM_PER_CONTROL=700
 
-# Viscosity = first-order lag at the actuator (front-loaded, smooth)
-EMA_NUM=1; EMA_DEN=3
+# Viscosity = first-order lag at the actuator. 1/2 = half the move on tick one,
+# so small single changes reach the dataplane fast instead of crawling.
+EMA_NUM=1; EMA_DEN=2
 
-APPLY_EPS_UP=200; APPLY_EPS_DOWN=350   # deadband to cut tc churn at 10 Hz
+# Apply quantum: round rate to this grid and apply whenever the rounded value
+# changes. Small real moves still get through (no fixed-kbit suppression);
+# identical calls are skipped. Raise to 200 if a weak CPU can't keep 10 Hz.
+APPLY_Q=100
 
 # --- pick a sub-second sleep method once, at startup ---
 SLEEP_US=100000     # 100 ms = 10 Hz target
@@ -51,7 +56,7 @@ get_delay_dms() {
 }
 clamp() { v="$1"; [ "$v" -lt "$2" ] && v="$2"; [ "$v" -gt "$3" ] && v="$3"; echo "$v"; }
 
-# First-order lag toward target, with guaranteed convergence
+# First-order lag toward target, with guaranteed convergence (min step 1)
 ema_step() {
     cur="$1"; tgt="$2"; d=$((tgt - cur)); s=$((d * EMA_NUM / EMA_DEN))
     if [ "$s" -eq 0 ] && [ "$d" -ne 0 ]; then [ "$d" -gt 0 ] && s=1 || s=-1; fi
@@ -59,7 +64,7 @@ ema_step() {
 }
 apply_class() { tc class change dev "$1" classid "$2" hfsc ls rate "${3}kbit" ul rate "${3}kbit" 2>/dev/null; }
 
-# Game lane is static — set once, never touched in the loop
+# Game lane is static -- set once, never touched in the loop
 apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
 apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
 
@@ -75,8 +80,9 @@ while true; do
     # Smooth shared combine (contraharmonic): mostly worst side, C1 at crossover
     FE=$(( (MAXE*MAXE + MINE*MINE) / (MAXE + MINE + 1) ))
 
-    # Light field filter (noise only)
+    # Field filter governs RELEASE only; a rising edge attacks instantly.
     FIELD=$(( (FIELD*FIELD_OLD_NUM + FE*(FIELD_DEN-FIELD_OLD_NUM)) / FIELD_DEN ))
+    [ "$FE" -gt "$FIELD" ] && FIELD="$FE"
 
     # Soft-knee shape: instant, early-biting, self-saturating
     P_CONTROL=$(( FIELD * SHAPE_A / (FIELD + SHAPE_B) ))
@@ -95,13 +101,13 @@ while true; do
     CUR_BULK_UP="$(ema_step "$CUR_BULK_UP" "$TARGET_UP")"
     CUR_BULK_DOWN="$(ema_step "$CUR_BULK_DOWN" "$TARGET_DOWN")"
 
-    # Deadband: only touch tc when it actually moved
-    du=$((CUR_BULK_UP - APPLIED_UP));   [ "$du" -lt 0 ] && du=$((-du))
-    dd=$((CUR_BULK_DOWN - APPLIED_DOWN)); [ "$dd" -lt 0 ] && dd=$((-dd))
-    if [ "$du" -ge "$APPLY_EPS_UP" ]   || [ "$CUR_BULK_UP" -eq "$TARGET_UP" ]; then
-        apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"; APPLIED_UP="$CUR_BULK_UP"; fi
-    if [ "$dd" -ge "$APPLY_EPS_DOWN" ] || [ "$CUR_BULK_DOWN" -eq "$TARGET_DOWN" ]; then
-        apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"; APPLIED_DOWN="$CUR_BULK_DOWN"; fi
+    # Apply on grid change: small real moves pass through, identical calls skipped
+    QU=$(( (CUR_BULK_UP   + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
+    QD=$(( (CUR_BULK_DOWN + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
+    if [ "$QU" -ne "$APPLIED_UP" ]; then
+        apply_class "$WAN_DEV" "$BULK_CLASS" "$QU"; APPLIED_UP="$QU"; fi
+    if [ "$QD" -ne "$APPLIED_DOWN" ]; then
+        apply_class "$IFB_DEV" "$BULK_CLASS" "$QD"; APPLIED_DOWN="$QD"; fi
 
     echo "W=${W} I=${I} field=$FIELD p=$P_CONTROL i=$I_CONTROL ctl=$CONTROL bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
     nap
