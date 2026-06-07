@@ -1,204 +1,70 @@
 #!/bin/sh
-# HFSC gaming controller -- residual-model comparison harness.
+# qos-audit.sh -- read-only audit of what's ACTUALLY shaping this box.
+# Changes nothing. Just reports the real qdisc tree, the CAKE sensor under
+# load, and the qosmate config, so the next decision is grounded in fact.
 #
-# ONE script, four residual models behind a switch. Everything else is
-# byte-identical across models, so any feel difference is attributable purely
-# to the residual math. Commit/posture layer intentionally OUT (it would mask
-# differences between residual models -- test it separately later).
-#
-# Set MODEL below (or pass as $1):  A | B | C | D
-#
-#   A  Delta-discount      : subtract a fixed fraction of any self-explainable
-#                            delay IMPROVEMENT. Crude, safe, magnitude-based.
-#                            (the current/baseline model)
-#   B  Predicted-trajectory: predict delay relief our clamp SHOULD cause
-#                            (control units * relief-per-unit) and respond to
-#                            measured - predicted. True efference copy.
-#   C  Refractory-timing   : no magnitude math; if improvement coincides in time
-#                            with a recent clamp, suppress release; otherwise
-#                            treat as real. Sign/timing-based, robust to bad
-#                            constants.
-#   D  Dual-rate two-field : respond to divergence between a fast field and a
-#                            slow echo-immune reference field. Timescale-based.
-#
-# ALL models share the safety asymmetry: delay WORSENING is never discounted ->
-# full instant environmental response. Only self-explainable IMPROVEMENTS are
-# ever damped, so a wrong model is at worst slightly slow to RELEASE (safe).
+# Run it twice if you can: once idle, once WITH a download running and you in
+# a contested game moment. The difference between the two is the real signal.
 
-MODEL="${1:-A}"
+LINE="---------------------------------------------------------------"
+say() { echo; echo "$LINE"; echo "== $1"; echo "$LINE"; }
 
-WAN_DEV="eth1"; IFB_DEV="ifb-eth1"
-GAME_CLASS="1:20"; BULK_CLASS="1:60"
+say "1. ALL qdiscs on ALL devices (what shaping exists, and where)"
+tc qdisc show
 
-GAME_UP=12000; GAME_DOWN=16000
-BULK_UP_BASE=42000; BULK_DOWN_BASE=84000
-BULK_UP_MIN=24000;  BULK_DOWN_MIN=52000
+say "2. Does any HFSC / class 1:20 / 1:60 exist ANYWHERE? (our old script's assumption)"
+found=0
+for d in $(tc qdisc show | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | sort -u); do
+    if tc class show dev "$d" 2>/dev/null | grep -qE '1:20|1:60|hfsc'; then
+        echo "  FOUND on dev $d:"; tc class show dev "$d" 2>/dev/null | grep -E '1:20|1:60|hfsc'
+        found=1
+    fi
+done
+[ "$found" -eq 0 ] && echo "  none found on any device -> the old HFSC script had nothing to act on."
 
-TARGET_DELAY_DMS=120
+say "3. The REAL shaper: CAKE on ifb-eth1 (full config + live stats)"
+echo "  (run this section under load to see real backlog / delay / drops)"
+tc -s qdisc show dev ifb-eth1
 
-SHAPE_A=70; SHAPE_B=80
-FIELD_FLOOR=8
+say "4. Is the UPLOAD/egress direction shaped at all? (check WAN devs)"
+for d in eth0 eth1 eth2 eth3; do
+    echo "  -- dev $d root qdisc:"
+    tc qdisc show dev "$d" 2>/dev/null | head -1 | sed 's/^/     /'
+done
+echo "  (if these are all 'mq'/'fq_codel' and only ifb-eth1 has cake,"
+echo "   then only DOWNLOAD is shaped and upload is unmanaged.)"
 
-ATK_TC_MS=250
-REL_TC_MS=120
+say "5. Per-tin CAKE detail (are game packets in their own priority tin?)"
+echo "  Look for 'besteffort' (no priority) vs 'diffserv3/diffserv4' (tiers),"
+echo "  and whether multiple tins show traffic:"
+tc -s qdisc show dev ifb-eth1 | grep -iE 'cake|tin|besteffort|diffserv|thresh|target|pk_delay|av_delay|sp_delay|backlog|drops|marks' | sed 's/^/     /'
 
-UP_TRIM_PER_CONTROL=450; DOWN_TRIM_PER_CONTROL=700
-
-# --- residual-model params ---
-# A: fraction of a self-explainable improvement to discount, + echo window
-A_FRAC_NUM=1; A_FRAC_DEN=2; A_ECHO_TICKS=3
-# B: expected delay relief (dms) per unit of control, decaying over B_ECHO_TICKS
-B_RELIEF_PER_CTL=2; B_ECHO_TICKS=4
-# C: refractory window (ticks) after a clamp during which improvement is ignored
-C_REFRACTORY=3
-# D: slow reference field smoothing (higher = slower/more echo-immune)
-D_SLOW_NUM=9; D_SLOW_DEN=10
-
-APPLY_Q=100
-APPLY_EPS=150
-
-LOOP_MS=50
-if sleep 0.05 2>/dev/null; then
-    nap() { sleep 0.05; }; PACE="sleep 0.05 (20Hz)"
-elif usleep 1 2>/dev/null; then
-    nap() { usleep 50000; }; PACE="usleep (20Hz)"
+say "6. qosmate config (mode, devices, game classification)"
+if [ -f /etc/config/qosmate ]; then
+    cat /etc/config/qosmate
 else
-    LOOP_MS=1000; nap() { sleep 1; }; PACE="1Hz fallback"
+    echo "  /etc/config/qosmate not found -- checking alternatives:"
+    ls -la /etc/config/ 2>/dev/null | grep -iE 'qos|sqm|cake' | sed 's/^/     /'
 fi
 
-ATK_NUM="$LOOP_MS"; ATK_DEN="$ATK_TC_MS"; [ "$ATK_NUM" -gt "$ATK_DEN" ] && ATK_NUM="$ATK_DEN"
-REL_NUM="$LOOP_MS"; REL_DEN="$REL_TC_MS"; [ "$REL_NUM" -gt "$REL_DEN" ] && REL_NUM="$REL_DEN"
-echo "MODEL=$MODEL  pace=$PACE  atk ${ATK_NUM}/${ATK_DEN} rel ${REL_NUM}/${REL_DEN}  [no commit layer]" >&2
+say "7. qosmate / SQM packages installed"
+opkg list-installed 2>/dev/null | grep -iE 'qosmate|sqm|cake|tc-' | sed 's/^/     /'
+[ -f /etc/init.d/qosmate ] && { echo "  qosmate service status:"; /etc/init.d/qosmate status 2>/dev/null | sed 's/^/     /'; }
 
-FIELD=0
-SLOW_FIELD=0            # model D
-PREV_RAW=0
-PREV_CONTROL=0
-ECHO_AGE=99            # ticks since control last rose (A, B, C)
-EXPECTED_RELIEF=0      # model B running expectation
-LAST_WAN=0; LAST_IFB=0
-CUR_BULK_UP="$BULK_UP_BASE"; CUR_BULK_DOWN="$BULK_DOWN_BASE"
-APPLIED_UP=-1; APPLIED_DOWN=-1
+say "8. Quick jitter probe (is the PATH itself steady, independent of queue?)"
+echo "  10 pings to gateway -- watch the spread, not the average:"
+GW=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
+if [ -n "$GW" ]; then
+    ping -c 10 "$GW" 2>/dev/null | tail -3 | sed 's/^/     /'
+else
+    echo "     (no default gateway found)"
+fi
 
-get_delay_dms() {
-    tc -s qdisc show dev "$1" 2>/dev/null | awk '
-        /avg_delay/ || /delay/ {
-            for (i=1;i<=NF;i++) if ($i ~ /delay/) {
-                v=$(i+1); gsub(/[^0-9.]/,"",v); printf "%d\n", int(v*10+0.5); exit }
-        }'
-}
-clamp() { v="$1"; [ "$v" -lt "$2" ] && v="$2"; [ "$v" -gt "$3" ] && v="$3"; echo "$v"; }
-apply_class() { tc class change dev "$1" classid "$2" hfsc ls rate "${3}kbit" ul rate "${3}kbit" 2>/dev/null; }
-ease() {
-    cur="$1"; tgt="$2"; n="$3"; dn="$4"
-    diff=$((tgt - cur)); [ "$diff" -eq 0 ] && { echo "$cur"; return; }
-    step=$(( diff * n / dn ))
-    if [ "$step" -eq 0 ]; then [ "$diff" -gt 0 ] && step=1 || step=-1; fi
-    newv=$((cur + step))
-    if [ "$diff" -gt 0 ]; then [ "$newv" -gt "$tgt" ] && newv="$tgt"
-    else                       [ "$newv" -lt "$tgt" ] && newv="$tgt"; fi
-    echo "$newv"
-}
-
-# residual(): reads globals RAW, PREV_RAW, ECHO_AGE, CONTROL/PREV_CONTROL,
-# EXPECTED_RELIEF, SLOW_FIELD; echoes the EFFECTIVE excess the FIELD reacts to.
-residual() {
-    DELTA=$(( RAW - PREV_RAW ))
-    case "$MODEL" in
-    A)
-        EFF="$RAW"
-        if [ "$DELTA" -lt 0 ] && [ "$ECHO_AGE" -lt "$A_ECHO_TICKS" ]; then
-            IMP=$(( -DELTA )); ECHO=$(( IMP * A_FRAC_NUM / A_FRAC_DEN )); EFF=$(( RAW + ECHO ))
-        fi
-        ;;
-    B)
-        # Expected relief decays each tick; refreshed when control rises (below).
-        # The portion of measured improvement matching EXPECTED_RELIEF is "ours".
-        EFF="$RAW"
-        if [ "$DELTA" -lt 0 ] && [ "$EXPECTED_RELIEF" -gt 0 ]; then
-            IMP=$(( -DELTA ))
-            OWN="$IMP"; [ "$OWN" -gt "$EXPECTED_RELIEF" ] && OWN="$EXPECTED_RELIEF"
-            EFF=$(( RAW + OWN ))     # credit only the predicted part to ourselves
-        fi
-        ;;
-    C)
-        # Timing only: inside refractory window, ignore ALL improvement (hold
-        # field flat); outside, take raw. No magnitude estimate at all.
-        if [ "$DELTA" -lt 0 ] && [ "$ECHO_AGE" -lt "$C_REFRACTORY" ]; then
-            EFF="$PREV_RAW"          # pretend no improvement happened this tick
-        else
-            EFF="$RAW"
-        fi
-        ;;
-    D)
-        # Dual-rate: slow reference can't be fooled by one clamp's echo.
-        # Respond to the MAX of raw and the slow reference, so a self-caused dip
-        # in raw doesn't drop the field below the slow truth.
-        if [ "$RAW" -gt "$SLOW_FIELD" ]; then EFF="$RAW"; else EFF="$SLOW_FIELD"; fi
-        ;;
-    *) EFF="$RAW" ;;
-    esac
-    [ "$EFF" -lt 0 ] && EFF=0
-    echo "$EFF"
-}
-
-apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
-apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
-
-while true; do
-    W="$(get_delay_dms "$WAN_DEV")"; I="$(get_delay_dms "$IFB_DEV")"
-    [ -z "$W" ] && W="$LAST_WAN"; [ -z "$I" ] && I="$LAST_IFB"
-    LAST_WAN="$W"; LAST_IFB="$I"
-
-    WE=$((W - TARGET_DELAY_DMS)); IE=$((I - TARGET_DELAY_DMS))
-    [ "$WE" -lt 0 ] && WE=0; [ "$IE" -lt 0 ] && IE=0
-    if [ "$WE" -gt "$IE" ]; then MAXE="$WE"; MINE="$IE"; else MAXE="$IE"; MINE="$WE"; fi
-    RAW=$(( (MAXE*MAXE + MINE*MINE) / (MAXE + MINE + 1) ))
-
-    # slow reference field (model D) -- always maintained, cheap
-    SLOW_FIELD=$(( (SLOW_FIELD * D_SLOW_NUM + RAW * (D_SLOW_DEN - D_SLOW_NUM)) / D_SLOW_DEN ))
-
-    EFFECTIVE="$(residual)"
-    PREV_RAW="$RAW"
-
-    if [ "$EFFECTIVE" -gt "$FIELD" ]; then FIELD="$(ease "$FIELD" "$EFFECTIVE" "$ATK_NUM" "$ATK_DEN")"
-    else                                   FIELD="$(ease "$FIELD" "$EFFECTIVE" "$REL_NUM" "$REL_DEN")"; fi
-
-    if [ "$FIELD" -lt "$FIELD_FLOOR" ]; then
-        CONTROL=0; TGT_UP="$BULK_UP_BASE"; TGT_DOWN="$BULK_DOWN_BASE"
-    else
-        CONTROL=$(( FIELD * SHAPE_A / (FIELD + SHAPE_B) )); CONTROL="$(clamp "$CONTROL" 0 60)"
-        TGT_UP="$(clamp $((BULK_UP_BASE   - CONTROL*UP_TRIM_PER_CONTROL))   "$BULK_UP_MIN"   "$BULK_UP_BASE")"
-        TGT_DOWN="$(clamp $((BULK_DOWN_BASE - CONTROL*DOWN_TRIM_PER_CONTROL)) "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
-    fi
-
-    # update self-action trackers
-    if [ "$CONTROL" -gt "$PREV_CONTROL" ]; then
-        ECHO_AGE=0
-        # model B: refresh expected relief from the size of the control increase
-        RISE=$(( CONTROL - PREV_CONTROL ))
-        EXPECTED_RELIEF=$(( RISE * B_RELIEF_PER_CTL ))
-    else
-        ECHO_AGE=$(( ECHO_AGE + 1 ))
-        # model B: decay expectation over the window
-        EXPECTED_RELIEF=$(( EXPECTED_RELIEF * (B_ECHO_TICKS - 1) / B_ECHO_TICKS ))
-    fi
-    PREV_CONTROL="$CONTROL"
-
-    if [ "$TGT_UP" -lt "$CUR_BULK_UP" ]; then CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TGT_UP" "$ATK_NUM" "$ATK_DEN")"
-    else                                      CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TGT_UP" "$REL_NUM" "$REL_DEN")"; fi
-    if [ "$TGT_DOWN" -lt "$CUR_BULK_DOWN" ]; then CUR_BULK_DOWN="$(ease "$CUR_BULK_DOWN" "$TGT_DOWN" "$ATK_NUM" "$ATK_DEN")"
-    else                                          CUR_BULK_DOWN="$(ease "$CUR_BULK_DOWN" "$TGT_DOWN" "$REL_NUM" "$REL_DEN")"; fi
-
-    QU=$(( (CUR_BULK_UP   + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
-    QD=$(( (CUR_BULK_DOWN + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
-    dU=$(( QU - APPLIED_UP ));   [ "$dU" -lt 0 ] && dU=$(( -dU ))
-    dD=$(( QD - APPLIED_DOWN )); [ "$dD" -lt 0 ] && dD=$(( -dD ))
-    if [ "$APPLIED_UP" -lt 0 ] || [ "$dU" -ge "$APPLY_EPS" ] || { [ "$CUR_BULK_UP" -eq "$TGT_UP" ] && [ "$QU" -ne "$APPLIED_UP" ]; }; then
-        apply_class "$WAN_DEV" "$BULK_CLASS" "$QU"; APPLIED_UP="$QU"; fi
-    if [ "$APPLIED_DOWN" -lt 0 ] || [ "$dD" -ge "$APPLY_EPS" ] || { [ "$CUR_BULK_DOWN" -eq "$TGT_DOWN" ] && [ "$QD" -ne "$APPLIED_DOWN" ]; }; then
-        apply_class "$IFB_DEV" "$BULK_CLASS" "$QD"; APPLIED_DOWN="$QD"; fi
-
-    echo "M=$MODEL W=${W} I=${I} raw=$RAW eff=$EFFECTIVE slow=$SLOW_FIELD eAge=$ECHO_AGE exp=$EXPECTED_RELIEF field=$FIELD ctl=$CONTROL bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
-    nap
-done
+echo
+echo "$LINE"
+echo "DONE. Most important answers:"
+echo "  - Section 2: did HFSC/1:20 exist? (proves whether old script ever worked)"
+echo "  - Section 3/5: is ifb-eth1 backing up under load, and is it besteffort?"
+echo "  - Section 4: is upload shaped at all?"
+echo "  - Section 8: is the bare path jittery even with no queue involved?"
+echo "$LINE"
