@@ -1,23 +1,25 @@
 #!/bin/sh
-# HFSC gaming controller -- synthesis build.
+# HFSC gaming controller -- "sense fast, commit external" build.
 #
-# Philosophy: not "no memory" -- "no BAD memory."
-#   GOOD memory (kept): the shared pressure field itself, with a short,
-#     visible, delay-tied release. It persists just long enough that the
-#     environment doesn't blink out between pressure moments -- earned
-#     continuity, inferable from the shared field, never hidden.
-#   BAD memory (removed): no separate leaky integrator, no per-side private
-#     state, no dielectric/viscosity stack, no long lingering debt. There is
-#     exactly ONE memory variable: FIELD. Nothing else accumulates.
+# THREE cleanly separated layers:
+#   1. FIELD  (sense):   20 Hz, one memory var, soft attack / faster release.
+#                        Visible, short-lived, delay-tied. No hidden state.
+#   2. TARGET (shape):   soft-knee bite -> desired bulk rate, eased.
+#   3. POSTURE (commit): the ONLY thing tc ever sees. Holds a steady external
+#                        transport identity for a dwell window so the game's
+#                        state estimator can LOCK ON. Updates only when:
+#                          (a) the dwell timer expires (slow drift to target), OR
+#                          (b) the target diverges from posture by more than the
+#                              COMMIT BAND -- a real regime change, override now.
 #
-# Untrappability comes from RELEASE BEING FAST, not from release being instant.
-#   - Attack eases in  (~250 ms real) so transients don't yank you.
-#   - Release eases out (~120 ms real) -- faster than attack, so you're never
-#     held, but soft enough the field stays continuous (not a square wave).
-#   - Both constants are REAL-TIME, derived from the loop period, so feel is
-#     identical at any resolution. Raise the rate for finer motion, same feel.
-#   - When the field decays to base, tc calls stop entirely: clean link is
-#     byte-for-byte equivalent to no script.
+# Why: the game (EA/FIFA netcode) estimates a congestion REGIME -- jitter
+# stability, pacing confidence, transport predictability -- not just ping.
+# Continuous micro-adjustment never lets it classify a stable regime ("not
+# giving me a state"). Internal speed stays high for accurate bite; the
+# EXTERNAL posture stays still so the game perceives a committed identity.
+#
+# This is NOT trapping and NOT hidden memory: posture is fully derived from the
+# visible field, holds only briefly, and yields instantly to real events.
 
 WAN_DEV="eth1"; IFB_DEV="ifb-eth1"
 GAME_CLASS="1:20"; BULK_CLASS="1:60"
@@ -28,26 +30,32 @@ BULK_UP_MIN=24000;  BULK_DOWN_MIN=52000
 
 TARGET_DELAY_DMS=120          # 12.0 ms
 
-# Soft-knee bite: control = field*A/(field+B). Early bite, gentle saturation.
+# Soft-knee bite: control = field*A/(field+B).
 SHAPE_A=70
 SHAPE_B=80
 
-# Pressure floor (deci-ms of excess). Below this the field is considered clean;
-# it eases through the floor at the release rate (no cliff), and once bulk has
-# returned to base, tc calls stop.
-FIELD_FLOOR=8                 # 0.8 ms of excess
+FIELD_FLOOR=8                 # 0.8 ms excess; below = clean
 
 # --- Real-time response constants (resolution-independent) ---
-ATK_TC_MS=250                 # grab speed: ease IN over ~250 ms
-REL_TC_MS=120                 # let-go speed: ease OUT over ~120 ms (faster than attack)
+ATK_TC_MS=250                 # field/actuator ease IN  over ~250 ms
+REL_TC_MS=120                 # field/actuator ease OUT over ~120 ms (faster)
 
 UP_TRIM_PER_CONTROL=450; DOWN_TRIM_PER_CONTROL=700
 
-# Apply quantum: round rate to grid, apply only when rounded value changes.
+# --- COMMIT LAYER: external transport-identity persistence ---
+# Posture holds for DWELL_MS before it's allowed to drift toward target.
+# A target move larger than COMMIT_BAND_* (kbit) overrides the dwell instantly
+# (real regime change). This is hysteresis in TIME + MAGNITUDE: steady against
+# noise, instant on real events.
+DWELL_MS=200                  # hold external posture ~200 ms (several game ticks)
+COMMIT_BAND_UP=4000           # up-move bigger than this overrides dwell
+COMMIT_BAND_DOWN=8000         # down-move bigger than this overrides dwell
+
+# Apply quantum: round posture to grid; apply only when rounded value changes.
 APPLY_Q=100
 
-# --- run FAST; untrappability is in the math, not slow ticks ---
-LOOP_MS=50                    # 20 Hz target
+# --- run FAST internally ---
+LOOP_MS=50                    # 20 Hz
 if sleep 0.05 2>/dev/null; then
     nap() { sleep 0.05; }; echo "pacing: sleep 0.05 (20 Hz)" >&2
 elif usleep 1 2>/dev/null; then
@@ -57,15 +65,17 @@ else
     nap() { sleep 1; }; echo "WARN: no sub-second sleep; 1 Hz fallback" >&2
 fi
 
-# Per-tick fractions derived from real-time constants (NUM/DEN), clamped <1 tick.
-ATK_NUM="$LOOP_MS"; ATK_DEN="$ATK_TC_MS"
-[ "$ATK_NUM" -gt "$ATK_DEN" ] && ATK_NUM="$ATK_DEN"
-REL_NUM="$LOOP_MS"; REL_DEN="$REL_TC_MS"
-[ "$REL_NUM" -gt "$REL_DEN" ] && REL_NUM="$REL_DEN"
-echo "attack ${ATK_NUM}/${ATK_DEN} (~${ATK_TC_MS}ms)  release ${REL_NUM}/${REL_DEN} (~${REL_TC_MS}ms) per tick" >&2
+# Per-tick ease fractions from real-time constants.
+ATK_NUM="$LOOP_MS"; ATK_DEN="$ATK_TC_MS"; [ "$ATK_NUM" -gt "$ATK_DEN" ] && ATK_NUM="$ATK_DEN"
+REL_NUM="$LOOP_MS"; REL_DEN="$REL_TC_MS"; [ "$REL_NUM" -gt "$REL_DEN" ] && REL_NUM="$REL_DEN"
+# Dwell measured in ticks.
+DWELL_TICKS=$(( DWELL_MS / LOOP_MS )); [ "$DWELL_TICKS" -lt 1 ] && DWELL_TICKS=1
+echo "attack ${ATK_NUM}/${ATK_DEN}  release ${REL_NUM}/${REL_DEN}  dwell ${DWELL_TICKS} ticks (~${DWELL_MS}ms)" >&2
 
 FIELD=0
-CUR_BULK_UP="$BULK_UP_BASE"; CUR_BULK_DOWN="$BULK_DOWN_BASE"
+CUR_BULK_UP="$BULK_UP_BASE"; CUR_BULK_DOWN="$BULK_DOWN_BASE"   # eased soft target
+POSTURE_UP="$BULK_UP_BASE"; POSTURE_DOWN="$BULK_DOWN_BASE"     # committed external
+DWELL_UP=0; DWELL_DOWN=0                                       # ticks since commit
 APPLIED_UP=-1; APPLIED_DOWN=-1
 LAST_WAN=0; LAST_IFB=0
 
@@ -79,22 +89,33 @@ get_delay_dms() {
 clamp() { v="$1"; [ "$v" -lt "$2" ] && v="$2"; [ "$v" -gt "$3" ] && v="$3"; echo "$v"; }
 apply_class() { tc class change dev "$1" classid "$2" hfsc ls rate "${3}kbit" ul rate "${3}kbit" 2>/dev/null; }
 
-# ease(current, target, num, den): first-order step toward target, min-step-1
-# so integer truncation never stalls. Used for both field and actuator.
+# first-order ease toward target, min-step-1, no overshoot
 ease() {
     cur="$1"; tgt="$2"; n="$3"; dn="$4"
-    diff=$((tgt - cur))
-    [ "$diff" -eq 0 ] && { echo "$cur"; return; }
+    diff=$((tgt - cur)); [ "$diff" -eq 0 ] && { echo "$cur"; return; }
     step=$(( diff * n / dn ))
     if [ "$step" -eq 0 ]; then [ "$diff" -gt 0 ] && step=1 || step=-1; fi
     newv=$((cur + step))
-    # don't overshoot
     if [ "$diff" -gt 0 ]; then [ "$newv" -gt "$tgt" ] && newv="$tgt"
     else                       [ "$newv" -lt "$tgt" ] && newv="$tgt"; fi
     echo "$newv"
 }
+absdiff() { a=$(( $1 - $2 )); [ "$a" -lt 0 ] && a=$(( -a )); echo "$a"; }
 
-# Game lane is static -- set once.
+# commit_posture(posture, soft_target, dwell_ticks_var_name, band):
+# returns "newposture newdwell" -- updates posture to target if dwell elapsed OR
+# move exceeds band; otherwise holds and increments dwell.
+commit() {
+    post="$1"; tgt="$2"; dwell="$3"; band="$4"
+    mv="$(absdiff "$tgt" "$post")"
+    if [ "$mv" -ge "$band" ] || [ "$dwell" -ge "$DWELL_TICKS" ]; then
+        echo "$tgt 0"            # commit to current soft target, reset dwell
+    else
+        echo "$post $((dwell + 1))"   # hold posture, age the dwell
+    fi
+}
+
+# Game lane static -- set once.
 apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
 apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
 
@@ -107,53 +128,35 @@ while true; do
     [ "$WE" -lt 0 ] && WE=0; [ "$IE" -lt 0 ] && IE=0
     if [ "$WE" -gt "$IE" ]; then MAXE="$WE"; MINE="$IE"; else MAXE="$IE"; MINE="$WE"; fi
 
-    # Shared field input (contraharmonic): mostly worst side, smooth at crossover.
     FE=$(( (MAXE*MAXE + MINE*MINE) / (MAXE + MINE + 1) ))
 
-    # FIELD is the ONE memory: ease IN on a rising edge (attack), ease OUT on a
-    # falling edge (release, faster). Short, visible, delay-tied continuity --
-    # not a snap, not a lingering debt.
-    if [ "$FE" -gt "$FIELD" ]; then
-        FIELD="$(ease "$FIELD" "$FE" "$ATK_NUM" "$ATK_DEN")"
-    else
-        FIELD="$(ease "$FIELD" "$FE" "$REL_NUM" "$REL_DEN")"
-    fi
+    # Layer 1: FIELD (fast, soft attack / faster release, one memory var)
+    if [ "$FE" -gt "$FIELD" ]; then FIELD="$(ease "$FIELD" "$FE" "$ATK_NUM" "$ATK_DEN")"
+    else                            FIELD="$(ease "$FIELD" "$FE" "$REL_NUM" "$REL_DEN")"; fi
 
-    # Below the floor, treat as clean for control purposes (the field is still
-    # easing down naturally; we just don't bite). No cliff -- the ease above
-    # already carried it here smoothly.
+    # Layer 2: TARGET (soft-knee shape -> eased soft target)
     if [ "$FIELD" -lt "$FIELD_FLOOR" ]; then
-        CONTROL=0
-        TARGET_UP="$BULK_UP_BASE"; TARGET_DOWN="$BULK_DOWN_BASE"
+        CONTROL=0; TGT_UP="$BULK_UP_BASE"; TGT_DOWN="$BULK_DOWN_BASE"
     else
-        CONTROL=$(( FIELD * SHAPE_A / (FIELD + SHAPE_B) ))
-        CONTROL="$(clamp "$CONTROL" 0 60)"
-        TARGET_UP="$(clamp $((BULK_UP_BASE   - CONTROL*UP_TRIM_PER_CONTROL))   "$BULK_UP_MIN"   "$BULK_UP_BASE")"
-        TARGET_DOWN="$(clamp $((BULK_DOWN_BASE - CONTROL*DOWN_TRIM_PER_CONTROL)) "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
+        CONTROL=$(( FIELD * SHAPE_A / (FIELD + SHAPE_B) )); CONTROL="$(clamp "$CONTROL" 0 60)"
+        TGT_UP="$(clamp $((BULK_UP_BASE   - CONTROL*UP_TRIM_PER_CONTROL))   "$BULK_UP_MIN"   "$BULK_UP_BASE")"
+        TGT_DOWN="$(clamp $((BULK_DOWN_BASE - CONTROL*DOWN_TRIM_PER_CONTROL)) "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
     fi
+    if [ "$TGT_UP" -lt "$CUR_BULK_UP" ]; then CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TGT_UP" "$ATK_NUM" "$ATK_DEN")"
+    else                                      CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TGT_UP" "$REL_NUM" "$REL_DEN")"; fi
+    if [ "$TGT_DOWN" -lt "$CUR_BULK_DOWN" ]; then CUR_BULK_DOWN="$(ease "$CUR_BULK_DOWN" "$TGT_DOWN" "$ATK_NUM" "$ATK_DEN")"
+    else                                          CUR_BULK_DOWN="$(ease "$CUR_BULK_DOWN" "$TGT_DOWN" "$REL_NUM" "$REL_DEN")"; fi
 
-    # Actuator: ease IN when clamping (target below current), ease OUT (faster)
-    # when releasing toward base. Soft both ways -- continuous, never a cliff,
-    # but release is quicker so you're never held.
-    if [ "$TARGET_UP" -lt "$CUR_BULK_UP" ]; then
-        CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TARGET_UP" "$ATK_NUM" "$ATK_DEN")"
-    else
-        CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TARGET_UP" "$REL_NUM" "$REL_DEN")"
-    fi
-    if [ "$TARGET_DOWN" -lt "$CUR_BULK_DOWN" ]; then
-        CUR_BULK_DOWN="$(ease "$CUR_BULK_DOWN" "$TARGET_DOWN" "$ATK_NUM" "$ATK_DEN")"
-    else
-        CUR_BULK_DOWN="$(ease "$CUR_BULK_DOWN" "$TARGET_DOWN" "$REL_NUM" "$REL_DEN")"
-    fi
+    # Layer 3: COMMIT (external posture holds for dwell, overrides on big move)
+    set -- $(commit "$POSTURE_UP"   "$CUR_BULK_UP"   "$DWELL_UP"   "$COMMIT_BAND_UP");   POSTURE_UP="$1";   DWELL_UP="$2"
+    set -- $(commit "$POSTURE_DOWN" "$CUR_BULK_DOWN" "$DWELL_DOWN" "$COMMIT_BAND_DOWN"); POSTURE_DOWN="$1"; DWELL_DOWN="$2"
 
-    # Apply on grid change only -- once back at base and unchanged, tc goes quiet.
-    QU=$(( (CUR_BULK_UP   + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
-    QD=$(( (CUR_BULK_DOWN + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
-    if [ "$QU" -ne "$APPLIED_UP" ]; then
-        apply_class "$WAN_DEV" "$BULK_CLASS" "$QU"; APPLIED_UP="$QU"; fi
-    if [ "$QD" -ne "$APPLIED_DOWN" ]; then
-        apply_class "$IFB_DEV" "$BULK_CLASS" "$QD"; APPLIED_DOWN="$QD"; fi
+    # Apply posture (not soft target) on grid change only.
+    QU=$(( (POSTURE_UP   + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
+    QD=$(( (POSTURE_DOWN + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
+    if [ "$QU" -ne "$APPLIED_UP" ]; then apply_class "$WAN_DEV" "$BULK_CLASS" "$QU"; APPLIED_UP="$QU"; fi
+    if [ "$QD" -ne "$APPLIED_DOWN" ]; then apply_class "$IFB_DEV" "$BULK_CLASS" "$QD"; APPLIED_DOWN="$QD"; fi
 
-    echo "W=${W} I=${I} field=$FIELD ctl=$CONTROL bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "W=${W} I=${I} field=$FIELD ctl=$CONTROL soft=${CUR_BULK_UP}/${CUR_BULK_DOWN} posture=${POSTURE_UP}/${POSTURE_DOWN} dU=$DWELL_UP"
     nap
 done
