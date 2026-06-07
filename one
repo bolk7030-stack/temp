@@ -1,18 +1,30 @@
 #!/bin/sh
 # qos-audit.sh -- read-only audit of what's ACTUALLY shaping this box.
-# Changes nothing. Just reports the real qdisc tree, the CAKE sensor under
-# load, and the qosmate config, so the next decision is grounded in fact.
+# Changes nothing. Prints to screen AND saves a timestamped log file.
 #
-# Run it twice if you can: once idle, once WITH a download running and you in
-# a contested game moment. The difference between the two is the real signal.
+# Usage:
+#   sh qos-audit.sh            -> saves /tmp/qos-audit-<time>.log
+#   sh qos-audit.sh idle       -> tags the file ...-idle.log
+#   sh qos-audit.sh load       -> tags the file ...-load.log  (run during a
+#                                 download + contested game moment)
+#
+# Run it twice (idle, then load) and send both logs.
 
+TAG="${1:-run}"
+TS="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo manual)"
+OUT="/tmp/qos-audit-${TS}-${TAG}.log"
+
+# Tee everything below to both screen and the file.
+{
 LINE="---------------------------------------------------------------"
 say() { echo; echo "$LINE"; echo "== $1"; echo "$LINE"; }
+
+echo "qos-audit  tag=$TAG  time=$TS"
 
 say "1. ALL qdiscs on ALL devices (what shaping exists, and where)"
 tc qdisc show
 
-say "2. Does any HFSC / class 1:20 / 1:60 exist ANYWHERE? (our old script's assumption)"
+say "2. Does any HFSC / class 1:20 / 1:60 exist ANYWHERE?"
 found=0
 for d in $(tc qdisc show | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | sort -u); do
     if tc class show dev "$d" 2>/dev/null | grep -qE '1:20|1:60|hfsc'; then
@@ -23,36 +35,30 @@ done
 [ "$found" -eq 0 ] && echo "  none found on any device -> the old HFSC script had nothing to act on."
 
 say "3. The REAL shaper: CAKE on ifb-eth1 (full config + live stats)"
-echo "  (run this section under load to see real backlog / delay / drops)"
 tc -s qdisc show dev ifb-eth1
 
-say "4. Is the UPLOAD/egress direction shaped at all? (check WAN devs)"
+say "4. Is the UPLOAD/egress direction shaped at all? (WAN devs)"
 for d in eth0 eth1 eth2 eth3; do
     echo "  -- dev $d root qdisc:"
     tc qdisc show dev "$d" 2>/dev/null | head -1 | sed 's/^/     /'
 done
-echo "  (if these are all 'mq'/'fq_codel' and only ifb-eth1 has cake,"
-echo "   then only DOWNLOAD is shaped and upload is unmanaged.)"
 
-say "5. Per-tin CAKE detail (are game packets in their own priority tin?)"
-echo "  Look for 'besteffort' (no priority) vs 'diffserv3/diffserv4' (tiers),"
-echo "  and whether multiple tins show traffic:"
+say "5. Per-tin CAKE detail (besteffort vs diffserv; game in own tin?)"
 tc -s qdisc show dev ifb-eth1 | grep -iE 'cake|tin|besteffort|diffserv|thresh|target|pk_delay|av_delay|sp_delay|backlog|drops|marks' | sed 's/^/     /'
 
-say "6. qosmate config (mode, devices, game classification)"
+say "6. qosmate config"
 if [ -f /etc/config/qosmate ]; then
     cat /etc/config/qosmate
 else
-    echo "  /etc/config/qosmate not found -- checking alternatives:"
+    echo "  /etc/config/qosmate not found:"
     ls -la /etc/config/ 2>/dev/null | grep -iE 'qos|sqm|cake' | sed 's/^/     /'
 fi
 
-say "7. qosmate / SQM packages installed"
+say "7. Packages + service status"
 opkg list-installed 2>/dev/null | grep -iE 'qosmate|sqm|cake|tc-' | sed 's/^/     /'
-[ -f /etc/init.d/qosmate ] && { echo "  qosmate service status:"; /etc/init.d/qosmate status 2>/dev/null | sed 's/^/     /'; }
+[ -f /etc/init.d/qosmate ] && { echo "  qosmate status:"; /etc/init.d/qosmate status 2>/dev/null | sed 's/^/     /'; }
 
-say "8. Quick jitter probe (is the PATH itself steady, independent of queue?)"
-echo "  10 pings to gateway -- watch the spread, not the average:"
+say "8. Bare path jitter (steady independent of queue?)"
 GW=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
 if [ -n "$GW" ]; then
     ping -c 10 "$GW" 2>/dev/null | tail -3 | sed 's/^/     /'
@@ -62,9 +68,11 @@ fi
 
 echo
 echo "$LINE"
-echo "DONE. Most important answers:"
-echo "  - Section 2: did HFSC/1:20 exist? (proves whether old script ever worked)"
-echo "  - Section 3/5: is ifb-eth1 backing up under load, and is it besteffort?"
-echo "  - Section 4: is upload shaped at all?"
-echo "  - Section 8: is the bare path jittery even with no queue involved?"
+echo "DONE."
 echo "$LINE"
+} 2>&1 | tee "$OUT"
+
+echo
+echo ">>> saved to: $OUT"
+echo ">>> view with:  cat $OUT"
+echo ">>> if you have it, copy off-box with scp, or just cat and screenshot."
