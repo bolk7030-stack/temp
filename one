@@ -1,160 +1,204 @@
 #!/bin/sh
+# HFSC gaming controller -- residual-model comparison harness.
+#
+# ONE script, four residual models behind a switch. Everything else is
+# byte-identical across models, so any feel difference is attributable purely
+# to the residual math. Commit/posture layer intentionally OUT (it would mask
+# differences between residual models -- test it separately later).
+#
+# Set MODEL below (or pass as $1):  A | B | C | D
+#
+#   A  Delta-discount      : subtract a fixed fraction of any self-explainable
+#                            delay IMPROVEMENT. Crude, safe, magnitude-based.
+#                            (the current/baseline model)
+#   B  Predicted-trajectory: predict delay relief our clamp SHOULD cause
+#                            (control units * relief-per-unit) and respond to
+#                            measured - predicted. True efference copy.
+#   C  Refractory-timing   : no magnitude math; if improvement coincides in time
+#                            with a recent clamp, suppress release; otherwise
+#                            treat as real. Sign/timing-based, robust to bad
+#                            constants.
+#   D  Dual-rate two-field : respond to divergence between a fast field and a
+#                            slow echo-immune reference field. Timescale-based.
+#
+# ALL models share the safety asymmetry: delay WORSENING is never discounted ->
+# full instant environmental response. Only self-explainable IMPROVEMENTS are
+# ever damped, so a wrong model is at worst slightly slow to RELEASE (safe).
 
-WAN_DEV="eth1"
-IFB_DEV="ifb-eth1"
+MODEL="${1:-A}"
 
-GAME_CLASS="1:20"
-BULK_CLASS="1:60"
+WAN_DEV="eth1"; IFB_DEV="ifb-eth1"
+GAME_CLASS="1:20"; BULK_CLASS="1:60"
 
-SLEEP_SEC=1
+GAME_UP=12000; GAME_DOWN=16000
+BULK_UP_BASE=42000; BULK_DOWN_BASE=84000
+BULK_UP_MIN=24000;  BULK_DOWN_MIN=52000
 
-GAME_UP=12000
-GAME_DOWN=16000
+TARGET_DELAY_DMS=120
 
-BULK_UP_BASE=45000
-BULK_DOWN_BASE=90000
+SHAPE_A=70; SHAPE_B=80
+FIELD_FLOOR=8
 
-BULK_UP_MIN=24000
-BULK_DOWN_MIN=52000
+ATK_TC_MS=250
+REL_TC_MS=120
 
-TARGET_DELAY_MS=12
+UP_TRIM_PER_CONTROL=450; DOWN_TRIM_PER_CONTROL=700
 
-UP_TRIM_PER_DEBT=450
-DOWN_TRIM_PER_DEBT=700
+# --- residual-model params ---
+# A: fraction of a self-explainable improvement to discount, + echo window
+A_FRAC_NUM=1; A_FRAC_DEN=2; A_ECHO_TICKS=3
+# B: expected delay relief (dms) per unit of control, decaying over B_ECHO_TICKS
+B_RELIEF_PER_CTL=2; B_ECHO_TICKS=4
+# C: refractory window (ticks) after a clamp during which improvement is ignored
+C_REFRACTORY=3
+# D: slow reference field smoothing (higher = slower/more echo-immune)
+D_SLOW_NUM=9; D_SLOW_DEN=10
 
-PRESSURE_DEBT=0
-LAST_DEBT=0
-PRESSURE_DEBT_MAX=60
-PRESSURE_DECAY_PER_TICK=3
+APPLY_Q=100
+APPLY_EPS=150
 
-# Minimal proprioception:
-# Don't release too quickly on delay improvement caused by our own last clamp.
-PREV_EXCESS=0
-ECHO_AGE=99
-ECHO_TICKS=2
-ECHO_FRAC_NUM=1
-ECHO_FRAC_DEN=2
+LOOP_MS=50
+if sleep 0.05 2>/dev/null; then
+    nap() { sleep 0.05; }; PACE="sleep 0.05 (20Hz)"
+elif usleep 1 2>/dev/null; then
+    nap() { usleep 50000; }; PACE="usleep (20Hz)"
+else
+    LOOP_MS=1000; nap() { sleep 1; }; PACE="1Hz fallback"
+fi
 
-CUR_BULK_UP="$BULK_UP_BASE"
-CUR_BULK_DOWN="$BULK_DOWN_BASE"
+ATK_NUM="$LOOP_MS"; ATK_DEN="$ATK_TC_MS"; [ "$ATK_NUM" -gt "$ATK_DEN" ] && ATK_NUM="$ATK_DEN"
+REL_NUM="$LOOP_MS"; REL_DEN="$REL_TC_MS"; [ "$REL_NUM" -gt "$REL_DEN" ] && REL_NUM="$REL_DEN"
+echo "MODEL=$MODEL  pace=$PACE  atk ${ATK_NUM}/${ATK_DEN} rel ${REL_NUM}/${REL_DEN}  [no commit layer]" >&2
 
-get_delay_ms() {
-    DEV="$1"
+FIELD=0
+SLOW_FIELD=0            # model D
+PREV_RAW=0
+PREV_CONTROL=0
+ECHO_AGE=99            # ticks since control last rose (A, B, C)
+EXPECTED_RELIEF=0      # model B running expectation
+LAST_WAN=0; LAST_IFB=0
+CUR_BULK_UP="$BULK_UP_BASE"; CUR_BULK_DOWN="$BULK_DOWN_BASE"
+APPLIED_UP=-1; APPLIED_DOWN=-1
 
-    tc -s qdisc show dev "$DEV" 2>/dev/null | awk '
-        /avg_delay/ {
-            for (i=1; i<=NF; i++) {
-                if ($i ~ /avg_delay/) {
-                    val=$(i+1)
-                    gsub(/[^0-9.]/, "", val)
-                    print int(val)
-                    exit
-                }
-            }
-        }
-        /delay/ {
-            for (i=1; i<=NF; i++) {
-                if ($i ~ /delay/) {
-                    val=$(i+1)
-                    gsub(/[^0-9.]/, "", val)
-                    print int(val)
-                    exit
-                }
-            }
-        }
-    '
+get_delay_dms() {
+    tc -s qdisc show dev "$1" 2>/dev/null | awk '
+        /avg_delay/ || /delay/ {
+            for (i=1;i<=NF;i++) if ($i ~ /delay/) {
+                v=$(i+1); gsub(/[^0-9.]/,"",v); printf "%d\n", int(v*10+0.5); exit }
+        }'
+}
+clamp() { v="$1"; [ "$v" -lt "$2" ] && v="$2"; [ "$v" -gt "$3" ] && v="$3"; echo "$v"; }
+apply_class() { tc class change dev "$1" classid "$2" hfsc ls rate "${3}kbit" ul rate "${3}kbit" 2>/dev/null; }
+ease() {
+    cur="$1"; tgt="$2"; n="$3"; dn="$4"
+    diff=$((tgt - cur)); [ "$diff" -eq 0 ] && { echo "$cur"; return; }
+    step=$(( diff * n / dn ))
+    if [ "$step" -eq 0 ]; then [ "$diff" -gt 0 ] && step=1 || step=-1; fi
+    newv=$((cur + step))
+    if [ "$diff" -gt 0 ]; then [ "$newv" -gt "$tgt" ] && newv="$tgt"
+    else                       [ "$newv" -lt "$tgt" ] && newv="$tgt"; fi
+    echo "$newv"
 }
 
-clamp() {
-    VAL="$1"
-    MIN="$2"
-    MAX="$3"
-
-    [ "$VAL" -lt "$MIN" ] && VAL="$MIN"
-    [ "$VAL" -gt "$MAX" ] && VAL="$MAX"
-
-    echo "$VAL"
+# residual(): reads globals RAW, PREV_RAW, ECHO_AGE, CONTROL/PREV_CONTROL,
+# EXPECTED_RELIEF, SLOW_FIELD; echoes the EFFECTIVE excess the FIELD reacts to.
+residual() {
+    DELTA=$(( RAW - PREV_RAW ))
+    case "$MODEL" in
+    A)
+        EFF="$RAW"
+        if [ "$DELTA" -lt 0 ] && [ "$ECHO_AGE" -lt "$A_ECHO_TICKS" ]; then
+            IMP=$(( -DELTA )); ECHO=$(( IMP * A_FRAC_NUM / A_FRAC_DEN )); EFF=$(( RAW + ECHO ))
+        fi
+        ;;
+    B)
+        # Expected relief decays each tick; refreshed when control rises (below).
+        # The portion of measured improvement matching EXPECTED_RELIEF is "ours".
+        EFF="$RAW"
+        if [ "$DELTA" -lt 0 ] && [ "$EXPECTED_RELIEF" -gt 0 ]; then
+            IMP=$(( -DELTA ))
+            OWN="$IMP"; [ "$OWN" -gt "$EXPECTED_RELIEF" ] && OWN="$EXPECTED_RELIEF"
+            EFF=$(( RAW + OWN ))     # credit only the predicted part to ourselves
+        fi
+        ;;
+    C)
+        # Timing only: inside refractory window, ignore ALL improvement (hold
+        # field flat); outside, take raw. No magnitude estimate at all.
+        if [ "$DELTA" -lt 0 ] && [ "$ECHO_AGE" -lt "$C_REFRACTORY" ]; then
+            EFF="$PREV_RAW"          # pretend no improvement happened this tick
+        else
+            EFF="$RAW"
+        fi
+        ;;
+    D)
+        # Dual-rate: slow reference can't be fooled by one clamp's echo.
+        # Respond to the MAX of raw and the slow reference, so a self-caused dip
+        # in raw doesn't drop the field below the slow truth.
+        if [ "$RAW" -gt "$SLOW_FIELD" ]; then EFF="$RAW"; else EFF="$SLOW_FIELD"; fi
+        ;;
+    *) EFF="$RAW" ;;
+    esac
+    [ "$EFF" -lt 0 ] && EFF=0
+    echo "$EFF"
 }
 
-apply_class() {
-    DEV="$1"
-    CLASS="$2"
-    RATE="$3"
+apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
+apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
 
-    tc class change dev "$DEV" classid "$CLASS" \
-        hfsc ls rate "${RATE}kbit" ul rate "${RATE}kbit" 2>/dev/null
-}
+while true; do
+    W="$(get_delay_dms "$WAN_DEV")"; I="$(get_delay_dms "$IFB_DEV")"
+    [ -z "$W" ] && W="$LAST_WAN"; [ -z "$I" ] && I="$LAST_IFB"
+    LAST_WAN="$W"; LAST_IFB="$I"
 
-apply_rates() {
-    apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
-    apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
+    WE=$((W - TARGET_DELAY_DMS)); IE=$((I - TARGET_DELAY_DMS))
+    [ "$WE" -lt 0 ] && WE=0; [ "$IE" -lt 0 ] && IE=0
+    if [ "$WE" -gt "$IE" ]; then MAXE="$WE"; MINE="$IE"; else MAXE="$IE"; MINE="$WE"; fi
+    RAW=$(( (MAXE*MAXE + MINE*MINE) / (MAXE + MINE + 1) ))
 
-    apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
-    apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
+    # slow reference field (model D) -- always maintained, cheap
+    SLOW_FIELD=$(( (SLOW_FIELD * D_SLOW_NUM + RAW * (D_SLOW_DEN - D_SLOW_NUM)) / D_SLOW_DEN ))
 
-    echo "APPLY delay=${DELAY}ms side=$SIDE raw=${RAW_EXCESS}ms excess=${EXCESS}ms echoAge=${ECHO_AGE} debt=$PRESSURE_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
-}
+    EFFECTIVE="$(residual)"
+    PREV_RAW="$RAW"
 
-apply_rates
+    if [ "$EFFECTIVE" -gt "$FIELD" ]; then FIELD="$(ease "$FIELD" "$EFFECTIVE" "$ATK_NUM" "$ATK_DEN")"
+    else                                   FIELD="$(ease "$FIELD" "$EFFECTIVE" "$REL_NUM" "$REL_DEN")"; fi
 
-while true
-do
-    WAN_DELAY="$(get_delay_ms "$WAN_DEV")"
-    IFB_DELAY="$(get_delay_ms "$IFB_DEV")"
-
-    [ -z "$WAN_DELAY" ] && WAN_DELAY=0
-    [ -z "$IFB_DELAY" ] && IFB_DELAY=0
-
-    if [ "$WAN_DELAY" -gt "$IFB_DELAY" ]; then
-        DELAY="$WAN_DELAY"
-        SIDE="wan"
+    if [ "$FIELD" -lt "$FIELD_FLOOR" ]; then
+        CONTROL=0; TGT_UP="$BULK_UP_BASE"; TGT_DOWN="$BULK_DOWN_BASE"
     else
-        DELAY="$IFB_DELAY"
-        SIDE="ifb"
+        CONTROL=$(( FIELD * SHAPE_A / (FIELD + SHAPE_B) )); CONTROL="$(clamp "$CONTROL" 0 60)"
+        TGT_UP="$(clamp $((BULK_UP_BASE   - CONTROL*UP_TRIM_PER_CONTROL))   "$BULK_UP_MIN"   "$BULK_UP_BASE")"
+        TGT_DOWN="$(clamp $((BULK_DOWN_BASE - CONTROL*DOWN_TRIM_PER_CONTROL)) "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
     fi
 
-    RAW_EXCESS=$((DELAY - TARGET_DELAY_MS))
-    [ "$RAW_EXCESS" -lt 0 ] && RAW_EXCESS=0
-
-    DELTA=$((RAW_EXCESS - PREV_EXCESS))
-    EXCESS="$RAW_EXCESS"
-
-    # Self-echo correction:
-    # If delay improved shortly after our own clamp increased,
-    # discount part of that improvement so we don't release on our own echo.
-    if [ "$DELTA" -lt 0 ] && [ "$ECHO_AGE" -lt "$ECHO_TICKS" ]; then
-        IMPROVE=$((0 - DELTA))
-        ECHO=$((IMPROVE * ECHO_FRAC_NUM / ECHO_FRAC_DEN))
-        EXCESS=$((RAW_EXCESS + ECHO))
-    fi
-
-    PREV_EXCESS="$RAW_EXCESS"
-
-    if [ "$EXCESS" -gt 0 ]; then
-        PRESSURE_DEBT=$((PRESSURE_DEBT + EXCESS))
-    else
-        PRESSURE_DEBT=$((PRESSURE_DEBT - PRESSURE_DECAY_PER_TICK))
-    fi
-
-    PRESSURE_DEBT="$(clamp "$PRESSURE_DEBT" 0 "$PRESSURE_DEBT_MAX")"
-
-    # Track whether we just increased control authority.
-    # That arms short echo protection for the next few ticks.
-    if [ "$PRESSURE_DEBT" -gt "$LAST_DEBT" ]; then
+    # update self-action trackers
+    if [ "$CONTROL" -gt "$PREV_CONTROL" ]; then
         ECHO_AGE=0
+        # model B: refresh expected relief from the size of the control increase
+        RISE=$(( CONTROL - PREV_CONTROL ))
+        EXPECTED_RELIEF=$(( RISE * B_RELIEF_PER_CTL ))
     else
-        ECHO_AGE=$((ECHO_AGE + 1))
+        ECHO_AGE=$(( ECHO_AGE + 1 ))
+        # model B: decay expectation over the window
+        EXPECTED_RELIEF=$(( EXPECTED_RELIEF * (B_ECHO_TICKS - 1) / B_ECHO_TICKS ))
     fi
+    PREV_CONTROL="$CONTROL"
 
-    LAST_DEBT="$PRESSURE_DEBT"
+    if [ "$TGT_UP" -lt "$CUR_BULK_UP" ]; then CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TGT_UP" "$ATK_NUM" "$ATK_DEN")"
+    else                                      CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TGT_UP" "$REL_NUM" "$REL_DEN")"; fi
+    if [ "$TGT_DOWN" -lt "$CUR_BULK_DOWN" ]; then CUR_BULK_DOWN="$(ease "$CUR_BULK_DOWN" "$TGT_DOWN" "$ATK_NUM" "$ATK_DEN")"
+    else                                          CUR_BULK_DOWN="$(ease "$CUR_BULK_DOWN" "$TGT_DOWN" "$REL_NUM" "$REL_DEN")"; fi
 
-    NEW_UP=$((BULK_UP_BASE - PRESSURE_DEBT * UP_TRIM_PER_DEBT))
-    NEW_DOWN=$((BULK_DOWN_BASE - PRESSURE_DEBT * DOWN_TRIM_PER_DEBT))
+    QU=$(( (CUR_BULK_UP   + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
+    QD=$(( (CUR_BULK_DOWN + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
+    dU=$(( QU - APPLIED_UP ));   [ "$dU" -lt 0 ] && dU=$(( -dU ))
+    dD=$(( QD - APPLIED_DOWN )); [ "$dD" -lt 0 ] && dD=$(( -dD ))
+    if [ "$APPLIED_UP" -lt 0 ] || [ "$dU" -ge "$APPLY_EPS" ] || { [ "$CUR_BULK_UP" -eq "$TGT_UP" ] && [ "$QU" -ne "$APPLIED_UP" ]; }; then
+        apply_class "$WAN_DEV" "$BULK_CLASS" "$QU"; APPLIED_UP="$QU"; fi
+    if [ "$APPLIED_DOWN" -lt 0 ] || [ "$dD" -ge "$APPLY_EPS" ] || { [ "$CUR_BULK_DOWN" -eq "$TGT_DOWN" ] && [ "$QD" -ne "$APPLIED_DOWN" ]; }; then
+        apply_class "$IFB_DEV" "$BULK_CLASS" "$QD"; APPLIED_DOWN="$QD"; fi
 
-    CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
-    CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
-
-    apply_rates
-
-    sleep "$SLEEP_SEC"
+    echo "M=$MODEL W=${W} I=${I} raw=$RAW eff=$EFFECTIVE slow=$SLOW_FIELD eAge=$ECHO_AGE exp=$EXPECTED_RELIEF field=$FIELD ctl=$CONTROL bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    nap
 done
