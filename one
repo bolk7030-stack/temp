@@ -19,17 +19,26 @@ BULK_DOWN_MIN=52000
 
 TARGET_DELAY_MS=12
 
-UP_TRIM_PER_DEBT=450
-DOWN_TRIM_PER_DEBT=700
+# Irrigation field
+FIELD_ENERGY=0
+FIELD_MAX=80
+TARGET_FIELD=18
 
-PRESSURE_DEBT=0
-PRESSURE_DEBT_MAX=60
-PRESSURE_DECAY_PER_TICK=3
+FIELD_FILL_GAIN=1
+FIELD_DRY_PER_TICK=2
 
-# Artificial launch ramp:
-# real pressure still leads, but authority arrives faster
-LAUNCH_GAIN=2
-LAUNCH_MAX=6
+# Conservative starter motor:
+# Helps the field catch pressure sooner without dominating it.
+LAUNCH_GAIN=1
+LAUNCH_MAX=4
+
+UP_TRIM_PER_FIELD=450
+DOWN_TRIM_PER_FIELD=700
+
+# Viscosity mandate:
+# output seeps toward target instead of teleporting.
+MAX_UP_STEP=1200
+MAX_DOWN_STEP=2200
 
 CUR_BULK_UP="$BULK_UP_BASE"
 CUR_BULK_DOWN="$BULK_DOWN_BASE"
@@ -72,6 +81,22 @@ clamp() {
     echo "$VAL"
 }
 
+approach_target() {
+    CURRENT="$1"
+    TARGET="$2"
+    STEP="$3"
+
+    if [ "$CURRENT" -lt "$TARGET" ]; then
+        CURRENT=$((CURRENT + STEP))
+        [ "$CURRENT" -gt "$TARGET" ] && CURRENT="$TARGET"
+    elif [ "$CURRENT" -gt "$TARGET" ]; then
+        CURRENT=$((CURRENT - STEP))
+        [ "$CURRENT" -lt "$TARGET" ] && CURRENT="$TARGET"
+    fi
+
+    echo "$CURRENT"
+}
+
 apply_class() {
     DEV="$1"
     CLASS="$2"
@@ -88,7 +113,7 @@ apply_rates() {
     apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
     apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
 
-    echo "APPLY wan=${WAN_DELAY}ms ifb=${IFB_DELAY}ms field_excess=$FIELD_EXCESS launch=$LAUNCH debt=$PRESSURE_DEBT game=${GAME_UP}/${GAME_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
+    echo "APPLY delay=${DELAY}ms side=$SIDE excess=$EXCESS launch=$LAUNCH field=$FIELD_ENERGY target=$TARGET_FIELD imbalance=$FIELD_IMBALANCE target_bulk=${TARGET_UP}/${TARGET_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
 }
 
 apply_rates
@@ -101,49 +126,40 @@ do
     [ -z "$WAN_DELAY" ] && WAN_DELAY=0
     [ -z "$IFB_DELAY" ] && IFB_DELAY=0
 
-    WAN_EXCESS=$((WAN_DELAY - TARGET_DELAY_MS))
-    IFB_EXCESS=$((IFB_DELAY - TARGET_DELAY_MS))
-
-    [ "$WAN_EXCESS" -lt 0 ] && WAN_EXCESS=0
-    [ "$IFB_EXCESS" -lt 0 ] && IFB_EXCESS=0
-
-    if [ "$WAN_EXCESS" -gt "$IFB_EXCESS" ]; then
-        MAX_EXCESS="$WAN_EXCESS"
-        MIN_EXCESS="$IFB_EXCESS"
+    if [ "$WAN_DELAY" -gt "$IFB_DELAY" ]; then
+        DELAY="$WAN_DELAY"
         SIDE="wan"
     else
-        MAX_EXCESS="$IFB_EXCESS"
-        MIN_EXCESS="$WAN_EXCESS"
+        DELAY="$IFB_DELAY"
         SIDE="ifb"
     fi
 
-    # Shared-field translation:
-    # both sides pressured = full obligation
-    # one side pressured = partial obligation
-    if [ "$MAX_EXCESS" -gt 0 ]; then
-        if [ "$MIN_EXCESS" -gt 0 ]; then
-            FIELD_EXCESS="$MAX_EXCESS"
-        else
-            FIELD_EXCESS=$(((MAX_EXCESS + 1) / 2))
-        fi
+    EXCESS=$((DELAY - TARGET_DELAY_MS))
+    [ "$EXCESS" -lt 0 ] && EXCESS=0
 
-        LAUNCH=$((FIELD_EXCESS * LAUNCH_GAIN))
+    if [ "$EXCESS" -gt 0 ]; then
+        LAUNCH=$((EXCESS * LAUNCH_GAIN))
         LAUNCH="$(clamp "$LAUNCH" 0 "$LAUNCH_MAX")"
 
-        PRESSURE_DEBT=$((PRESSURE_DEBT + FIELD_EXCESS + LAUNCH))
+        FIELD_ENERGY=$((FIELD_ENERGY + EXCESS * FIELD_FILL_GAIN + LAUNCH))
     else
-        FIELD_EXCESS=0
         LAUNCH=0
-        PRESSURE_DEBT=$((PRESSURE_DEBT - PRESSURE_DECAY_PER_TICK))
+        FIELD_ENERGY=$((FIELD_ENERGY - FIELD_DRY_PER_TICK))
     fi
 
-    PRESSURE_DEBT="$(clamp "$PRESSURE_DEBT" 0 "$PRESSURE_DEBT_MAX")"
+    FIELD_ENERGY="$(clamp "$FIELD_ENERGY" 0 "$FIELD_MAX")"
 
-    NEW_UP=$((BULK_UP_BASE - PRESSURE_DEBT * UP_TRIM_PER_DEBT))
-    NEW_DOWN=$((BULK_DOWN_BASE - PRESSURE_DEBT * DOWN_TRIM_PER_DEBT))
+    FIELD_IMBALANCE=$((FIELD_ENERGY - TARGET_FIELD))
+    [ "$FIELD_IMBALANCE" -lt 0 ] && FIELD_IMBALANCE=0
 
-    CUR_BULK_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
-    CUR_BULK_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
+    NEW_UP=$((BULK_UP_BASE - FIELD_IMBALANCE * UP_TRIM_PER_FIELD))
+    NEW_DOWN=$((BULK_DOWN_BASE - FIELD_IMBALANCE * DOWN_TRIM_PER_FIELD))
+
+    TARGET_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
+    TARGET_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
+
+    CUR_BULK_UP="$(approach_target "$CUR_BULK_UP" "$TARGET_UP" "$MAX_UP_STEP")"
+    CUR_BULK_DOWN="$(approach_target "$CUR_BULK_DOWN" "$TARGET_DOWN" "$MAX_DOWN_STEP")"
 
     apply_rates
 
