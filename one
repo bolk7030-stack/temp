@@ -1,25 +1,25 @@
 #!/bin/sh
-# HFSC gaming controller -- "sense fast, commit external" build.
+# HFSC gaming controller -- proprioceptive build.
 #
-# THREE cleanly separated layers:
-#   1. FIELD  (sense):   20 Hz, one memory var, soft attack / faster release.
-#                        Visible, short-lived, delay-tied. No hidden state.
-#   2. TARGET (shape):   soft-knee bite -> desired bulk rate, eased.
-#   3. POSTURE (commit): the ONLY thing tc ever sees. Holds a steady external
-#                        transport identity for a dwell window so the game's
-#                        state estimator can LOCK ON. Updates only when:
-#                          (a) the dwell timer expires (slow drift to target), OR
-#                          (b) the target diverges from posture by more than the
-#                              COMMIT BAND -- a real regime change, override now.
+# Layers (each unchanged from prior build except the new self-model):
+#   1. FIELD   (sense):  delay-only, fast, soft attack / faster release. ANCHOR.
+#   2. SELF-MODEL (NEW): predicts how much of the latest delay change is our own
+#                        last action settling in (efference copy), and responds
+#                        only to the RESIDUAL = environment minus self-echo.
+#   3. TARGET  (shape):  soft-knee bite -> eased soft target.
+#   4. POSTURE (commit): external transport identity, holds for a dwell.
 #
-# Why: the game (EA/FIFA netcode) estimates a congestion REGIME -- jitter
-# stability, pacing confidence, transport predictability -- not just ping.
-# Continuous micro-adjustment never lets it classify a stable regime ("not
-# giving me a state"). Internal speed stays high for accurate bite; the
-# EXTERNAL posture stays still so the game perceives a committed identity.
-#
-# This is NOT trapping and NOT hidden memory: posture is fully derived from the
-# visible field, holds only briefly, and yields instantly to real events.
+# SELF-MODEL design (proprioception, NOT a settle/cooldown gate):
+#   - The controller never blinds itself. It always senses at full rate.
+#   - It only discounts delay IMPROVEMENTS that its own last clamp could explain
+#     -- so it won't mistake "my own action working" for "world went clean" and
+#     release too early (the self-chasing failure).
+#   - It NEVER discounts delay WORSENING. Worsening is always treated as real
+#     environment -> full, instant response. The asymmetry guarantees the worst
+#     case of a wrong self-model is "slightly slow to RELEASE" (safe), never
+#     "slow to RESPOND" (dangerous).
+#   - Conservative: discounts at most ECHO_FRAC of a self-explainable improvement.
+#   - Short memory: the echo estimate decays over ~ECHO_TICKS, never lingers.
 
 WAN_DEV="eth1"; IFB_DEV="ifb-eth1"
 GAME_CLASS="1:20"; BULK_CLASS="1:60"
@@ -30,52 +30,49 @@ BULK_UP_MIN=24000;  BULK_DOWN_MIN=52000
 
 TARGET_DELAY_DMS=120          # 12.0 ms
 
-# Soft-knee bite: control = field*A/(field+B).
-SHAPE_A=70
-SHAPE_B=80
-
+SHAPE_A=70; SHAPE_B=80        # soft-knee
 FIELD_FLOOR=8                 # 0.8 ms excess; below = clean
 
-# --- Real-time response constants (resolution-independent) ---
-ATK_TC_MS=250                 # field/actuator ease IN  over ~250 ms
-REL_TC_MS=120                 # field/actuator ease OUT over ~120 ms (faster)
+ATK_TC_MS=250                 # ease IN  ~250 ms
+REL_TC_MS=120                 # ease OUT ~120 ms
 
 UP_TRIM_PER_CONTROL=450; DOWN_TRIM_PER_CONTROL=700
 
-# --- COMMIT LAYER: external transport-identity persistence ---
-# Posture holds for DWELL_MS before it's allowed to drift toward target.
-# A target move larger than COMMIT_BAND_* (kbit) overrides the dwell instantly
-# (real regime change). This is hysteresis in TIME + MAGNITUDE: steady against
-# noise, instant on real events.
-DWELL_MS=200                  # hold external posture ~200 ms (several game ticks)
-COMMIT_BAND_UP=4000           # up-move bigger than this overrides dwell
-COMMIT_BAND_DOWN=8000         # down-move bigger than this overrides dwell
+# --- SELF-MODEL (proprioception) ---
+# When our control rises (we clamp harder) and delay then falls, up to
+# ECHO_FRAC_NUM/DEN of that fall is attributed to our own action and is NOT
+# allowed to accelerate release. Conservative default = half.
+ECHO_FRAC_NUM=1; ECHO_FRAC_DEN=2
+ECHO_TICKS=3                  # our action presumed settling for ~3 ticks (~150ms)
 
-# Apply quantum: round posture to grid; apply only when rounded value changes.
+# --- COMMIT LAYER ---
+DWELL_MS=200
+COMMIT_BAND_UP=4000
+COMMIT_BAND_DOWN=8000
+
 APPLY_Q=100
 
-# --- run FAST internally ---
-LOOP_MS=50                    # 20 Hz
+LOOP_MS=50
 if sleep 0.05 2>/dev/null; then
     nap() { sleep 0.05; }; echo "pacing: sleep 0.05 (20 Hz)" >&2
 elif usleep 1 2>/dev/null; then
     nap() { usleep 50000; }; echo "pacing: usleep 50000 (20 Hz)" >&2
 else
-    LOOP_MS=1000
-    nap() { sleep 1; }; echo "WARN: no sub-second sleep; 1 Hz fallback" >&2
+    LOOP_MS=1000; nap() { sleep 1; }; echo "WARN: no sub-second sleep; 1 Hz fallback" >&2
 fi
 
-# Per-tick ease fractions from real-time constants.
 ATK_NUM="$LOOP_MS"; ATK_DEN="$ATK_TC_MS"; [ "$ATK_NUM" -gt "$ATK_DEN" ] && ATK_NUM="$ATK_DEN"
 REL_NUM="$LOOP_MS"; REL_DEN="$REL_TC_MS"; [ "$REL_NUM" -gt "$REL_DEN" ] && REL_NUM="$REL_DEN"
-# Dwell measured in ticks.
 DWELL_TICKS=$(( DWELL_MS / LOOP_MS )); [ "$DWELL_TICKS" -lt 1 ] && DWELL_TICKS=1
-echo "attack ${ATK_NUM}/${ATK_DEN}  release ${REL_NUM}/${REL_DEN}  dwell ${DWELL_TICKS} ticks (~${DWELL_MS}ms)" >&2
+echo "atk ${ATK_NUM}/${ATK_DEN} rel ${REL_NUM}/${REL_DEN} dwell ${DWELL_TICKS}t echo ${ECHO_FRAC_NUM}/${ECHO_FRAC_DEN}x${ECHO_TICKS}t" >&2
 
 FIELD=0
-CUR_BULK_UP="$BULK_UP_BASE"; CUR_BULK_DOWN="$BULK_DOWN_BASE"   # eased soft target
-POSTURE_UP="$BULK_UP_BASE"; POSTURE_DOWN="$BULK_DOWN_BASE"     # committed external
-DWELL_UP=0; DWELL_DOWN=0                                       # ticks since commit
+PREV_RAW=0                    # last raw shared-excess reading (pre-self-model)
+PREV_CONTROL=0               # control level last tick (proxy for our action)
+ECHO_AGE=99                  # ticks since our control last increased (>=ECHO_TICKS = no active echo)
+CUR_BULK_UP="$BULK_UP_BASE"; CUR_BULK_DOWN="$BULK_DOWN_BASE"
+POSTURE_UP="$BULK_UP_BASE"; POSTURE_DOWN="$BULK_DOWN_BASE"
+DWELL_UP=0; DWELL_DOWN=0
 APPLIED_UP=-1; APPLIED_DOWN=-1
 LAST_WAN=0; LAST_IFB=0
 
@@ -88,8 +85,6 @@ get_delay_dms() {
 }
 clamp() { v="$1"; [ "$v" -lt "$2" ] && v="$2"; [ "$v" -gt "$3" ] && v="$3"; echo "$v"; }
 apply_class() { tc class change dev "$1" classid "$2" hfsc ls rate "${3}kbit" ul rate "${3}kbit" 2>/dev/null; }
-
-# first-order ease toward target, min-step-1, no overshoot
 ease() {
     cur="$1"; tgt="$2"; n="$3"; dn="$4"
     diff=$((tgt - cur)); [ "$diff" -eq 0 ] && { echo "$cur"; return; }
@@ -101,21 +96,13 @@ ease() {
     echo "$newv"
 }
 absdiff() { a=$(( $1 - $2 )); [ "$a" -lt 0 ] && a=$(( -a )); echo "$a"; }
-
-# commit_posture(posture, soft_target, dwell_ticks_var_name, band):
-# returns "newposture newdwell" -- updates posture to target if dwell elapsed OR
-# move exceeds band; otherwise holds and increments dwell.
 commit() {
     post="$1"; tgt="$2"; dwell="$3"; band="$4"
     mv="$(absdiff "$tgt" "$post")"
-    if [ "$mv" -ge "$band" ] || [ "$dwell" -ge "$DWELL_TICKS" ]; then
-        echo "$tgt 0"            # commit to current soft target, reset dwell
-    else
-        echo "$post $((dwell + 1))"   # hold posture, age the dwell
-    fi
+    if [ "$mv" -ge "$band" ] || [ "$dwell" -ge "$DWELL_TICKS" ]; then echo "$tgt 0"
+    else echo "$post $((dwell + 1))"; fi
 }
 
-# Game lane static -- set once.
 apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
 apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
 
@@ -127,14 +114,31 @@ while true; do
     WE=$((W - TARGET_DELAY_DMS)); IE=$((I - TARGET_DELAY_DMS))
     [ "$WE" -lt 0 ] && WE=0; [ "$IE" -lt 0 ] && IE=0
     if [ "$WE" -gt "$IE" ]; then MAXE="$WE"; MINE="$IE"; else MAXE="$IE"; MINE="$WE"; fi
+    RAW=$(( (MAXE*MAXE + MINE*MINE) / (MAXE + MINE + 1) ))    # raw shared excess
 
-    FE=$(( (MAXE*MAXE + MINE*MINE) / (MAXE + MINE + 1) ))
+    # ---- SELF-MODEL: compute residual the field should respond to ----
+    # delta of raw reading since last tick
+    DELTA=$(( RAW - PREV_RAW ))
+    EFFECTIVE="$RAW"
+    if [ "$DELTA" -lt 0 ] && [ "$ECHO_AGE" -lt "$ECHO_TICKS" ]; then
+        # delay IMPROVED while our own recent clamp is still settling.
+        # Attribute ECHO_FRAC of the improvement to ourselves: don't let that
+        # part pull the field down (don't release on our own echo).
+        IMPROVE=$(( -DELTA ))
+        ECHO=$(( IMPROVE * ECHO_FRAC_NUM / ECHO_FRAC_DEN ))
+        # Hold the field up by the echo amount: effective excess = raw + echo,
+        # i.e. we pretend things are echo-units less improved than measured.
+        EFFECTIVE=$(( RAW + ECHO ))
+    fi
+    # Worsening (DELTA>=0) is NEVER discounted -- full environmental response.
+    [ "$EFFECTIVE" -lt 0 ] && EFFECTIVE=0
+    PREV_RAW="$RAW"
 
-    # Layer 1: FIELD (fast, soft attack / faster release, one memory var)
-    if [ "$FE" -gt "$FIELD" ]; then FIELD="$(ease "$FIELD" "$FE" "$ATK_NUM" "$ATK_DEN")"
-    else                            FIELD="$(ease "$FIELD" "$FE" "$REL_NUM" "$REL_DEN")"; fi
+    # ---- Layer 1: FIELD on the residual-corrected signal ----
+    if [ "$EFFECTIVE" -gt "$FIELD" ]; then FIELD="$(ease "$FIELD" "$EFFECTIVE" "$ATK_NUM" "$ATK_DEN")"
+    else                                   FIELD="$(ease "$FIELD" "$EFFECTIVE" "$REL_NUM" "$REL_DEN")"; fi
 
-    # Layer 2: TARGET (soft-knee shape -> eased soft target)
+    # ---- Layer 3: TARGET (soft-knee) ----
     if [ "$FIELD" -lt "$FIELD_FLOOR" ]; then
         CONTROL=0; TGT_UP="$BULK_UP_BASE"; TGT_DOWN="$BULK_DOWN_BASE"
     else
@@ -142,21 +146,27 @@ while true; do
         TGT_UP="$(clamp $((BULK_UP_BASE   - CONTROL*UP_TRIM_PER_CONTROL))   "$BULK_UP_MIN"   "$BULK_UP_BASE")"
         TGT_DOWN="$(clamp $((BULK_DOWN_BASE - CONTROL*DOWN_TRIM_PER_CONTROL)) "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
     fi
+
+    # ---- track our own action for the self-model: did control just rise? ----
+    if [ "$CONTROL" -gt "$PREV_CONTROL" ]; then ECHO_AGE=0
+    else ECHO_AGE=$(( ECHO_AGE + 1 )); fi
+    PREV_CONTROL="$CONTROL"
+
+    # ---- actuator ease ----
     if [ "$TGT_UP" -lt "$CUR_BULK_UP" ]; then CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TGT_UP" "$ATK_NUM" "$ATK_DEN")"
     else                                      CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TGT_UP" "$REL_NUM" "$REL_DEN")"; fi
     if [ "$TGT_DOWN" -lt "$CUR_BULK_DOWN" ]; then CUR_BULK_DOWN="$(ease "$CUR_BULK_DOWN" "$TGT_DOWN" "$ATK_NUM" "$ATK_DEN")"
     else                                          CUR_BULK_DOWN="$(ease "$CUR_BULK_DOWN" "$TGT_DOWN" "$REL_NUM" "$REL_DEN")"; fi
 
-    # Layer 3: COMMIT (external posture holds for dwell, overrides on big move)
+    # ---- Layer 4: COMMIT ----
     set -- $(commit "$POSTURE_UP"   "$CUR_BULK_UP"   "$DWELL_UP"   "$COMMIT_BAND_UP");   POSTURE_UP="$1";   DWELL_UP="$2"
     set -- $(commit "$POSTURE_DOWN" "$CUR_BULK_DOWN" "$DWELL_DOWN" "$COMMIT_BAND_DOWN"); POSTURE_DOWN="$1"; DWELL_DOWN="$2"
 
-    # Apply posture (not soft target) on grid change only.
     QU=$(( (POSTURE_UP   + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
     QD=$(( (POSTURE_DOWN + APPLY_Q/2) / APPLY_Q * APPLY_Q ))
     if [ "$QU" -ne "$APPLIED_UP" ]; then apply_class "$WAN_DEV" "$BULK_CLASS" "$QU"; APPLIED_UP="$QU"; fi
     if [ "$QD" -ne "$APPLIED_DOWN" ]; then apply_class "$IFB_DEV" "$BULK_CLASS" "$QD"; APPLIED_DOWN="$QD"; fi
 
-    echo "W=${W} I=${I} field=$FIELD ctl=$CONTROL soft=${CUR_BULK_UP}/${CUR_BULK_DOWN} posture=${POSTURE_UP}/${POSTURE_DOWN} dU=$DWELL_UP"
+    echo "W=${W} I=${I} raw=$RAW eff=$EFFECTIVE echoAge=$ECHO_AGE field=$FIELD ctl=$CONTROL posture=${POSTURE_UP}/${POSTURE_DOWN}"
     nap
 done
