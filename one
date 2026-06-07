@@ -144,3 +144,4 @@ while true; do
     echo "W=${W} I=${I} field=$FIELD ctl=$CONTROL bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
     nap
 done
+ 
