@@ -1,191 +1,97 @@
 #!/bin/sh
+WAN_DEV="eth1"; IFB_DEV="ifb-eth1"
+GAME_CLASS="1:20"; BULK_CLASS="1:60"
 
-WAN_DEV="eth1"
-IFB_DEV="ifb-eth1"
+SLEEP_SEC=0.1                 # sense fast; actuate on change (deadband below)
 
-GAME_CLASS="1:20"
-BULK_CLASS="1:60"
+GAME_UP=12000; GAME_DOWN=16000
+BULK_UP_BASE=42000; BULK_DOWN_BASE=84000   # standing reservation kept
+BULK_UP_MIN=24000;  BULK_DOWN_MIN=52000
 
-# Faster sensing than 1 Hz
-SLEEP_SEC=0.2
+TARGET_DELAY_DMS=120          # 12.0 ms
 
-GAME_UP=12000
-GAME_DOWN=16000
+# Soft-knee shape: CONTROL = FIELD*A/(FIELD+B). Bites early, saturates gently.
+SHAPE_A=70                    # asymptotic ceiling of P
+SHAPE_B=80                    # half-bite at +8ms excess; lower B = earlier bite
 
-# Standing reservation: already owns some field before pressure arrives
-BULK_UP_BASE=42000
-BULK_DOWN_BASE=84000
+# Light field filter: noise rejection only (keep 0.3 old / 0.7 new)
+FIELD=0; FIELD_OLD_NUM=3; FIELD_DEN=10
 
-BULK_UP_MIN=24000
-BULK_DOWN_MIN=52000
+# Tiny leaky-I in centi-units: residual trim, NOT a co-controller
+I_ACC=0; I_MAX=80
 
-# deci-ms target: 12.0ms = 120
-TARGET_DELAY_DMS=120
+UP_TRIM_PER_CONTROL=450; DOWN_TRIM_PER_CONTROL=700
 
-# P-dominant control
-P_GAIN_NUM=1
-P_GAIN_DEN=10
+# Viscosity = first-order lag at the actuator (front-loaded, smooth)
+EMA_NUM=1; EMA_DEN=3
 
-# Small leaky integral
-I_DEBT=0
-I_DEBT_MAX=30
-I_GAIN_NUM=1
-I_GAIN_DEN=30
-I_LEAK_NUM=92
-I_LEAK_DEN=100
+APPLY_EPS_UP=200; APPLY_EPS_DOWN=350   # deadband to cut tc churn at 10 Hz
 
-# Smooth shared pressure field
-FIELD=0
-FIELD_SMOOTH_NUM=6
-FIELD_SMOOTH_DEN=10
-
-# Trim strength per control unit
-UP_TRIM_PER_CONTROL=450
-DOWN_TRIM_PER_CONTROL=700
-
-# Actuator continuity
-MAX_UP_STEP=2500
-MAX_DOWN_STEP=4500
-
-CUR_BULK_UP="$BULK_UP_BASE"
-CUR_BULK_DOWN="$BULK_DOWN_BASE"
-
-LAST_WAN_DELAY=0
-LAST_IFB_DELAY=0
+CUR_BULK_UP="$BULK_UP_BASE"; CUR_BULK_DOWN="$BULK_DOWN_BASE"
+APPLIED_UP=-1; APPLIED_DOWN=-1
+LAST_WAN=0; LAST_IFB=0
 
 get_delay_dms() {
-    DEV="$1"
-
-    tc -s qdisc show dev "$DEV" 2>/dev/null | awk '
-        /avg_delay/ {
-            for (i=1; i<=NF; i++) {
-                if ($i ~ /avg_delay/) {
-                    val=$(i+1)
-                    gsub(/[^0-9.]/, "", val)
-                    printf "%d\n", int((val * 10) + 0.5)
-                    exit
-                }
-            }
-        }
-        /delay/ {
-            for (i=1; i<=NF; i++) {
-                if ($i ~ /delay/) {
-                    val=$(i+1)
-                    gsub(/[^0-9.]/, "", val)
-                    printf "%d\n", int((val * 10) + 0.5)
-                    exit
-                }
-            }
-        }
-    '
+    tc -s qdisc show dev "$1" 2>/dev/null | awk '
+        /avg_delay/ || /delay/ {
+            for (i=1;i<=NF;i++) if ($i ~ /delay/) {
+                v=$(i+1); gsub(/[^0-9.]/,"",v); printf "%d\n", int(v*10+0.5); exit }
+        }'
 }
+clamp() { v="$1"; [ "$v" -lt "$2" ] && v="$2"; [ "$v" -gt "$3" ] && v="$3"; echo "$v"; }
 
-clamp() {
-    VAL="$1"
-    MIN="$2"
-    MAX="$3"
-
-    [ "$VAL" -lt "$MIN" ] && VAL="$MIN"
-    [ "$VAL" -gt "$MAX" ] && VAL="$MAX"
-
-    echo "$VAL"
+# First-order lag toward target, with guaranteed convergence
+ema_step() {
+    cur="$1"; tgt="$2"; d=$((tgt - cur)); s=$((d * EMA_NUM / EMA_DEN))
+    if [ "$s" -eq 0 ] && [ "$d" -ne 0 ]; then [ "$d" -gt 0 ] && s=1 || s=-1; fi
+    echo $((cur + s))
 }
+apply_class() { tc class change dev "$1" classid "$2" hfsc ls rate "${3}kbit" ul rate "${3}kbit" 2>/dev/null; }
 
-approach_target() {
-    CURRENT="$1"
-    TARGET="$2"
-    STEP="$3"
+# Game lane is static — set once, never touched in the loop
+apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
+apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
 
-    if [ "$CURRENT" -lt "$TARGET" ]; then
-        CURRENT=$((CURRENT + STEP))
-        [ "$CURRENT" -gt "$TARGET" ] && CURRENT="$TARGET"
-    elif [ "$CURRENT" -gt "$TARGET" ]; then
-        CURRENT=$((CURRENT - STEP))
-        [ "$CURRENT" -lt "$TARGET" ] && CURRENT="$TARGET"
-    fi
+while true; do
+    W="$(get_delay_dms "$WAN_DEV")"; I="$(get_delay_dms "$IFB_DEV")"
+    [ -z "$W" ] && W="$LAST_WAN"; [ -z "$I" ] && I="$LAST_IFB"
+    LAST_WAN="$W"; LAST_IFB="$I"
 
-    echo "$CURRENT"
-}
+    WE=$((W - TARGET_DELAY_DMS)); IE=$((I - TARGET_DELAY_DMS))
+    [ "$WE" -lt 0 ] && WE=0; [ "$IE" -lt 0 ] && IE=0
+    if [ "$WE" -gt "$IE" ]; then MAXE="$WE"; MINE="$IE"; else MAXE="$IE"; MINE="$WE"; fi
 
-apply_class() {
-    DEV="$1"
-    CLASS="$2"
-    RATE="$3"
+    # Smooth shared combine (contraharmonic): mostly worst side, C1 at crossover
+    FE=$(( (MAXE*MAXE + MINE*MINE) / (MAXE + MINE + 1) ))
 
-    tc class change dev "$DEV" classid "$CLASS" \
-        hfsc ls rate "${RATE}kbit" ul rate "${RATE}kbit" 2>/dev/null
-}
+    # Light field filter (noise only)
+    FIELD=$(( (FIELD*FIELD_OLD_NUM + FE*(FIELD_DEN-FIELD_OLD_NUM)) / FIELD_DEN ))
 
-apply_rates() {
-    apply_class "$WAN_DEV" "$GAME_CLASS" "$GAME_UP"
-    apply_class "$IFB_DEV" "$GAME_CLASS" "$GAME_DOWN"
+    # Soft-knee shape: instant, early-biting, self-saturating
+    P_CONTROL=$(( FIELD * SHAPE_A / (FIELD + SHAPE_B) ))
 
-    apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"
-    apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"
+    # Tiny leaky-I, residual only (centi-units so it can't truncate to 0)
+    I_ACC=$(( I_ACC * 90 / 100 ))
+    [ "$FIELD" -gt 0 ] && I_ACC=$(( I_ACC + FIELD/30 ))
+    I_ACC="$(clamp "$I_ACC" 0 "$I_MAX")"
+    I_CONTROL=$(( I_ACC / 10 ))
 
-    echo "APPLY wan=${WAN_DELAY}dms ifb=${IFB_DELAY}dms excess=${FIELD_EXCESS} field=$FIELD p=$P_CONTROL i=$I_DEBT control=$CONTROL target=${TARGET_UP}/${TARGET_DOWN} bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
-}
+    CONTROL="$(clamp $((P_CONTROL + I_CONTROL)) 0 60)"
 
-apply_rates
+    TARGET_UP="$(clamp $((BULK_UP_BASE   - CONTROL*UP_TRIM_PER_CONTROL))   "$BULK_UP_MIN"   "$BULK_UP_BASE")"
+    TARGET_DOWN="$(clamp $((BULK_DOWN_BASE - CONTROL*DOWN_TRIM_PER_CONTROL)) "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
 
-while true
-do
-    WAN_DELAY="$(get_delay_dms "$WAN_DEV")"
-    IFB_DELAY="$(get_delay_dms "$IFB_DEV")"
+    CUR_BULK_UP="$(ema_step "$CUR_BULK_UP" "$TARGET_UP")"
+    CUR_BULK_DOWN="$(ema_step "$CUR_BULK_DOWN" "$TARGET_DOWN")"
 
-    # Missing read = hold last value, not fake clean zero
-    [ -z "$WAN_DELAY" ] && WAN_DELAY="$LAST_WAN_DELAY"
-    [ -z "$IFB_DELAY" ] && IFB_DELAY="$LAST_IFB_DELAY"
+    # Deadband: only touch tc when it actually moved
+    du=$((CUR_BULK_UP - APPLIED_UP));   [ "$du" -lt 0 ] && du=$((-du))
+    dd=$((CUR_BULK_DOWN - APPLIED_DOWN)); [ "$dd" -lt 0 ] && dd=$((-dd))
+    if [ "$du" -ge "$APPLY_EPS_UP" ]   || [ "$CUR_BULK_UP" -eq "$TARGET_UP" ]; then
+        apply_class "$WAN_DEV" "$BULK_CLASS" "$CUR_BULK_UP"; APPLIED_UP="$CUR_BULK_UP"; fi
+    if [ "$dd" -ge "$APPLY_EPS_DOWN" ] || [ "$CUR_BULK_DOWN" -eq "$TARGET_DOWN" ]; then
+        apply_class "$IFB_DEV" "$BULK_CLASS" "$CUR_BULK_DOWN"; APPLIED_DOWN="$CUR_BULK_DOWN"; fi
 
-    LAST_WAN_DELAY="$WAN_DELAY"
-    LAST_IFB_DELAY="$IFB_DELAY"
-
-    WAN_EXCESS=$((WAN_DELAY - TARGET_DELAY_DMS))
-    IFB_EXCESS=$((IFB_DELAY - TARGET_DELAY_DMS))
-
-    [ "$WAN_EXCESS" -lt 0 ] && WAN_EXCESS=0
-    [ "$IFB_EXCESS" -lt 0 ] && IFB_EXCESS=0
-
-    if [ "$WAN_EXCESS" -gt "$IFB_EXCESS" ]; then
-        MAX_EXCESS="$WAN_EXCESS"
-        MIN_EXCESS="$IFB_EXCESS"
-    else
-        MAX_EXCESS="$IFB_EXCESS"
-        MIN_EXCESS="$WAN_EXCESS"
-    fi
-
-    # Smooth shared-field combine:
-    # mostly worst side, but shared pressure matters.
-    FIELD_EXCESS=$(((MAX_EXCESS * 3 + MIN_EXCESS) / 4))
-
-    # Sensor smoothing: irrigation becomes just one clean shared field
-    FIELD=$(((FIELD * FIELD_SMOOTH_NUM + FIELD_EXCESS * (FIELD_SMOOTH_DEN - FIELD_SMOOTH_NUM)) / FIELD_SMOOTH_DEN))
-
-    # P term: instant authority from current field
-    P_CONTROL=$((FIELD * P_GAIN_NUM / P_GAIN_DEN))
-
-    # Leaky I term: small persistence without windup
-    I_DEBT=$((I_DEBT * I_LEAK_NUM / I_LEAK_DEN))
-
-    if [ "$FIELD" -gt 0 ]; then
-        I_DEBT=$((I_DEBT + FIELD * I_GAIN_NUM / I_GAIN_DEN))
-    fi
-
-    I_DEBT="$(clamp "$I_DEBT" 0 "$I_DEBT_MAX")"
-
-    CONTROL=$((P_CONTROL + I_DEBT))
-    CONTROL="$(clamp "$CONTROL" 0 60)"
-
-    NEW_UP=$((BULK_UP_BASE - CONTROL * UP_TRIM_PER_CONTROL))
-    NEW_DOWN=$((BULK_DOWN_BASE - CONTROL * DOWN_TRIM_PER_CONTROL))
-
-    TARGET_UP="$(clamp "$NEW_UP" "$BULK_UP_MIN" "$BULK_UP_BASE")"
-    TARGET_DOWN="$(clamp "$NEW_DOWN" "$BULK_DOWN_MIN" "$BULK_DOWN_BASE")"
-
-    CUR_BULK_UP="$(approach_target "$CUR_BULK_UP" "$TARGET_UP" "$MAX_UP_STEP")"
-    CUR_BULK_DOWN="$(approach_target "$CUR_BULK_DOWN" "$TARGET_DOWN" "$MAX_DOWN_STEP")"
-
-    apply_rates
-
+    echo "W=${W} I=${I} field=$FIELD p=$P_CONTROL i=$I_CONTROL ctl=$CONTROL bulk=${CUR_BULK_UP}/${CUR_BULK_DOWN}"
     sleep "$SLEEP_SEC"
 done
