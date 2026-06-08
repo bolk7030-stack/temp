@@ -16,119 +16,44 @@ GITHUB_TOKEN="github_pat_1CCU5TOI030r8svYnVp6Q_nq4KAWIisAPHDPI63L2pg2A3cjG1bOFxj
 
 # Example:
 # REPO_URL="https://github.com/yourname/temp.git"
-REPO_URL="https://github.com/bolk7030-stack/temp.git"
-
-# =========================
-
-TS="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo manual)"
-OUT="/tmp/qos-audit-${TS}-${TAG}.log"
-
-{
-LINE="---------------------------------------------------------------"
-
-say() {
-    echo
-    echo "$LINE"
-    echo "== $1"
-    echo "$LINE"
-}
-
-echo "qos-audit tag=$TAG time=$TS"
-
-say "1. ALL qdiscs on ALL devices"
-tc qdisc show
-
-say "2. HFSC / class 1:20 / 1:60 check"
-found=0
-
-for d in $(tc qdisc show | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | sort -u); do
-    if tc class show dev "$d" 2>/dev/null | grep -qE '1:20|1:60|hfsc'; then
-        echo "FOUND on dev $d:"
-        tc class show dev "$d" 2>/dev/null | grep -E '1:20|1:60|hfsc'
-        found=1
-    fi
-done
-
-[ "$found" -eq 0 ] && echo "none found"
-
-say "3. CAKE on ifb-eth1"
-tc -s qdisc show dev ifb-eth1
-
-say "4. WAN egress qdiscs"
-
-for d in eth0 eth1 eth2 eth3; do
-    echo "-- dev $d root qdisc:"
-    tc qdisc show dev "$d" 2>/dev/null | head -1 | sed 's/^/     /'
-done
-
-say "5. Per-tin CAKE detail"
-
-tc -s qdisc show dev ifb-eth1 | \
-grep -iE 'cake|tin|besteffort|diffserv|thresh|target|pk_delay|av_delay|sp_delay|backlog|drops|marks' | \
-sed 's/^/     /'
-
-say "6. qosmate config"
-
-if [ -f /etc/config/qosmate ]; then
-    cat /etc/config/qosmate
-else
-    echo "/etc/config/qosmate not found"
-fi
-
-say "7. Packages + service status"
-
-opkg list-installed 2>/dev/null | \
-grep -iE 'qosmate|sqm|cake|tc-' | \
-sed 's/^/     /'
-
-if [ -f /etc/init.d/qosmate ]; then
-    /etc/init.d/qosmate status 2>/dev/null | sed 's/^/     /'
-fi
-
-say "8. Gateway jitter"
-
-GW=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
-
-if [ -n "$GW" ]; then
-    ping -c 10 "$GW" 2>/dev/null | tail -3 | sed 's/^/     /'
-fi
-
-echo
-echo "$LINE"
-echo "DONE"
-echo "$LINE"
-
-} 2>&1 | tee "$OUT"
-
-echo
-echo "Saved log: $OUT"
+REPO_URL="https://github.com/bolk7030-stack/temp.service status"
 
 # =========================
 # GIT PUSH SECTION
 # =========================
 
+PARENT_DIR="/root"
+REPO_NAME="temp"
+REPO_DIR="${PARENT_DIR}/${REPO_NAME}"
+BRANCH="main"
+
+GITHUB_USER="YOUR_GITHUB_USERNAME"
+GITHUB_TOKEN="ghp_YOURTOKENHERE"
+
+AUTH_REPO_URL="https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/${GITHUB_USER}/${REPO_NAME}.git"
+
+mkdir -p "$PARENT_DIR"
+
+if [ ! -d "$REPO_DIR/.git" ]; then
+    echo "Repo not found. Cloning into $REPO_DIR..."
+    rm -rf "$REPO_DIR"
+    git clone "$AUTH_REPO_URL" "$REPO_DIR" || {
+        echo "ERROR: git clone failed"
+        exit 1
+    }
+fi
+
 cd "$REPO_DIR" || {
-    echo "Repo directory missing: $REPO_DIR"
+    echo "ERROR: cannot cd into $REPO_DIR"
     exit 1
 }
 
-# clone repo if absent
-if [ ! -d ".git" ]; then
-    echo "Initializing repo..."
-
-    rm -rf "$REPO_DIR"
-
-    git clone \
-    "https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/${GITHUB_USER}/temp.git" \
-    "$REPO_DIR"
-
-    cd "$REPO_DIR" || exit 1
-fi
+git config user.name "openwrt-audit"
+git config user.email "openwrt-audit@local"
 
 mkdir -p audits
 
 DEST="audits/$(basename "$OUT")"
-
 cp "$OUT" "$DEST"
 
 git add audits/
@@ -138,9 +63,11 @@ git commit -m "audit ${TS} ${TAG}" || {
     exit 0
 }
 
-git push \
-"https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/${GITHUB_USER}/temp.git" \
-"$BRANCH"
+git push "$AUTH_REPO_URL" "$BRANCH" || {
+    echo "ERROR: git push failed"
+    exit 1
+}
 
-echo
 echo "GitHub push complete."
+
+
