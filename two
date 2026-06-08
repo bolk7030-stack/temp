@@ -18,18 +18,89 @@ GITHUB_TOKEN="github_pat_1CCU5TOI030r8svYnVp6Q_nq4KAWIisAPHDPI63L2pg2A3cjG1bOFxj
 # REPO_URL="https://github.com/yourname/temp.git"
 REPO_URL="https://github.com/bolk7030-stack/temp.service status"
 
-# =========================
-# GIT PUSH SECTION
-# =========================
+#!/bin/sh
 
-PARENT_DIR="/root"
+TAG="${1:-run}"
+
+
 REPO_NAME="temp"
-REPO_DIR="${PARENT_DIR}/${REPO_NAME}"
 BRANCH="main"
 
-
-
+PARENT_DIR="/root"
+REPO_DIR="${PARENT_DIR}/${REPO_NAME}"
 AUTH_REPO_URL="https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/${GITHUB_USER}/${REPO_NAME}.git"
+
+TS="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo manual)"
+OUT="/tmp/qos-audit-${TS}-${TAG}.log"
+
+{
+LINE="---------------------------------------------------------------"
+say() { echo; echo "$LINE"; echo "== $1"; echo "$LINE"; }
+
+echo "qos-audit  tag=$TAG  time=$TS"
+
+say "1. ALL qdiscs on ALL devices"
+tc qdisc show
+
+say "2. Does any HFSC / class 1:20 / 1:60 exist ANYWHERE?"
+found=0
+for d in $(tc qdisc show | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | sort -u); do
+    if tc class show dev "$d" 2>/dev/null | grep -qE '1:20|1:60|hfsc'; then
+        echo "FOUND on dev $d:"
+        tc class show dev "$d" 2>/dev/null | grep -E '1:20|1:60|hfsc'
+        found=1
+    fi
+done
+[ "$found" -eq 0 ] && echo "none found on any device"
+
+say "3. The REAL shaper: CAKE on ifb-eth1"
+tc -s qdisc show dev ifb-eth1
+
+say "4. Is UPLOAD/egress direction shaped?"
+for d in eth0 eth1 eth2 eth3; do
+    echo "-- dev $d root qdisc:"
+    tc qdisc show dev "$d" 2>/dev/null | head -1 | sed 's/^/     /'
+done
+
+say "5. Per-tin CAKE detail"
+tc -s qdisc show dev ifb-eth1 | grep -iE 'cake|tin|besteffort|diffserv|thresh|target|pk_delay|av_delay|sp_delay|backlog|drops|marks' | sed 's/^/     /'
+
+say "6. qosmate config"
+if [ -f /etc/config/qosmate ]; then
+    cat /etc/config/qosmate
+else
+    echo "/etc/config/qosmate not found"
+    ls -la /etc/config/ 2>/dev/null | grep -iE 'qos|sqm|cake' | sed 's/^/     /'
+fi
+
+say "7. Packages + service status"
+if command -v apk >/dev/null 2>&1; then
+    apk info 2>/dev/null | grep -iE 'qosmate|sqm|cake|tc|iproute' | sed 's/^/     /'
+elif command -v opkg >/dev/null 2>&1; then
+    opkg list-installed 2>/dev/null | grep -iE 'qosmate|sqm|cake|tc-' | sed 's/^/     /'
+fi
+
+[ -f /etc/init.d/qosmate ] && {
+    echo "qosmate status:"
+    /etc/init.d/qosmate status 2>/dev/null | sed 's/^/     /'
+}
+
+say "8. Bare path jitter"
+GW=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
+if [ -n "$GW" ]; then
+    ping -c 10 "$GW" 2>/dev/null | tail -3 | sed 's/^/     /'
+else
+    echo "no default gateway found"
+fi
+
+echo
+echo "$LINE"
+echo "DONE."
+echo "$LINE"
+} 2>&1 | tee "$OUT"
+
+echo
+echo "saved audit to: $OUT"
 
 mkdir -p "$PARENT_DIR"
 
@@ -50,13 +121,13 @@ cd "$REPO_DIR" || {
 git config user.name "openwrt-audit"
 git config user.email "openwrt-audit@local"
 
-mkdir -p audits
+git pull "$AUTH_REPO_URL" "$BRANCH" 2>/dev/null
 
+mkdir -p audits
 DEST="audits/$(basename "$OUT")"
 cp "$OUT" "$DEST"
 
 git add audits/
-
 git commit -m "audit ${TS} ${TAG}" || {
     echo "Nothing new to commit."
     exit 0
@@ -68,5 +139,4 @@ git push "$AUTH_REPO_URL" "$BRANCH" || {
 }
 
 echo "GitHub push complete."
-
 
