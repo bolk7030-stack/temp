@@ -13,7 +13,7 @@ BRANCH="main"
 
 # HARD-CODED TOKEN (experiment only)
 GITHUB_USER="bolk7030-stack"
-GITHUB_TOKEN="github_pat_11CCU5TOI030r8svYnVp6Q_nq4KAWIisAPHDPI63L2pg2A3cjG1bOFxj7eYnbRFjge7REOFPKKbY0hZGR"
+GITHUB_TOKEN="github_pat_1CCU5TOI030r8svYnVp6Q_nq4KAWIisAPHDPI63L2pg2A3cjG1bOFxj7eYnbRFjge7REOFPKKbY0hZGRb"
 
 # Example:
 # REPO_URL="https://github.com/yourname/temp.git"
