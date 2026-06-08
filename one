@@ -1,56 +1,48 @@
 #!/bin/sh
-# phase-probe.sh -- READ-ONLY phase probe (v2: minimal capture filter).
+# phase-probe.sh -- READ-ONLY phase probe (v3).
 #
-# FIX: the v1 filter chained many "and not port" clauses which some tcpdump
-# builds parse to match NOTHING (hence 0 packets). v2 uses the SAME minimal
-# filter we proved works manually ("host H and udp") and does ALL noise
-# filtering in awk instead. Capture can no longer come back empty if traffic
-# exists.
+# FIX: v1/v2 used `timeout 30 tcpdump` which on busybox kills tcpdump before it
+# flushes -> 0 packets. This version uses `-c COUNT` exactly like the command
+# you confirmed works:
+#   tcpdump -n -ttt -c 60 -i br-lan host 192.168.10.50 and udp and not port 9999 ...
+# tcpdump exits on its own after COUNT packets and flushes cleanly.
 #
-# Measures the OUT->IN response-delay distribution to find a remote tick window
-# worth aligning to. Run during a live match.
+# Measures OUT->IN response-delay distribution to find a remote tick window.
 #
-# Usage: sh phase-probe.sh [seconds]   (default 30)
+# Usage: sh phase-probe.sh [count]   (default 400 packets)
 
 HOST="192.168.10.50"
-DUR="${1:-30}"
+COUNT="${1:-400}"
 RAW="/tmp/phase-raw-$$.txt"
 
-# MINIMAL filter -- exactly what worked manually. No port exclusions here.
-echo "Capturing ${DUR}s of UDP for $HOST (br-lan) ..." >&2
-echo "  -> PLAY NOW (active match)." >&2
+echo "Capturing $COUNT UDP packets for $HOST (br-lan) ..." >&2
+echo "  -> PLAY NOW. (collects until $COUNT packets, then analyses)" >&2
 
-timeout "$DUR" tcpdump -n -tt -i br-lan -q "host $HOST and udp" 2>/dev/null > "$RAW"
+# EXACT working filter + -tt for absolute timestamps (awk computes deltas).
+# -c COUNT makes tcpdump self-terminate and flush (no timeout wrapper).
+tcpdump -n -tt -c "$COUNT" -i br-lan \
+    "host $HOST and udp and not port 9999 and not port 1900 and not port 53 and not port 5353" \
+    2>/dev/null > "$RAW"
 
 LINES=$(wc -l < "$RAW" 2>/dev/null)
 echo "captured ${LINES:-0} packets" >&2
 if [ "${LINES:-0}" -lt 20 ]; then
-    echo "Still too few. Sanity-check raw capture with:" >&2
-    echo "   tcpdump -n -i br-lan host $HOST and udp" >&2
+    echo "Too few. Confirm with the known-good command:" >&2
+    echo "  tcpdump -n -ttt -c 60 -i br-lan host $HOST and udp and not port 9999 and not port 1900 and not port 53" >&2
     rm -f "$RAW"; exit 1
 fi
 
-# All noise-filtering + analysis in awk. We KEEP only the game server stream:
-# the console's port 3659 talking to a remote server. We DROP local noise by
-# ignoring any packet whose other end is a 192.168/239.255/224. (multicast/LAN)
-# and the common chatter ports (9999 broadcast, 1900 ssdp, 53 dns, 5353 mdns).
 awk -v HOST="$HOST" '
 function islocal(ip){ return (ip ~ /^192\.168\./ || ip ~ /^239\./ || ip ~ /^224\./ || ip ~ /^255\./) }
-function noiseport(p){ return (p=="9999"||p=="1900"||p=="53"||p=="5353"||p=="123"||p=="137"||p=="138") }
 {
     t=$1+0
     src=$3; dst=$5; sub(/:$/,"",dst)
-    split(src,sa,"."); srcip=sa[1]"."sa[2]"."sa[3]"."sa[4]; srcport=sa[5]
-    split(dst,da,"."); dstip=da[1]"."da[2]"."da[3]"."da[4]; dstport=da[5]
-
-    # classify direction relative to the console
-    if (srcip==HOST) { dir="OUT"; otherip=dstip; otherport=dstport; myport=srcport }
-    else if (dstip==HOST) { dir="IN"; otherip=srcip; otherport=srcport; myport=dstport }
+    split(src,sa,"."); srcip=sa[1]"."sa[2]"."sa[3]"."sa[4]
+    split(dst,da,"."); dstip=da[1]"."da[2]"."da[3]"."da[4]
+    if (srcip==HOST) { dir="OUT"; otherip=dstip }
+    else if (dstip==HOST) { dir="IN"; otherip=srcip }
     else next
-
-    # drop local/multicast peers and noise ports -> keep only remote game server
-    if (islocal(otherip)) next
-    if (noiseport(otherport) || noiseport(myport)) next
+    if (islocal(otherip)) next      # keep only remote game server stream
 
     kept++
     if (dir=="OUT") {
@@ -65,31 +57,24 @@ function noiseport(p){ return (p=="9999"||p=="1900"||p=="53"||p=="5353"||p=="123
     }
 }
 END{
-    if(kept<10){ print "  kept too few game packets after noise filtering ("kept"). Servers may be all-local/P2P this match."; exit }
-    printf "\n  (kept %d game-server packets after dropping LAN/multicast/noise)\n", kept
-    print ""
+    if(kept<10){ print "  too few remote-server packets ("kept") -- match may be all-P2P/local."; exit }
+    printf "\n  (kept %d remote game-server packets)\n\n", kept
     print "==== OUTBOUND cadence (console -> server) ===="
     if(oc>0){ om=osum/oc; for(i=1;i<=oc;i++){d=ogap[i]-om;oss+=d*d}osd=sqrt(oss/oc)
         printf "  pkts:%d mean:%.2fms min/max:%.2f/%.2f jitter:%.2fms\n",no,om,omin,omax,osd } else print "  (none)"
-    print ""
-    print "==== INBOUND cadence (server -> console) ===="
+    print "\n==== INBOUND cadence (server -> console) ===="
     if(ic>0){ im=isum/ic; for(i=1;i<=ic;i++){d=igap[i]-im;iss+=d*d}isd=sqrt(iss/ic)
         printf "  pkts:%d mean:%.2fms min/max:%.2f/%.2f jitter:%.2fms\n",ni,im,imin,imax,isd } else print "  (none)"
-    print ""
-    print "==== RESPONSE DELAY (OUT -> next IN) : the PHASE signal ===="
+    print "\n==== RESPONSE DELAY (OUT -> next IN) : the PHASE signal ===="
     if(rc>0){ rm=rsum/rc
         for(i=1;i<=rc;i++){ b=int(rdel[i]/5); h[b]++; if(b>maxb)maxb=b }
-        printf "  samples:%d mean:%.2fms\n",rc,rm
-        print "  distribution (5ms buckets):"
+        printf "  samples:%d mean:%.2fms\n  distribution (5ms buckets):\n",rc,rm
         for(b=0;b<=maxb;b++){ if(h[b]>0){ bar="";k=h[b];while(k-->0&&length(bar)<50)bar=bar"#"
             printf "   %3d-%3dms | %-50s %d\n",b*5,(b*5)+4,bar,h[b] } }
-        print ""
-        print "  READING: one peak = stable phase (little to shape)."
-        print "           two+ peaks = some packets miss the tick -> phase target;"
+        print "\n  READING: one peak = stable phase; two+ peaks = phase target,"
         print "           peak spacing ~ remote tick period."
     } else print "  (no OUT->IN pairs)"
     print ""
 }
 ' "$RAW"
-
 rm -f "$RAW"
