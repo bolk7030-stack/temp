@@ -1,33 +1,34 @@
 #!/bin/sh
-# phase-probe.sh -- READ-ONLY phase probe (v3).
+# phase-probe.sh -- READ-ONLY phase probe (v4).
 #
-# FIX: v1/v2 used `timeout 30 tcpdump` which on busybox kills tcpdump before it
-# flushes -> 0 packets. This version uses `-c COUNT` exactly like the command
-# you confirmed works:
-#   tcpdump -n -ttt -c 60 -i br-lan host 192.168.10.50 and udp and not port 9999 ...
-# tcpdump exits on its own after COUNT packets and flushes cleanly.
+# v3 bugs (found by auditing against your known-good command):
+#   1. I QUOTED the filter as one argument; your working command passed it as
+#      separate unquoted words. busybox tcpdump parses these differently and the
+#      quoted blob compiled to a filter matching nothing.
+#   2. I added a 5th clause ("and not port 5353"); your working filter had 4.
+#      The longer chain silently compiled to match-nothing on busybox.
+# Fix: reproduce your EXACT working invocation, filter unquoted, 4 clauses.
+# Keep -tt (absolute epoch) -- verified to parse cleanly; awk computes deltas.
 #
-# Measures OUT->IN response-delay distribution to find a remote tick window.
-#
-# Usage: sh phase-probe.sh [count]   (default 400 packets)
+# Usage: sh phase-probe.sh [count]   (default 400)
 
 HOST="192.168.10.50"
 COUNT="${1:-400}"
 RAW="/tmp/phase-raw-$$.txt"
 
 echo "Capturing $COUNT UDP packets for $HOST (br-lan) ..." >&2
-echo "  -> PLAY NOW. (collects until $COUNT packets, then analyses)" >&2
+echo "  -> PLAY NOW." >&2
 
-# EXACT working filter + -tt for absolute timestamps (awk computes deltas).
-# -c COUNT makes tcpdump self-terminate and flush (no timeout wrapper).
+# Filter passed UNQUOTED as separate words (matches your working command).
+# Exactly 4 'and' clauses, same as the command you confirmed works.
 tcpdump -n -tt -c "$COUNT" -i br-lan \
-    "host $HOST and udp and not port 9999 and not port 1900 and not port 53 and not port 5353" \
+    host "$HOST" and udp and not port 9999 and not port 1900 and not port 53 \
     2>/dev/null > "$RAW"
 
 LINES=$(wc -l < "$RAW" 2>/dev/null)
 echo "captured ${LINES:-0} packets" >&2
 if [ "${LINES:-0}" -lt 20 ]; then
-    echo "Too few. Confirm with the known-good command:" >&2
+    echo "Too few. Run the known-good command by hand to confirm traffic:" >&2
     echo "  tcpdump -n -ttt -c 60 -i br-lan host $HOST and udp and not port 9999 and not port 1900 and not port 53" >&2
     rm -f "$RAW"; exit 1
 fi
@@ -42,7 +43,7 @@ function islocal(ip){ return (ip ~ /^192\.168\./ || ip ~ /^239\./ || ip ~ /^224\
     if (srcip==HOST) { dir="OUT"; otherip=dstip }
     else if (dstip==HOST) { dir="IN"; otherip=srcip }
     else next
-    if (islocal(otherip)) next      # keep only remote game server stream
+    if (islocal(otherip)) next
 
     kept++
     if (dir=="OUT") {
