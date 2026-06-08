@@ -16,7 +16,7 @@ GITHUB_TOKEN="github_pat_1CCU5TOI030r8svYnVp6Q_nq4KAWIisAPHDPI63L2pg2A3cjG1bOFxj
 
 # Example:
 # REPO_URL="https://github.com/yourname/temp.git"
-REPO_URL="https://github.com/YOUR_GITHUB_USERNAME/temp.git"
+REPO_URL="https://github.com/bolk7030-stack/temp.git"
 
 # =========================
 
