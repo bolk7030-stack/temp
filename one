@@ -1,110 +1,95 @@
 #!/bin/sh
-# phase-probe.sh -- READ-ONLY. Measures the PHASE relationship between your
-# outbound game packets and the server's responses, to find out if there is a
-# remote tick window worth aligning to.
+# phase-probe.sh -- READ-ONLY phase probe (v2: minimal capture filter).
 #
-# This is the real test of the "interaction pacing" idea:
-#   - emission frequency you cannot change (console's 33ms)
-#   - emission PHASE you CAN shape (when in the remote tick your packet lands)
-# If server responses cluster at a stable offset -> there's a tick to align to.
-# If the offset is multimodal (some fast, some a tick late) -> THAT gap is the
-# phase problem worth shaping, and the modes tell us the tick period.
+# FIX: the v1 filter chained many "and not port" clauses which some tcpdump
+# builds parse to match NOTHING (hence 0 packets). v2 uses the SAME minimal
+# filter we proved works manually ("host H and udp") and does ALL noise
+# filtering in awk instead. Capture can no longer come back empty if traffic
+# exists.
 #
-# Host: 192.168.10.50   Game server pattern: :3659 <-> :21002/:21008
-# Changes nothing. Run during live play.
+# Measures the OUT->IN response-delay distribution to find a remote tick window
+# worth aligning to. Run during a live match.
 #
 # Usage: sh phase-probe.sh [seconds]   (default 30)
 
 HOST="192.168.10.50"
 DUR="${1:-30}"
-TS="$(date +%H%M%S 2>/dev/null || echo run)"
 RAW="/tmp/phase-raw-$$.txt"
 
-# Capture BOTH directions of the game UDP stream, excluding local noise.
-# -tt = absolute epoch timestamps (we compute deltas/pairing in awk).
-FILT="host $HOST and udp and not port 9999 and not port 1900 and not port 53 and not port 5353"
+# MINIMAL filter -- exactly what worked manually. No port exclusions here.
+echo "Capturing ${DUR}s of UDP for $HOST (br-lan) ..." >&2
+echo "  -> PLAY NOW (active match)." >&2
 
-echo "Capturing ${DUR}s bidirectional game UDP for $HOST ..." >&2
-echo "  -> PLAY NOW (in an active match, ideally moving/contesting)." >&2
-
-timeout "$DUR" tcpdump -n -tt -i br-lan -q "$FILT" 2>/dev/null > "$RAW"
+timeout "$DUR" tcpdump -n -tt -i br-lan -q "host $HOST and udp" 2>/dev/null > "$RAW"
 
 LINES=$(wc -l < "$RAW" 2>/dev/null)
 echo "captured ${LINES:-0} packets" >&2
 if [ "${LINES:-0}" -lt 20 ]; then
-    echo "TOO FEW. Not in a match, or filter wrong. Try: tcpdump -n -i br-lan host $HOST and udp" >&2
+    echo "Still too few. Sanity-check raw capture with:" >&2
+    echo "   tcpdump -n -i br-lan host $HOST and udp" >&2
     rm -f "$RAW"; exit 1
 fi
 
-# Parse. Lines look like:
-#   <epoch> IP 192.168.10.50.3659 > 34.174.61.192.21002: UDP, length N
-#   <epoch> IP 34.174.61.192.21002 > 192.168.10.50.3659: UDP, length N
-# OUT = src is HOST ; IN = dst is HOST. We measure:
-#   1) OUT inter-packet cadence (confirm ~33ms, and its stability)
-#   2) IN  inter-packet cadence (server send rhythm -> hints at tick period)
-#   3) For each OUT, the delay until the NEXT IN from the same server
-#      (round-trip-ish response delay) and whether it's uni- or multi-modal.
-
+# All noise-filtering + analysis in awk. We KEEP only the game server stream:
+# the console's port 3659 talking to a remote server. We DROP local noise by
+# ignoring any packet whose other end is a 192.168/239.255/224. (multicast/LAN)
+# and the common chatter ports (9999 broadcast, 1900 ssdp, 53 dns, 5353 mdns).
 awk -v HOST="$HOST" '
-function abs(x){return x<0?-x:x}
+function islocal(ip){ return (ip ~ /^192\.168\./ || ip ~ /^239\./ || ip ~ /^224\./ || ip ~ /^255\./) }
+function noiseport(p){ return (p=="9999"||p=="1900"||p=="53"||p=="5353"||p=="123"||p=="137"||p=="138") }
 {
     t=$1+0
-    # field 3 = src ip.port, field 5 = dst ip.port (strip trailing :)
     src=$3; dst=$5; sub(/:$/,"",dst)
-    # split host:port
-    ns=split(src,sa,"."); srcip=sa[1]"."sa[2]"."sa[3]"."sa[4]; srcport=sa[5]
-    nd=split(dst,da,"."); dstip=da[1]"."da[2]"."da[3]"."da[4]; dstport=da[5]
+    split(src,sa,"."); srcip=sa[1]"."sa[2]"."sa[3]"."sa[4]; srcport=sa[5]
+    split(dst,da,"."); dstip=da[1]"."da[2]"."da[3]"."da[4]; dstport=da[5]
 
-    if (srcip==HOST) {
-        dir="OUT"
+    # classify direction relative to the console
+    if (srcip==HOST) { dir="OUT"; otherip=dstip; otherport=dstport; myport=srcport }
+    else if (dstip==HOST) { dir="IN"; otherip=srcip; otherport=srcport; myport=dstport }
+    else next
+
+    # drop local/multicast peers and noise ports -> keep only remote game server
+    if (islocal(otherip)) next
+    if (noiseport(otherport) || noiseport(myport)) next
+
+    kept++
+    if (dir=="OUT") {
         no++
-        if (lastout>0){ g=(t-lastout)*1000; if(g>0&&g<500){oc++; osum+=g; ogap[oc]=g; if(omin==""||g<omin)omin=g; if(g>omax)omax=g}}
+        if (lastout>0){ g=(t-lastout)*1000; if(g>0&&g<500){oc++;osum+=g;ogap[oc]=g;if(omin==""||g<omin)omin=g;if(g>omax)omax=g} }
         lastout=t
-        lastout_t[++outn]=t            # remember each OUT time for pairing
-    } else if (dstip==HOST) {
-        dir="IN"
+    } else {
         ni++
-        if (lastin>0){ g=(t-lastin)*1000; if(g>0&&g<500){ic++; isum+=g; igap[ic]=g; if(imin==""||g<imin)imin=g; if(g>imax)imax=g}}
+        if (lastin>0){ g=(t-lastin)*1000; if(g>0&&g<500){ic++;isum+=g;igap[ic]=g;if(imin==""||g<imin)imin=g;if(g>imax)imax=g} }
         lastin=t
-        # pair: response delay = this IN minus the most recent prior OUT
-        if (lastout>0){ rd=(t-lastout)*1000; if(rd>=0&&rd<500){rc++; rsum+=rd; rdel[rc]=rd}}
+        if (lastout>0){ rd=(t-lastout)*1000; if(rd>=0&&rd<500){rc++;rsum+=rd;rdel[rc]=rd} }
     }
 }
 END{
+    if(kept<10){ print "  kept too few game packets after noise filtering ("kept"). Servers may be all-local/P2P this match."; exit }
+    printf "\n  (kept %d game-server packets after dropping LAN/multicast/noise)\n", kept
     print ""
-    print "==== OUTBOUND cadence (your console -> server) ===="
-    if(oc>0){ om=osum/oc; for(i=1;i<=oc;i++){d=ogap[i]-om;oss+=d*d} osd=sqrt(oss/oc)
-        printf "  packets:%d  mean:%.2fms  min/max:%.2f/%.2f  jitter(sd):%.2fms\n",no,om,omin,omax,osd }
-    else print "  (no outbound gaps)"
+    print "==== OUTBOUND cadence (console -> server) ===="
+    if(oc>0){ om=osum/oc; for(i=1;i<=oc;i++){d=ogap[i]-om;oss+=d*d}osd=sqrt(oss/oc)
+        printf "  pkts:%d mean:%.2fms min/max:%.2f/%.2f jitter:%.2fms\n",no,om,omin,omax,osd } else print "  (none)"
     print ""
-    print "==== INBOUND cadence (server -> your console) ===="
-    if(ic>0){ im=isum/ic; for(i=1;i<=ic;i++){d=igap[i]-im;iss+=d*d} isd=sqrt(iss/ic)
-        printf "  packets:%d  mean:%.2fms  min/max:%.2f/%.2f  jitter(sd):%.2fms\n",ni,im,imin,imax,isd
-        printf "  (inbound mean gap ~ server send period; stability hints at tick)\n" }
-    else print "  (no inbound gaps)"
+    print "==== INBOUND cadence (server -> console) ===="
+    if(ic>0){ im=isum/ic; for(i=1;i<=ic;i++){d=igap[i]-im;iss+=d*d}isd=sqrt(iss/ic)
+        printf "  pkts:%d mean:%.2fms min/max:%.2f/%.2f jitter:%.2fms\n",ni,im,imin,imax,isd } else print "  (none)"
     print ""
     print "==== RESPONSE DELAY (OUT -> next IN) : the PHASE signal ===="
     if(rc>0){ rm=rsum/rc
-        # histogram in 5ms buckets to reveal uni- vs multi-modal
         for(i=1;i<=rc;i++){ b=int(rdel[i]/5); h[b]++; if(b>maxb)maxb=b }
-        printf "  samples:%d  mean response delay:%.2fms\n",rc,rm
+        printf "  samples:%d mean:%.2fms\n",rc,rm
         print "  distribution (5ms buckets):"
-        for(b=0;b<=maxb;b++){ if(h[b]>0){ bar=""; k=h[b]; while(k-->0 && length(bar)<50)bar=bar"#"
-            printf "   %3d-%3dms | %-50s %d\n", b*5,(b*5)+4, bar, h[b] } }
+        for(b=0;b<=maxb;b++){ if(h[b]>0){ bar="";k=h[b];while(k-->0&&length(bar)<50)bar=bar"#"
+            printf "   %3d-%3dms | %-50s %d\n",b*5,(b*5)+4,bar,h[b] } }
         print ""
-        print "  READING:"
-        print "   - ONE clear peak  -> stable phase; little to gain from shaping."
-        print "   - TWO+ peaks      -> MULTIMODAL: some packets catch the tick, some miss"
-        print "     it and wait ~a full tick. THAT gap = the phase problem you can shape."
-        print "     The spacing between peaks ~ the remote tick period to align to."
-    } else print "  (no OUT->IN pairs found)"
+        print "  READING: one peak = stable phase (little to shape)."
+        print "           two+ peaks = some packets miss the tick -> phase target;"
+        print "           peak spacing ~ remote tick period."
+    } else print "  (no OUT->IN pairs)"
     print ""
 }
 ' "$RAW"
 
 rm -f "$RAW"
-echo
-echo "Run this a few times (different matches/servers). If you consistently see"
-echo "TWO peaks in response delay, that's the target -- we shape egress phase to"
-echo "hit the near peak. If always one peak, phase is already good and the feel"
-echo "issue is remote-sim/host side, not shapeable here."
