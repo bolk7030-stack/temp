@@ -1,0 +1,32 @@
+
+---------------------------------------------------------------
+== JITTER PROBE
+---------------------------------------------------------------
+time     : 20260608-022035
+host     : 192.168.1.50
+duration : 30s
+dir      : both
+
+---------------------------------------------------------------
+== CAPTURE
+---------------------------------------------------------------
+Capturing 30s of UDP traffic for 192.168.1.50 (both)
+interface: any
+filter   : host 192.168.1.50 and udp
+PLAY NOW.
+
+captured packets: 0
+
+TOO FEW PACKETS.
+Possible reasons:
+  wrong device IP
+  not in live match
+  game uses TCP
+  tcpdump cannot see traffic on interface 'any'
+
+Try manually:
+  tcpdump -n -i any host 192.168.1.50
+
+---------------------------------------------------------------
+DONE.
+---------------------------------------------------------------
