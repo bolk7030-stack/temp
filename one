@@ -1,212 +1,110 @@
 #!/bin/sh
-# qos-audit-git.sh
-# Runs QoS audit -> saves log -> commits -> pushes to GitHub automatically
+# phase-probe.sh -- READ-ONLY. Measures the PHASE relationship between your
+# outbound game packets and the server's responses, to find out if there is a
+# remote tick window worth aligning to.
+#
+# This is the real test of the "interaction pacing" idea:
+#   - emission frequency you cannot change (console's 33ms)
+#   - emission PHASE you CAN shape (when in the remote tick your packet lands)
+# If server responses cluster at a stable offset -> there's a tick to align to.
+# If the offset is multimodal (some fast, some a tick late) -> THAT gap is the
+# phase problem worth shaping, and the modes tell us the tick period.
+#
+# Host: 192.168.10.50   Game server pattern: :3659 <-> :21002/:21008
+# Changes nothing. Run during live play.
+#
+# Usage: sh phase-probe.sh [seconds]   (default 30)
 
-TAG="${1:-run}"
-
-# =========================
-# CONFIG
-# =========================
-
-REPO_DIR="/root/temp"
-BRANCH="main"
-
-GITHUB_USER="bolk7030-stack"
-GITHUB_TOKEN="ghp_WyiNYZ0aGRJ6H25VbRBKKEHSPSt008mbEu"
-
-# Example:
-# REPO_URL="https://github.com/yourname/temp.git"
-REPO_URL="https://github.com/bolk7030-stack/temp.service status"
-
-#!/bin/sh
-# qdit.sh -- jitter probe + GitHub upload
-
-# Usage:
-#   ./qdit.sh                 -> 30 sec, both directions
-#   ./qdit.sh 60              -> 60 sec, both directions
-#   ./qdit.sh 30 out          -> 30 sec outbound only
-#   ./qdit.sh 30 in           -> 30 sec inbound only
-
-HOST="192.168.1.50"
+HOST="192.168.10.50"
 DUR="${1:-30}"
-DIR="${2:-both}"
+TS="$(date +%H%M%S 2>/dev/null || echo run)"
+RAW="/tmp/phase-raw-$$.txt"
 
-REPO_NAME="temp"
+# Capture BOTH directions of the game UDP stream, excluding local noise.
+# -tt = absolute epoch timestamps (we compute deltas/pairing in awk).
+FILT="host $HOST and udp and not port 9999 and not port 1900 and not port 53 and not port 5353"
 
-PARENT_DIR="/root"
-REPO_DIR="${PARENT_DIR}/${REPO_NAME}"
-AUTH_REPO_URL="https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/${GITHUB_USER}/${REPO_NAME}.git"
+echo "Capturing ${DUR}s bidirectional game UDP for $HOST ..." >&2
+echo "  -> PLAY NOW (in an active match, ideally moving/contesting)." >&2
 
-TS="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo manual)"
-OUT="/tmp/jitter-probe-${TS}-${DIR}.log"
-RAW="/tmp/jp-raw-$$.txt"
-
-{
-LINE="---------------------------------------------------------------"
-say() { echo; echo "$LINE"; echo "== $1"; echo "$LINE"; }
-
-say "JITTER PROBE"
-echo "time     : $TS"
-echo "host     : $HOST"
-echo "duration : ${DUR}s"
-echo "dir      : $DIR"
-
-case "$DIR" in
-    out) FILT="src host $HOST" ;;
-    in)  FILT="dst host $HOST" ;;
-    *)   FILT="host $HOST" ;;
-esac
-
-FILT="$FILT and udp"
-IFACE="any"
-
-say "CAPTURE"
-echo "Capturing ${DUR}s of UDP traffic for $HOST ($DIR)"
-echo "interface: $IFACE"
-echo "filter   : $FILT"
-echo "PLAY NOW."
-
-timeout "$DUR" tcpdump -n -tt -i "$IFACE" -q "$FILT" 2>/dev/null > "$RAW"
+timeout "$DUR" tcpdump -n -tt -i br-lan -q "$FILT" 2>/dev/null > "$RAW"
 
 LINES=$(wc -l < "$RAW" 2>/dev/null)
-echo
-echo "captured packets: ${LINES:-0}"
-
-if [ "${LINES:-0}" -lt 10 ]; then
-    echo
-    echo "TOO FEW PACKETS."
-    echo "Possible reasons:"
-    echo "  wrong device IP"
-    echo "  not in live match"
-    echo "  game uses TCP"
-    echo "  tcpdump cannot see traffic on interface '$IFACE'"
-    echo
-    echo "Try manually:"
-    echo "  tcpdump -n -i any host $HOST"
-else
-    say "INTER-PACKET TIMING ANALYSIS"
-
-    awk '
-    {
-        t = $1 + 0
-        if (prev > 0) {
-            gap = (t - prev) * 1000.0
-            if (gap >= 0 && gap < 1000) {
-                n++
-                sum += gap
-                gaps[n] = gap
-                if (min=="" || gap < min) min = gap
-                if (gap > max) max = gap
-            }
-        }
-        prev = t
-    }
-    END {
-        if (n < 5) {
-            print "not enough gaps to analyse"
-            exit
-        }
-
-        mean = sum / n
-
-        for (i=1;i<=n;i++) {
-            d = gaps[i]-mean
-            ss += d*d
-        }
-
-        sd = sqrt(ss/n)
-
-        for (i=2;i<=n;i++) {
-            k=gaps[i]
-            j=i-1
-            while(j>=1 && gaps[j]>k) {
-                gaps[j+1]=gaps[j]
-                j--
-            }
-            gaps[j+1]=k
-        }
-
-        p50 = gaps[int(n*0.50)]
-        p95 = gaps[int(n*0.95)]
-        p99 = gaps[int(n*0.99)]
-
-        printf "packets analysed : %d\n", n+1
-        printf "mean gap         : %.2f ms\n", mean
-        printf "min / max        : %.2f / %.2f ms\n", min, max
-        printf "median p50       : %.2f ms\n", p50
-        printf "p95 / p99        : %.2f / %.2f ms\n", p95, p99
-        printf "JITTER std dev   : %.2f ms\n", sd
-        printf "spread max-min   : %.2f ms\n", max-min
-        printf "\n"
-
-        printf "READING:\n"
-        if (sd < 1.0)
-            printf "  jitter < 1ms  -> stream is very steady at router.\n"
-        else if (sd < 3.0)
-            printf "  jitter 1-3ms  -> mild local wobble.\n"
-        else
-            printf "  jitter > 3ms  -> real local wobble worth investigating.\n"
-    }
-    ' "$RAW"
+echo "captured ${LINES:-0} packets" >&2
+if [ "${LINES:-0}" -lt 20 ]; then
+    echo "TOO FEW. Not in a match, or filter wrong. Try: tcpdump -n -i br-lan host $HOST and udp" >&2
+    rm -f "$RAW"; exit 1
 fi
+
+# Parse. Lines look like:
+#   <epoch> IP 192.168.10.50.3659 > 34.174.61.192.21002: UDP, length N
+#   <epoch> IP 34.174.61.192.21002 > 192.168.10.50.3659: UDP, length N
+# OUT = src is HOST ; IN = dst is HOST. We measure:
+#   1) OUT inter-packet cadence (confirm ~33ms, and its stability)
+#   2) IN  inter-packet cadence (server send rhythm -> hints at tick period)
+#   3) For each OUT, the delay until the NEXT IN from the same server
+#      (round-trip-ish response delay) and whether it's uni- or multi-modal.
+
+awk -v HOST="$HOST" '
+function abs(x){return x<0?-x:x}
+{
+    t=$1+0
+    # field 3 = src ip.port, field 5 = dst ip.port (strip trailing :)
+    src=$3; dst=$5; sub(/:$/,"",dst)
+    # split host:port
+    ns=split(src,sa,"."); srcip=sa[1]"."sa[2]"."sa[3]"."sa[4]; srcport=sa[5]
+    nd=split(dst,da,"."); dstip=da[1]"."da[2]"."da[3]"."da[4]; dstport=da[5]
+
+    if (srcip==HOST) {
+        dir="OUT"
+        no++
+        if (lastout>0){ g=(t-lastout)*1000; if(g>0&&g<500){oc++; osum+=g; ogap[oc]=g; if(omin==""||g<omin)omin=g; if(g>omax)omax=g}}
+        lastout=t
+        lastout_t[++outn]=t            # remember each OUT time for pairing
+    } else if (dstip==HOST) {
+        dir="IN"
+        ni++
+        if (lastin>0){ g=(t-lastin)*1000; if(g>0&&g<500){ic++; isum+=g; igap[ic]=g; if(imin==""||g<imin)imin=g; if(g>imax)imax=g}}
+        lastin=t
+        # pair: response delay = this IN minus the most recent prior OUT
+        if (lastout>0){ rd=(t-lastout)*1000; if(rd>=0&&rd<500){rc++; rsum+=rd; rdel[rc]=rd}}
+    }
+}
+END{
+    print ""
+    print "==== OUTBOUND cadence (your console -> server) ===="
+    if(oc>0){ om=osum/oc; for(i=1;i<=oc;i++){d=ogap[i]-om;oss+=d*d} osd=sqrt(oss/oc)
+        printf "  packets:%d  mean:%.2fms  min/max:%.2f/%.2f  jitter(sd):%.2fms\n",no,om,omin,omax,osd }
+    else print "  (no outbound gaps)"
+    print ""
+    print "==== INBOUND cadence (server -> your console) ===="
+    if(ic>0){ im=isum/ic; for(i=1;i<=ic;i++){d=igap[i]-im;iss+=d*d} isd=sqrt(iss/ic)
+        printf "  packets:%d  mean:%.2fms  min/max:%.2f/%.2f  jitter(sd):%.2fms\n",ni,im,imin,imax,isd
+        printf "  (inbound mean gap ~ server send period; stability hints at tick)\n" }
+    else print "  (no inbound gaps)"
+    print ""
+    print "==== RESPONSE DELAY (OUT -> next IN) : the PHASE signal ===="
+    if(rc>0){ rm=rsum/rc
+        # histogram in 5ms buckets to reveal uni- vs multi-modal
+        for(i=1;i<=rc;i++){ b=int(rdel[i]/5); h[b]++; if(b>maxb)maxb=b }
+        printf "  samples:%d  mean response delay:%.2fms\n",rc,rm
+        print "  distribution (5ms buckets):"
+        for(b=0;b<=maxb;b++){ if(h[b]>0){ bar=""; k=h[b]; while(k-->0 && length(bar)<50)bar=bar"#"
+            printf "   %3d-%3dms | %-50s %d\n", b*5,(b*5)+4, bar, h[b] } }
+        print ""
+        print "  READING:"
+        print "   - ONE clear peak  -> stable phase; little to gain from shaping."
+        print "   - TWO+ peaks      -> MULTIMODAL: some packets catch the tick, some miss"
+        print "     it and wait ~a full tick. THAT gap = the phase problem you can shape."
+        print "     The spacing between peaks ~ the remote tick period to align to."
+    } else print "  (no OUT->IN pairs found)"
+    print ""
+}
+' "$RAW"
 
 rm -f "$RAW"
-
 echo
-echo "$LINE"
-echo "DONE."
-echo "$LINE"
-
-} 2>&1 | tee "$OUT"
-
-echo
-echo "saved jitter log to: $OUT"
-
-# =========================
-# GIT PUSH SECTION
-# =========================
-
-mkdir -p "$PARENT_DIR"
-
-if [ ! -d "$REPO_DIR/.git" ]; then
-    echo "Repo not found. Cloning into $REPO_DIR..."
-    rm -rf "$REPO_DIR"
-    git clone "$AUTH_REPO_URL" "$REPO_DIR" || {
-        echo "ERROR: git clone failed"
-        exit 1
-    }
-fi
-
-cd "$REPO_DIR" || {
-    echo "ERROR: cannot cd into $REPO_DIR"
-    exit 1
-}
-
-git config user.name "openwrt-jitter"
-git config user.email "openwrt-jitter@local"
-
-git pull --rebase "$AUTH_REPO_URL" "$BRANCH" || {
-    echo "ERROR: pull/rebase failed"
-    exit 1
-}
-
-mkdir -p jitter
-
-DEST="jitter/$(basename "$OUT")"
-cp "$OUT" "$DEST"
-
-git add jitter/
-
-git commit -m "jitter probe ${TS} ${DIR}" || {
-    echo "Nothing new to commit."
-    exit 0
-}
-
-git push "$AUTH_REPO_URL" "$BRANCH" || {
-    echo "ERROR: git push failed"
-    exit 1
-}
-
-echo "GitHub push complete."    echo "ERROR: git push failed"
-    exit 1
-}
+echo "Run this a few times (different matches/servers). If you consistently see"
+echo "TWO peaks in response delay, that's the target -- we shape egress phase to"
+echo "hit the near peak. If always one peak, phase is already good and the feel"
+echo "issue is remote-sim/host side, not shapeable here."
