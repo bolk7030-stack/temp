@@ -12,7 +12,7 @@ REPO_DIR="/root/temp"
 BRANCH="main"
 
 GITHUB_USER="bolk7030-stack"
-GITHUB_TOKEN="github_pat_1CCU5TOI030r8svYnVp6Q_nq4KAWIisAPHDPI63L2pg2A3cjG1bOFxj7eYnbRFjge7REOFPKKbY0hZGRb"
+GITHUB_TOKEN="ghp_WyiNYZ0aGRJ6H25VbRBKKEHSPSt008mbEu"
 
 # Example:
 # REPO_URL="https://github.com/yourname/temp.git"
