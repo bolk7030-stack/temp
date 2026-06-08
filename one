@@ -12,12 +12,12 @@ REPO_DIR="/root/temp"
 BRANCH="main"
 
 # HARD-CODED TOKEN (experiment only)
-GITHUB_USER="bolk7030"
+GITHUB_USER="bolk7030-stack"
 GITHUB_TOKEN="ghp_YOURTOKENHERE"
 
 # Example:
 # REPO_URL="https://github.com/yourname/temp.git"
-REPO_URL="https://github.com/YOUR_GITHUB_USERNAME/temp.git"
+REPO_URL="https://github.com/bolk7030-stack/temp"
 
 # =========================
 
