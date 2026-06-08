@@ -8,7 +8,7 @@ TAG="${1:-run}"
 # CONFIG
 # =========================
 
-REPO_DIR="/root/temp"
+REPO_DIR="./temp"
 BRANCH="main"
 
 GITHUB_USER="bolk7030-stack"
