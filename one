@@ -1,199 +1,212 @@
 #!/bin/sh
-# hfsc-selftest.sh -- SELF-CONTAINED test rig for the controller.
-#
-# Purpose: for the first time, give the controller a REAL HFSC tree to sense
-# and act on, fully ISOLATED from qosmate, so its log numbers (raw/field/ctl)
-# are real instead of reads against a tree that never existed.
-#
-# What it does:
-#   1. On startup, BUILDS its own HFSC tree on the WAN egress device, with:
-#        - a game class (high priority)
-#        - a bulk class (the one the controller trims)
-#        - an fq_codel LEAF on the bulk class  <-- this reports real qlen/backlog
-#   2. Runs the control loop, sensing the bulk leaf's backlog as the pressure
-#      signal (HFSC/pfifo don't report delay; fq_codel/backlog is what's real
-#      on this box -- no iffy packet counting, just the queue's own backlog).
-#   3. On exit (Ctrl-C), TEARS DOWN its tree cleanly so nothing collides with
-#      qosmate or persists.
-#
-# IMPORTANT:
-#   - Run with qosmate DISABLED (it is, per your audit). This rig and qosmate
-#     must never both shape the same device.
-#   - WAN egress only (upload). Download shaping needs an IFB; out of scope for
-#     a clean single-variable test. Upload is enough to prove the controller
-#     senses and acts on something real.
-#   - To actually SEE it work you must generate real upload load (see notes at
-#     end). On an idle link backlog stays 0 and the controller correctly idles.
-#
-# Set MODEL via $1 (A|B|C|D), default A.
+# qos-audit-git.sh
+# Runs QoS audit -> saves log -> commits -> pushes to GitHub automatically
 
-MODEL="${1:-A}"
+TAG="${1:-run}"
 
-WAN_DEV="eth1"                 # confirmed WAN egress from audit
-TOTAL_UP=85000                 # kbit; your qosmate UPRATE. Shape slightly under
-SHAPE_UP=80000                 #   line rate so OUR queue (not ISP) is the bottleneck
+# =========================
+# CONFIG
+# =========================
 
-GAME_CLASS="1:20"
-BULK_CLASS="1:60"
-GAME_UP=12000
-BULK_UP_BASE=42000
-BULK_UP_MIN=24000
+REPO_DIR="/root/temp"
+BRANCH="main"
 
-# pressure target/units now in BACKLOG terms (bytes), not delay.
-# backlog is the real signal fq_codel exposes. We convert backlog bytes -> a
-# "pressure" number comparable to the old delay-excess scale.
-TARGET_BACKLOG=3000            # bytes; below this = no pressure (clean)
-BACKLOG_DIV=500                # bytes per pressure unit (scales backlog -> field)
+GITHUB_USER="bolk7030-stack"
+GITHUB_TOKEN="ghp_WyiNYZ0aGRJ6H25VbRBKKEHSPSt008mbEu"
 
-SHAPE_A=70; SHAPE_B=80
-FIELD_FLOOR=8
-ATK_TC_MS=250; REL_TC_MS=120
-UP_TRIM_PER_CONTROL=450
+# Example:
+# REPO_URL="https://github.com/yourname/temp.git"
+REPO_URL="https://github.com/bolk7030-stack/temp.service status"
 
-A_FRAC_NUM=1; A_FRAC_DEN=2; A_ECHO_TICKS=3
-B_RELIEF_PER_CTL=2; B_ECHO_TICKS=4
-C_REFRACTORY=3
-D_SLOW_NUM=9; D_SLOW_DEN=10
+#!/bin/sh
+# qdit.sh -- jitter probe + GitHub upload
 
-APPLY_Q=100; APPLY_EPS=150
+# Usage:
+#   ./qdit.sh                 -> 30 sec, both directions
+#   ./qdit.sh 60              -> 60 sec, both directions
+#   ./qdit.sh 30 out          -> 30 sec outbound only
+#   ./qdit.sh 30 in           -> 30 sec inbound only
 
-LOOP_MS=50
-if sleep 0.05 2>/dev/null; then nap() { sleep 0.05; }; PACE="20Hz"
-elif usleep 1 2>/dev/null; then nap() { usleep 50000; }; PACE="20Hz(usleep)"
-else LOOP_MS=1000; nap() { sleep 1; }; PACE="1Hz"; fi
+HOST="192.168.1.50"
+DUR="${1:-30}"
+DIR="${2:-both}"
 
-ATK_NUM="$LOOP_MS"; ATK_DEN="$ATK_TC_MS"; [ "$ATK_NUM" -gt "$ATK_DEN" ] && ATK_NUM="$ATK_DEN"
-REL_NUM="$LOOP_MS"; REL_DEN="$REL_TC_MS"; [ "$REL_NUM" -gt "$REL_DEN" ] && REL_NUM="$REL_DEN"
+REPO_NAME="temp"
 
-# ---------- tree build / teardown ----------
-teardown() {
-    echo >&2; echo "tearing down test tree on $WAN_DEV ..." >&2
-    tc qdisc del dev "$WAN_DEV" root 2>/dev/null
-    echo "done. $WAN_DEV back to kernel default." >&2
+PARENT_DIR="/root"
+REPO_DIR="${PARENT_DIR}/${REPO_NAME}"
+AUTH_REPO_URL="https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/${GITHUB_USER}/${REPO_NAME}.git"
+
+TS="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo manual)"
+OUT="/tmp/jitter-probe-${TS}-${DIR}.log"
+RAW="/tmp/jp-raw-$$.txt"
+
+{
+LINE="---------------------------------------------------------------"
+say() { echo; echo "$LINE"; echo "== $1"; echo "$LINE"; }
+
+say "JITTER PROBE"
+echo "time     : $TS"
+echo "host     : $HOST"
+echo "duration : ${DUR}s"
+echo "dir      : $DIR"
+
+case "$DIR" in
+    out) FILT="src host $HOST" ;;
+    in)  FILT="dst host $HOST" ;;
+    *)   FILT="host $HOST" ;;
+esac
+
+FILT="$FILT and udp"
+IFACE="any"
+
+say "CAPTURE"
+echo "Capturing ${DUR}s of UDP traffic for $HOST ($DIR)"
+echo "interface: $IFACE"
+echo "filter   : $FILT"
+echo "PLAY NOW."
+
+timeout "$DUR" tcpdump -n -tt -i "$IFACE" -q "$FILT" 2>/dev/null > "$RAW"
+
+LINES=$(wc -l < "$RAW" 2>/dev/null)
+echo
+echo "captured packets: ${LINES:-0}"
+
+if [ "${LINES:-0}" -lt 10 ]; then
+    echo
+    echo "TOO FEW PACKETS."
+    echo "Possible reasons:"
+    echo "  wrong device IP"
+    echo "  not in live match"
+    echo "  game uses TCP"
+    echo "  tcpdump cannot see traffic on interface '$IFACE'"
+    echo
+    echo "Try manually:"
+    echo "  tcpdump -n -i any host $HOST"
+else
+    say "INTER-PACKET TIMING ANALYSIS"
+
+    awk '
+    {
+        t = $1 + 0
+        if (prev > 0) {
+            gap = (t - prev) * 1000.0
+            if (gap >= 0 && gap < 1000) {
+                n++
+                sum += gap
+                gaps[n] = gap
+                if (min=="" || gap < min) min = gap
+                if (gap > max) max = gap
+            }
+        }
+        prev = t
+    }
+    END {
+        if (n < 5) {
+            print "not enough gaps to analyse"
+            exit
+        }
+
+        mean = sum / n
+
+        for (i=1;i<=n;i++) {
+            d = gaps[i]-mean
+            ss += d*d
+        }
+
+        sd = sqrt(ss/n)
+
+        for (i=2;i<=n;i++) {
+            k=gaps[i]
+            j=i-1
+            while(j>=1 && gaps[j]>k) {
+                gaps[j+1]=gaps[j]
+                j--
+            }
+            gaps[j+1]=k
+        }
+
+        p50 = gaps[int(n*0.50)]
+        p95 = gaps[int(n*0.95)]
+        p99 = gaps[int(n*0.99)]
+
+        printf "packets analysed : %d\n", n+1
+        printf "mean gap         : %.2f ms\n", mean
+        printf "min / max        : %.2f / %.2f ms\n", min, max
+        printf "median p50       : %.2f ms\n", p50
+        printf "p95 / p99        : %.2f / %.2f ms\n", p95, p99
+        printf "JITTER std dev   : %.2f ms\n", sd
+        printf "spread max-min   : %.2f ms\n", max-min
+        printf "\n"
+
+        printf "READING:\n"
+        if (sd < 1.0)
+            printf "  jitter < 1ms  -> stream is very steady at router.\n"
+        else if (sd < 3.0)
+            printf "  jitter 1-3ms  -> mild local wobble.\n"
+        else
+            printf "  jitter > 3ms  -> real local wobble worth investigating.\n"
+    }
+    ' "$RAW"
+fi
+
+rm -f "$RAW"
+
+echo
+echo "$LINE"
+echo "DONE."
+echo "$LINE"
+
+} 2>&1 | tee "$OUT"
+
+echo
+echo "saved jitter log to: $OUT"
+
+# =========================
+# GIT PUSH SECTION
+# =========================
+
+mkdir -p "$PARENT_DIR"
+
+if [ ! -d "$REPO_DIR/.git" ]; then
+    echo "Repo not found. Cloning into $REPO_DIR..."
+    rm -rf "$REPO_DIR"
+    git clone "$AUTH_REPO_URL" "$REPO_DIR" || {
+        echo "ERROR: git clone failed"
+        exit 1
+    }
+fi
+
+cd "$REPO_DIR" || {
+    echo "ERROR: cannot cd into $REPO_DIR"
+    exit 1
+}
+
+git config user.name "openwrt-jitter"
+git config user.email "openwrt-jitter@local"
+
+git pull --rebase "$AUTH_REPO_URL" "$BRANCH" || {
+    echo "ERROR: pull/rebase failed"
+    exit 1
+}
+
+mkdir -p jitter
+
+DEST="jitter/$(basename "$OUT")"
+cp "$OUT" "$DEST"
+
+git add jitter/
+
+git commit -m "jitter probe ${TS} ${DIR}" || {
+    echo "Nothing new to commit."
     exit 0
 }
-trap teardown INT TERM
 
-build_tree() {
-    # wipe whatever is there (kernel default mq will be restored on teardown)
-    tc qdisc del dev "$WAN_DEV" root 2>/dev/null
-    # HFSC root, default class = bulk
-    tc qdisc add dev "$WAN_DEV" root handle 1: hfsc default 60 || return 1
-    tc class add dev "$WAN_DEV" parent 1: classid 1:1 hfsc ls rate "${SHAPE_UP}kbit" ul rate "${SHAPE_UP}kbit"
-    # game class: high priority, real-time guarantee
-    tc class add dev "$WAN_DEV" parent 1:1 classid "$GAME_CLASS" hfsc rt rate "${GAME_UP}kbit" ls rate "${GAME_UP}kbit" ul rate "${GAME_UP}kbit"
-    # bulk class: the one we trim
-    tc class add dev "$WAN_DEV" parent 1:1 classid "$BULK_CLASS" hfsc ls rate "${BULK_UP_BASE}kbit" ul rate "${BULK_UP_BASE}kbit"
-    # fq_codel leaf on bulk -> reports REAL backlog (our sensor)
-    tc qdisc add dev "$WAN_DEV" parent "$BULK_CLASS" handle 60: fq_codel
-    # pfifo leaf on game (low-latency, not sensed)
-    tc qdisc add dev "$WAN_DEV" parent "$GAME_CLASS" handle 20: pfifo limit 64
-    return 0
-}
-
-# read backlog (bytes) of the bulk leaf -- the real pressure signal
-get_bulk_backlog() {
-    tc -s qdisc show dev "$WAN_DEV" 2>/dev/null | awk '
-        /qdisc fq_codel 60:/ {found=1; next}
-        found && /backlog/ {
-            for (i=1;i<=NF;i++) if ($i=="backlog") {
-                v=$(i+1); gsub(/[^0-9]/,"",v); print v+0; exit }
-        }'
-}
-
-clamp() { v="$1"; [ "$v" -lt "$2" ] && v="$2"; [ "$v" -gt "$3" ] && v="$3"; echo "$v"; }
-apply_bulk() { tc class change dev "$WAN_DEV" classid "$BULK_CLASS" hfsc ls rate "${1}kbit" ul rate "${1}kbit" 2>/dev/null; }
-ease() {
-    cur="$1"; tgt="$2"; n="$3"; dn="$4"
-    diff=$((tgt - cur)); [ "$diff" -eq 0 ] && { echo "$cur"; return; }
-    step=$(( diff * n / dn ))
-    if [ "$step" -eq 0 ]; then [ "$diff" -gt 0 ] && step=1 || step=-1; fi
-    newv=$((cur + step))
-    if [ "$diff" -gt 0 ]; then [ "$newv" -gt "$tgt" ] && newv="$tgt"
-    else                       [ "$newv" -lt "$tgt" ] && newv="$tgt"; fi
-    echo "$newv"
-}
-
-residual() {
-    DELTA=$(( RAW - PREV_RAW ))
-    case "$MODEL" in
-    A) EFF="$RAW"; if [ "$DELTA" -lt 0 ] && [ "$ECHO_AGE" -lt "$A_ECHO_TICKS" ]; then
-           IMP=$(( -DELTA )); E=$(( IMP*A_FRAC_NUM/A_FRAC_DEN )); EFF=$(( RAW+E )); fi ;;
-    B) EFF="$RAW"; if [ "$DELTA" -lt 0 ] && [ "$EXPECTED_RELIEF" -gt 0 ]; then
-           IMP=$(( -DELTA )); OWN="$IMP"; [ "$OWN" -gt "$EXPECTED_RELIEF" ] && OWN="$EXPECTED_RELIEF"; EFF=$(( RAW+OWN )); fi ;;
-    C) if [ "$DELTA" -lt 0 ] && [ "$ECHO_AGE" -lt "$C_REFRACTORY" ]; then EFF="$PREV_RAW"; else EFF="$RAW"; fi ;;
-    D) if [ "$RAW" -gt "$SLOW_FIELD" ]; then EFF="$RAW"; else EFF="$SLOW_FIELD"; fi ;;
-    *) EFF="$RAW" ;;
-    esac
-    [ "$EFF" -lt 0 ] && EFF=0; echo "$EFF"
-}
-
-# ---------- main ----------
-if ! build_tree; then
-    echo "ERROR: could not build HFSC tree on $WAN_DEV. Is qosmate enabled? It must be OFF." >&2
-    echo "Check: tc qdisc show dev $WAN_DEV" >&2
+git push "$AUTH_REPO_URL" "$BRANCH" || {
+    echo "ERROR: git push failed"
     exit 1
-fi
-echo "BUILT test tree on $WAN_DEV (game=$GAME_CLASS bulk=$BULK_CLASS leaf=fq_codel 60:)" >&2
-echo "MODEL=$MODEL pace=$PACE  Ctrl-C to tear down cleanly." >&2
-echo "Generate upload load to see it act (see notes at end of script)." >&2
+}
 
-FIELD=0; SLOW_FIELD=0; PREV_RAW=0; PREV_CONTROL=0; ECHO_AGE=99; EXPECTED_RELIEF=0
-CUR_BULK_UP="$BULK_UP_BASE"; APPLIED_UP=-1
-
-apply_bulk "$BULK_UP_BASE"
-
-while true; do
-    BL="$(get_bulk_backlog)"; [ -z "$BL" ] && BL=0
-    # backlog bytes -> pressure excess (comparable to old field scale)
-    EXCESS=$(( (BL - TARGET_BACKLOG) / BACKLOG_DIV ))
-    [ "$EXCESS" -lt 0 ] && EXCESS=0
-    RAW="$EXCESS"
-
-    SLOW_FIELD=$(( (SLOW_FIELD*D_SLOW_NUM + RAW*(D_SLOW_DEN-D_SLOW_NUM))/D_SLOW_DEN ))
-    EFFECTIVE="$(residual)"; PREV_RAW="$RAW"
-
-    if [ "$EFFECTIVE" -gt "$FIELD" ]; then FIELD="$(ease "$FIELD" "$EFFECTIVE" "$ATK_NUM" "$ATK_DEN")"
-    else                                   FIELD="$(ease "$FIELD" "$EFFECTIVE" "$REL_NUM" "$REL_DEN")"; fi
-
-    if [ "$FIELD" -lt "$FIELD_FLOOR" ]; then
-        CONTROL=0; TGT_UP="$BULK_UP_BASE"
-    else
-        CONTROL=$(( FIELD*SHAPE_A/(FIELD+SHAPE_B) )); CONTROL="$(clamp "$CONTROL" 0 60)"
-        TGT_UP="$(clamp $((BULK_UP_BASE - CONTROL*UP_TRIM_PER_CONTROL)) "$BULK_UP_MIN" "$BULK_UP_BASE")"
-    fi
-
-    if [ "$CONTROL" -gt "$PREV_CONTROL" ]; then
-        ECHO_AGE=0; RISE=$((CONTROL-PREV_CONTROL)); EXPECTED_RELIEF=$((RISE*B_RELIEF_PER_CTL))
-    else
-        ECHO_AGE=$((ECHO_AGE+1)); EXPECTED_RELIEF=$((EXPECTED_RELIEF*(B_ECHO_TICKS-1)/B_ECHO_TICKS))
-    fi
-    PREV_CONTROL="$CONTROL"
-
-    if [ "$TGT_UP" -lt "$CUR_BULK_UP" ]; then CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TGT_UP" "$ATK_NUM" "$ATK_DEN")"
-    else                                      CUR_BULK_UP="$(ease "$CUR_BULK_UP" "$TGT_UP" "$REL_NUM" "$REL_DEN")"; fi
-
-    QU=$(( (CUR_BULK_UP+APPLY_Q/2)/APPLY_Q*APPLY_Q ))
-    dU=$(( QU-APPLIED_UP )); [ "$dU" -lt 0 ] && dU=$((-dU))
-    if [ "$APPLIED_UP" -lt 0 ] || [ "$dU" -ge "$APPLY_EPS" ] || { [ "$CUR_BULK_UP" -eq "$TGT_UP" ] && [ "$QU" -ne "$APPLIED_UP" ]; }; then
-        apply_bulk "$QU"; APPLIED_UP="$QU"; fi
-
-    echo "M=$MODEL backlog=${BL}b raw=$RAW eff=$EFFECTIVE eAge=$ECHO_AGE field=$FIELD ctl=$CONTROL bulkUP=$CUR_BULK_UP"
-    nap
-done
-
-# ===================== HOW TO ACTUALLY TEST =====================
-# 1. Confirm qosmate is OFF:   /etc/init.d/qosmate status   (should say disabled)
-# 2. Start this rig:           sh hfsc-selftest.sh A
-#    -> you should see "BUILT test tree" and then backlog=0 ctl=0 (idle = correct)
-# 3. In ANOTHER ssh session, verify the tree is real:
-#       tc -s qdisc show dev eth1        # should show hfsc + fq_codel 60:
-#       tc class show dev eth1           # should show 1:20 and 1:60
-# 4. Generate REAL upload load from a LAN client (not the router) so the bulk
-#    class fills and backlog rises:
-#       - run a big upload / speedtest upload from a PC behind the router, OR
-#       - iperf3 -c <server> from a LAN host (upload direction)
-#    Watch backlog climb and ctl rise in the log -> the controller is finally
-#    sensing and acting on something REAL.
-# 5. Ctrl-C to tear the tree down cleanly. eth1 returns to default.
-# ================================================================
+echo "GitHub push complete."    echo "ERROR: git push failed"
+    exit 1
+}
