@@ -132,6 +132,8 @@ git commit -m "audit ${TS} ${TAG}" || {
     echo "Nothing new to commit."
     exit 0
 }
+cd /root/temp
+git pull --rebase origin main
 
 git push "$AUTH_REPO_URL" "$BRANCH" || {
     echo "ERROR: git push failed"
