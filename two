@@ -121,7 +121,12 @@ cd "$REPO_DIR" || {
 git config user.name "openwrt-audit"
 git config user.email "openwrt-audit@local"
 
-git pull "$AUTH_REPO_URL" "$BRANCH" 2>/dev/null
+cd /root/temp || exit 1
+
+git pull --rebase "$AUTH_REPO_URL" main || {
+    echo "ERROR: pull/rebase failed"
+    exit 1
+}
 
 mkdir -p audits
 DEST="audits/$(basename "$OUT")"
@@ -132,13 +137,8 @@ git commit -m "audit ${TS} ${TAG}" || {
     echo "Nothing new to commit."
     exit 0
 }
-cd /root/temp
-git pull --rebase origin main
 
-git push "$AUTH_REPO_URL" "$BRANCH" || {
+git push "$AUTH_REPO_URL" main || {
     echo "ERROR: git push failed"
     exit 1
 }
-
-echo "GitHub push complete."
-
