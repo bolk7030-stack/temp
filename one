@@ -1,119 +1,82 @@
 #!/bin/sh
-# stream-stats.sh -- interpretation-free time-series diagnostics (v2).
-# v1 crashed on busybox awk (user-defined function with many locals). v2 has NO
-# user functions -- straight-line code, globals only, busybox-safe.
+# burst-pace.sh -- enforce a minimum gap between OUTBOUND game packets, to smooth
+# the back-to-back bursts the stream-stats probe found (outbound was bimodal:
+# a ~33ms main mode + a ~0ms back-to-back mode). This paces the flow so packets
+# can't depart closer than MIN_GAP_MS apart, collapsing the 0ms mode into the
+# main one -- WITHOUT adding latency to already-spaced packets.
 #
-# On timestamps only (no packet "meaning"):
-#   1. AUTOCORRELATION of inter-arrival gaps -> hidden periodicity (no assumed period)
-#   2. MODALITY of the gap distribution -> single-state vs multi-state process
-#   3. STATIONARITY -> did the process drift across the capture
-# Done for OUT (console->server) and IN (server->console) separately.
+# Mechanism: tbf (token bucket filter) on just the console game flow, sized so
+# its rate = 1 packet per MIN_GAP_MS. tbf releases tokens at a steady rate, so
+# a back-to-back pair gets its 2nd packet held just until the next token --
+# exactly a minimum-gap pacer. A burst of 1 (the normal case) passes instantly.
 #
-# Usage: sh stream-stats.sh [packet_count]   (default 1500)
+# HONEST CAVEAT: if those back-to-back packets are intentionally-paired game
+# state, pacing them could HURT. The data says the bimodality is real; only PLAY
+# says whether smoothing it helps. Judge by feel. Reverts cleanly on Ctrl-C.
+#
+# Touches ONLY console game UDP (src 192.168.10.50 port 3659) on eth1 egress.
+#
+# Usage:
+#   sh burst-pace.sh           # MIN_GAP_MS=10 (breaks up <10ms back-to-backs)
+#   sh burst-pace.sh 8         # custom minimum gap in ms
+#
+# survive SSH disconnect: setsid sh burst-pace.sh &
 
+WAN_DEV="eth1"
 HOST="192.168.10.50"
-COUNT="${1:-1500}"
-RAW="/tmp/ss-raw-$$.txt"
+CONSOLE_PORT="3659"
+MIN_GAP_MS="${1:-10}"
 
-echo "Capturing $COUNT game UDP packets for $HOST ... PLAY NOW." >&2
-tcpdump -n -tt -c "$COUNT" -i br-lan \
-    host "$HOST" and udp and not port 9999 and not port 1900 and not port 53 \
-    2>/dev/null > "$RAW"
+# typical game packet ~ 60-150 bytes; size the bucket for ~1 pkt per gap.
+# rate = 1 packet / MIN_GAP_MS. Use a representative packet size for the math.
+PKT_BYTES=150
+# bits per second to allow 1 pkt of PKT_BYTES every MIN_GAP_MS:
+#   rate_bps = PKT_BYTES*8 * (1000/MIN_GAP_MS)
+RATE_BPS=$(( PKT_BYTES * 8 * 1000 / MIN_GAP_MS ))
+# burst = 1 packet (so 2nd back-to-back packet must wait for next token)
+BURST_BYTES="$PKT_BYTES"
+# small latency cap so held packets don't queue forever (drop if absurdly late)
+TBF_LATENCY_MS=$(( MIN_GAP_MS * 4 ))
 
-LINES=$(wc -l < "$RAW" 2>/dev/null)
-echo "captured ${LINES:-0} packets" >&2
-if [ "${LINES:-0}" -lt 200 ]; then
-    echo "Too few for stable statistics. Aborting." >&2
-    rm -f "$RAW"; exit 1
+cleanup() {
+    echo >&2
+    echo "tearing down pacer on $WAN_DEV ..." >&2
+    tc qdisc del dev "$WAN_DEV" root 2>/dev/null
+    echo "done. $WAN_DEV restored to default (game traffic no longer paced)." >&2
+}
+trap 'cleanup; exit 0' INT TERM
+
+echo "min-gap pacer: >= ${MIN_GAP_MS}ms between outbound game packets" >&2
+echo "  (rate ~${RATE_BPS}bps, burst ${BURST_BYTES}B, on src ${HOST}:${CONSOLE_PORT})" >&2
+
+# prio root: band 1:2 gets the paced flow (tbf), everything else passes untouched
+tc qdisc del dev "$WAN_DEV" root 2>/dev/null
+tc qdisc add dev "$WAN_DEV" root handle 1: prio bands 3 || { echo "prio add failed"; exit 1; }
+
+# tbf on the game band -> enforces minimum spacing
+if ! tc qdisc add dev "$WAN_DEV" parent 1:2 handle 20: tbf \
+        rate "${RATE_BPS}bit" burst "${BURST_BYTES}" latency "${TBF_LATENCY_MS}ms" 2>/dev/null; then
+    echo "tbf add failed (kmod-sched-tbf missing? try: apk add kmod-sched-tbf)" >&2
+    cleanup; exit 1
 fi
 
-# Split gaps into two files (OUT, IN) with plain awk, then analyse each with a
-# second awk that has NO functions. Keeps every awk program busybox-simple.
-awk -v HOST="$HOST" '
-{
-    t=$1+0; src=$3; dst=$5; sub(/:$/,"",dst)
-    split(src,sa,"."); si=sa[1]"."sa[2]"."sa[3]"."sa[4]
-    split(dst,da,"."); di=da[1]"."da[2]"."da[3]"."da[4]
-    isl = (di ~ /^192\.168\./ || di ~ /^239\./ || di ~ /^224\./ || di ~ /^255\./ || si ~ /^192\.168\./ || si ~ /^239\./ || si ~ /^224\./ || si ~ /^255\./)
-    if (si==HOST){
-        if (di ~ /^192\.168\./ || di ~ /^239\./ || di ~ /^224\./ || di ~ /^255\./) next
-        if (lo>0){ g=(t-lo)*1000; if(g>=0 && g<500) print g > "/tmp/ss-out-'$$'.txt" }
-        lo=t
-    } else if (di==HOST){
-        if (si ~ /^192\.168\./ || si ~ /^239\./ || si ~ /^224\./ || si ~ /^255\./) next
-        if (li>0){ g=(t-li)*1000; if(g>=0 && g<500) print g > "/tmp/ss-in-'$$'.txt" }
-        li=t
-    }
-}
-' "$RAW"
+# other bands: plain fifo, untouched
+tc qdisc add dev "$WAN_DEV" parent 1:1 handle 10: pfifo 2>/dev/null
+tc qdisc add dev "$WAN_DEV" parent 1:3 handle 30: pfifo 2>/dev/null
 
-# analysis pass -- NO functions, runs once per direction file
-analyse_file() {
-    NAME="$1"; F="$2"
-    [ -s "$F" ] || { echo "  [$NAME] no samples"; return; }
-    awk -v NAME="$NAME" '
-    { n++; x[n]=$1+0; sum+=$1 }
-    END{
-        if(n<30){ printf "  [%s] too few (%d)\n", NAME, n; exit }
-        mean=sum/n
-        ss=0; mn=1e9; mx=-1e9
-        for(i=1;i<=n;i++){ d=x[i]-mean; ss+=d*d; if(x[i]<mn)mn=x[i]; if(x[i]>mx)mx=x[i] }
-        sd=sqrt(ss/n)
-        printf "\n  === %s inter-arrival (ms) ===\n", NAME
-        printf "    n=%d mean=%.2f sd=%.2f cv=%.2f min=%.2f max=%.2f\n", n,mean,sd,(mean>0?sd/mean:0),mn,mx
+# filter: console game UDP -> paced band 1:2
+tc filter add dev "$WAN_DEV" parent 1: protocol ip prio 1 u32 \
+    match ip src "${HOST}/32" match ip sport "$CONSOLE_PORT" 0xffff flowid 1:2 \
+    || { echo "filter add failed"; cleanup; exit 1; }
 
-        # 1. autocorrelation lags 1..40
-        acden=0; for(i=1;i<=n;i++){ d=x[i]-mean; acden+=d*d }
-        if(acden<=0){ print "    autocorr: no variance"; }
-        else {
-            print "    autocorrelation peaks (r>0.15):"
-            anypk=0
-            for(lag=1;lag<=40;lag++){
-                s=0; for(i=1;i<=n-lag;i++){ s+=(x[i]-mean)*(x[i+lag]-mean) }
-                r[lag]=s/acden
-            }
-            for(lag=2;lag<=39;lag++){
-                if(r[lag]>0.15 && r[lag]>=r[lag-1] && r[lag]>=r[lag+1]){
-                    printf "      lag %2d : %+.2f  <= PEAK\n", lag, r[lag]; anypk=1
-                }
-            }
-            if(!anypk) print "      (none -- no hidden periodic structure)"
-        }
+echo "PACER ACTIVE. Play and judge by feel." >&2
+echo "  better/neutral -> the back-to-back bursts were incidental; you smoothed them." >&2
+echo "  worse          -> they were intentional pairs; Ctrl-C to revert and we rethink." >&2
+echo "Ctrl-C to stop." >&2
 
-        # 2. modality (2ms buckets)
-        for(i=0;i<60;i++) h[i]=0
-        for(i=1;i<=n;i++){ b=int(x[i]/2); if(b<0)b=0; if(b>59)b=59; h[b]++ }
-        maxh=0; for(i=0;i<60;i++) if(h[i]>maxh)maxh=h[i]
-        modes=0
-        for(i=0;i<60;i++){
-            if(h[i]>maxh*0.10 && h[i]>=3){
-                lo2=(i>0)?h[i-1]:0; hi2=(i<59)?h[i+1]:0
-                if(h[i]>=lo2 && h[i]>=hi2) modes++
-            }
-        }
-        printf "    gap distribution modes: %d  (1=single-state, 2+=distinct states)\n", modes
-        # show the populated buckets compactly
-        for(i=0;i<60;i++){
-            if(h[i]>0){
-                bl=int(h[i]*24/maxh); bar=""; k=bl; while(k-->0)bar=bar"#"
-                printf "      %2d-%2dms |%-24s %d\n", i*2,i*2+1,bar,h[i]
-            }
-        }
-
-        # 3. stationarity
-        half=int(n/2)
-        m1=0; for(i=1;i<=half;i++) m1+=x[i]; m1/=half
-        m2=0; for(i=half+1;i<=n;i++) m2+=x[i]; m2/=(n-half)
-        dm=m1-m2; if(dm<0)dm=-dm
-        printf "    stationarity: 1st-half mean=%.2f  2nd-half mean=%.2f  drift=%.2f -> %s\n", \
-            m1,m2,dm,(dm>mean*0.15?"NON-stationary":"stationary")
-    }' "$F"
-}
-
-analyse_file "OUTBOUND" "/tmp/ss-out-$$.txt"
-analyse_file "INBOUND"  "/tmp/ss-in-$$.txt"
-
-echo
-echo "  interpretation-free: structure of the timing process, not packet meaning."
-echo "  run 2-3x; real structure reproduces, noise does not."
-rm -f "$RAW" "/tmp/ss-out-$$.txt" "/tmp/ss-in-$$.txt"
+# hold; periodically show how many game packets are getting paced (queue/sent)
+while true; do
+    sleep 30
+    STATS="$(tc -s qdisc show dev "$WAN_DEV" 2>/dev/null | awk '/qdisc tbf 20:/{f=1} f&&/Sent/{print "  paced flow: "$0; f=0}')"
+    [ -n "$STATS" ] && echo "$STATS" >&2
+done
