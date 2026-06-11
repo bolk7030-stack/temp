@@ -1,126 +1,125 @@
 #!/bin/sh
-# phase-detect.sh -- Path 2, step 1: CONFIRM THE PREMISE before building a pacer.
+# stream-stats.sh -- interpretation-free time-series diagnostics on the game
+# packet stream. NO claims about what any packet "means". Operates on timestamps
+# (and raw byte counts as a bare scalar) only. Reports STRUCTURE, not stories.
 #
-# The phase-folding idea only works if a packet's DEPARTURE PHASE (where it sits
-# in the remote tick cycle) predicts its RESPONSE SPEED. This script tests that
-# directly, using only tcpdump (proven working) -- no NFQUEUE, no pacer yet.
+# Three standard diagnostics, each assumption-free:
+#   1. AUTOCORRELATION of inter-arrival times -- reveals hidden periodicity at
+#      whatever lag it actually exists (does NOT assume a tick period).
+#   2. INTER-ARRIVAL DISTRIBUTION + modality -- how many modes the gap
+#      distribution has (1 = single-state process; 2+ = distinct states).
+#   3. STATIONARITY -- split capture in halves, compare; did the process drift?
 #
-# METHOD (data-science, not tuning):
-#   1. Capture bidirectional game UDP.
-#   2. For each candidate TICK PERIOD, assign every outbound packet a phase =
-#      (departure_time mod period). Bin packets by phase.
-#   3. For each phase bin, compute the MEAN response delay (OUT -> next IN).
-#   4. If response delay varies a lot ACROSS phase bins at some period, then
-#      phase predicts outcome -> folding can work, and:
-#         - the period with the strongest variation = the real tick
-#         - the fastest phase bin = the FOLD TARGET (where we want packets)
-#      If response delay is FLAT across phases at every period -> phase does NOT
-#      predict outcome -> folding is pointless. Stop, honestly.
+# Computed per direction (OUT = console->server, IN = server->console) since
+# they are different processes.
 #
-# We sweep several candidate tick periods and let the DATA pick the one (if any)
-# where phase matters -- that's how we detect the tick instead of assuming it.
-#
-# Usage: sh phase-detect.sh [packet_count]   (default 1200; more = cleaner bins)
+# Usage: sh stream-stats.sh [packet_count]   (default 1500)
 
 HOST="192.168.10.50"
-COUNT="${1:-1200}"
-RAW="/tmp/pd-raw-$$.txt"
+COUNT="${1:-1500}"
+RAW="/tmp/ss-raw-$$.txt"
 
-# candidate tick periods (ms): 120Hz,100,75,60,50,40,30Hz and 33/16.7 explicitly
-PERIODS="8.333 10 13.333 16.667 20 25 33.333 50"
-BINS=8
-
-echo "Capturing $COUNT game UDP packets for $HOST ... PLAY NOW (move/contest)." >&2
+echo "Capturing $COUNT game UDP packets for $HOST ... PLAY NOW." >&2
 tcpdump -n -tt -c "$COUNT" -i br-lan \
     host "$HOST" and udp and not port 9999 and not port 1900 and not port 53 \
     2>/dev/null > "$RAW"
 
 LINES=$(wc -l < "$RAW" 2>/dev/null)
 echo "captured ${LINES:-0} packets" >&2
-if [ "${LINES:-0}" -lt 100 ]; then
-    echo "Too few. Need a live match with steady traffic. Aborting." >&2
+if [ "${LINES:-0}" -lt 200 ]; then
+    echo "Too few for stable statistics. Need a longer live capture. Aborting." >&2
     rm -f "$RAW"; exit 1
 fi
 
-awk -v HOST="$HOST" -v PERIODS="$PERIODS" -v BINS="$BINS" '
+awk -v HOST="$HOST" '
 function islocal(ip){ return (ip ~ /^192\.168\./ || ip ~ /^239\./ || ip ~ /^224\./ || ip ~ /^255\./) }
+function analyse(name, n, g,    i,mean,sd,ss,mn,mx,half,a1,a2,m1,m2,s1,s2,lag,ac,acsum,acden,acmean,k,bb,modes,prevdir,curdir,peakreport) {
+    if (n < 30){ print "  ["name"] too few samples ("n")"; return }
+    # --- basic moments of inter-arrival gaps (ms) ---
+    mean=0; for(i=1;i<=n;i++) mean+=g[i]; mean/=n
+    ss=0; mn=1e9; mx=-1e9
+    for(i=1;i<=n;i++){ d=g[i]-mean; ss+=d*d; if(g[i]<mn)mn=g[i]; if(g[i]>mx)mx=g[i] }
+    sd=sqrt(ss/n)
+    printf "\n  === %s inter-arrival (ms) ===\n", name
+    printf "    n=%d  mean=%.2f  sd=%.2f  cv=%.2f  min=%.2f  max=%.2f\n", n, mean, sd, (mean>0?sd/mean:0), mn, mx
+
+    # --- 1. AUTOCORRELATION across lags 1..40 (no assumed period) ---
+    # acmean uses the gap series; report lags whose autocorr is a local peak > threshold
+    acmean=mean
+    acden=0; for(i=1;i<=n;i++){ d=g[i]-acmean; acden+=d*d }
+    if(acden<=0){ print "    autocorr: degenerate (no variance)"; }
+    else {
+        printf "    autocorrelation (lag : r):  [peaks = hidden periodicity]\n"
+        prev=0; pprev=0
+        line="    "
+        for(lag=1; lag<=40; lag++){
+            acsum=0
+            for(i=1;i<=n-lag;i++){ acsum += (g[i]-acmean)*(g[i+lag]-acmean) }
+            r = acsum/acden
+            acf[lag]=r
+        }
+        # print compact, and flag local maxima above 0.15 (meaningful positive corr)
+        for(lag=1; lag<=40; lag++){
+            flag=""
+            if(lag>=2 && lag<=39 && acf[lag]>0.15 && acf[lag]>=acf[lag-1] && acf[lag]>=acf[lag+1]) flag=" <=PEAK"
+            if(acf[lag]>0.15 || flag!=""){
+                printf "      lag %2d : %+.2f%s\n", lag, acf[lag], flag
+            }
+        }
+        printf "    (a clear PEAK at lag L means the stream repeats every L packets;\n")
+        printf "     no peaks above +0.15 = no hidden periodic structure)\n")
+    }
+
+    # --- 2. MODALITY of gap distribution (histogram in fixed ms buckets) ---
+    printf "    gap distribution (2ms buckets):\n"
+    for(i=0;i<60;i++) h[i]=0
+    for(i=1;i<=n;i++){ bb=int(g[i]/2); if(bb<0)bb=0; if(bb>59)bb=59; h[bb]++ }
+    maxh=0; for(i=0;i<60;i++) if(h[i]>maxh)maxh=h[i]
+    modes=0
+    for(i=0;i<60;i++){
+        if(h[i]>0){
+            barlen=int(h[i]*30/maxh); bar=""; k=barlen; while(k-->0)bar=bar"#"
+            # local-maximum mode count (bucket higher than both neighbours, and >5% of peak)
+            ismode=""
+            lo=(i>0)?h[i-1]:0; hi=(i<59)?h[i+1]:0
+            if(h[i]>=lo && h[i]>=hi && h[i]>maxh*0.10 && h[i]>=3){ modes++; ismode=" *mode*" }
+            printf "      %2d-%2dms |%-30s %d%s\n", i*2, i*2+1, bar, h[i], ismode
+        }
+    }
+    printf "    -> %d mode(s) detected.  1 mode = single-state process; 2+ = distinct states.\n", modes
+
+    # --- 3. STATIONARITY: split halves, compare mean & sd ---
+    half=int(n/2)
+    m1=0; for(i=1;i<=half;i++) m1+=g[i]; m1/=half
+    m2=0; for(i=half+1;i<=n;i++) m2+=g[i]; m2/=(n-half)
+    s1=0; for(i=1;i<=half;i++){d=g[i]-m1;s1+=d*d} s1=sqrt(s1/half)
+    s2=0; for(i=half+1;i<=n;i++){d=g[i]-m2;s2+=d*d} s2=sqrt(s2/(n-half))
+    printf "    stationarity: 1st half mean=%.2f sd=%.2f | 2nd half mean=%.2f sd=%.2f\n", m1,s1,m2,s2
+    dm = m1-m2; if(dm<0)dm=-dm
+    printf "      mean drift = %.2f ms -> %s\n", dm, (dm > mean*0.15 ? "NON-stationary (process drifted)" : "stationary (stable process)")
+}
 {
     t=$1+0; src=$3; dst=$5; sub(/:$/,"",dst)
     split(src,sa,"."); si=sa[1]"."sa[2]"."sa[3]"."sa[4]
     split(dst,da,"."); di=da[1]"."da[2]"."da[3]"."da[4]
-    if (si==HOST){dir="OUT";o=di} else if(di==HOST){dir="IN";o=si} else next
+    if (si==HOST){d="OUT";o=di} else if(di==HOST){d="IN";o=si} else next
     if (islocal(o)) next
-    if (dir=="OUT"){
-        no++; outt[no]=t; lastout=t
-    } else if (lastout>0){
-        rd=(t-lastout)*1000
-        if (rd>=0 && rd<200){ rc++; rtime[rc]=lastout; rdelay[rc]=rd }   # pair: this OUT -> response delay
+    if (d=="OUT"){
+        if(lo>0){ og[++on]=(t-lo)*1000 } lo=t
+    } else {
+        if(li>0){ ig[++inn]=(t-li)*1000 } li=t
     }
 }
 END{
-    if (rc < 60){ print "  too few OUT->IN pairs ("rc") to analyse phase. Need more play."; exit }
-    np=split(PERIODS, P, " ")
-    printf "\n  analysed %d response-paired packets\n", rc
-    printf "  testing %d candidate tick periods, %d phase bins each\n\n", np, BINS
-
-    bestP=0; bestSpread=-1; bestFastBin=-1; bestFastVal=0; bestSlowVal=0
-    for (p=1; p<=np; p++){
-        per = P[p]+0
-        # reset bins
-        for (b=0;b<BINS;b++){ sum[b]=0; cnt[b]=0 }
-        for (i=1;i<=rc;i++){
-            tm = rtime[i]*1000.0                 # ms
-            n = int(tm/per); ph = tm - n*per     # phase within tick, 0..per (manual fmod)
-            b = int((ph/per)*BINS); if(b>=BINS)b=BINS-1; if(b<0)b=0
-            sum[b]+=rdelay[i]; cnt[b]++
-        }
-        # per-bin means, find min/max bin mean = spread (how much phase matters)
-        mn=1e9; mx=-1e9; fastb=-1
-        valid=1
-        for (b=0;b<BINS;b++){
-            if (cnt[b]<3){ valid=0 }   # need enough samples per bin
-            m = (cnt[b]>0)? sum[b]/cnt[b] : 0
-            mean[b]=m
-            if (cnt[b]>0 && m<mn){ mn=m; fastb=b }
-            if (cnt[b]>0 && m>mx){ mx=m }
-        }
-        spread = mx-mn
-        printf "  period %6.3f ms (%5.1f Hz):  response-delay spread across phase = %.2f ms", per, 1000/per, spread
-        if (!valid) printf "  (sparse bins)"
-        printf "\n"
-        if (valid && spread>bestSpread){ bestSpread=spread; bestP=per; bestFastBin=fastb; bestFastVal=mn; bestSlowVal=mx }
-    }
-
+    # cap gaps at 500ms to drop pauses (still interpretation-free: just outlier trim)
+    j=0; for(i=1;i<=on;i++) if(og[i]>=0 && og[i]<500){ ogc[++j]=og[i] } onc=j
+    j=0; for(i=1;i<=inn;i++) if(ig[i]>=0 && ig[i]<500){ igc[++j]=ig[i] } inc=j
+    analyse("OUTBOUND", onc, ogc)
+    analyse("INBOUND",  inc, igc)
     print ""
-    if (bestP==0){ print "  No period had well-populated bins. Capture more packets and retry."; exit }
-
-    printf "  STRONGEST phase dependence: period %.3f ms (%.1f Hz), spread %.2f ms\n", bestP, 1000/bestP, bestSpread
-    print ""
-    # show the winning periods per-phase profile
-    per=bestP
-    for (b=0;b<BINS;b++){ sum[b]=0; cnt[b]=0 }
-    for (i=1;i<=rc;i++){
-        tm=rtime[i]*1000.0; n=int(tm/per); ph=tm-n*per
-        b=int((ph/per)*BINS); if(b>=BINS)b=BINS-1; if(b<0)b=0
-        sum[b]+=rdelay[i]; cnt[b]++
-    }
-    print "  per-phase response delay at this period:"
-    for (b=0;b<BINS;b++){
-        m=(cnt[b]>0)?sum[b]/cnt[b]:0
-        bar=""; k=int(m); while(k-->0 && length(bar)<40) bar=bar"#"
-        tag=""; if(b==bestFastBin) tag=" <= FAST phase (fold target)"
-        printf "   phase %d/%d | %-40s %.1fms (n=%d)%s\n", b, BINS, bar, m, cnt[b], tag
-    }
-    print ""
-    print "  READING:"
-    printf "   spread = %.2f ms.\n", bestSpread
-    print "   - spread LARGE (say > 8ms) and one period clearly wins -> phase PREDICTS"
-    print "     outcome. Folding is justified: target the FAST phase bin above."
-    print "   - spread SMALL (< ~4ms) or similar at all periods -> phase does NOT"
-    print "     predict outcome. A per-packet pacer would NOT help. Stop here."
-    print ""
-    print "  Run this 2-3 times. A real tick reproduces the SAME winning period and"
-    print "  fast phase. If the winner jumps around each run, it is noise, not a tick."
+    print "  All three diagnostics are interpretation-free: they describe the"
+    print "  STRUCTURE of the timing process, not the meaning of any packet."
+    print "  Run 2-3x: real structure reproduces; noise does not."
 }
 ' "$RAW"
 rm -f "$RAW"
