@@ -1,82 +1,58 @@
 #!/bin/sh
-# burst-pace.sh -- enforce a minimum gap between OUTBOUND game packets, to smooth
-# the back-to-back bursts the stream-stats probe found (outbound was bimodal:
-# a ~33ms main mode + a ~0ms back-to-back mode). This paces the flow so packets
-# can't depart closer than MIN_GAP_MS apart, collapsing the 0ms mode into the
-# main one -- WITHOUT adding latency to already-spaced packets.
-#
-# Mechanism: tbf (token bucket filter) on just the console game flow, sized so
-# its rate = 1 packet per MIN_GAP_MS. tbf releases tokens at a steady rate, so
-# a back-to-back pair gets its 2nd packet held just until the next token --
-# exactly a minimum-gap pacer. A burst of 1 (the normal case) passes instantly.
-#
-# HONEST CAVEAT: if those back-to-back packets are intentionally-paired game
-# state, pacing them could HURT. The data says the bimodality is real; only PLAY
-# says whether smoothing it helps. Judge by feel. Reverts cleanly on Ctrl-C.
-#
-# Touches ONLY console game UDP (src 192.168.10.50 port 3659) on eth1 egress.
-#
-# Usage:
-#   sh burst-pace.sh           # MIN_GAP_MS=10 (breaks up <10ms back-to-backs)
-#   sh burst-pace.sh 8         # custom minimum gap in ms
-#
-# survive SSH disconnect: setsid sh burst-pace.sh &
 
 WAN_DEV="eth1"
 HOST="192.168.10.50"
 CONSOLE_PORT="3659"
-MIN_GAP_MS="${1:-10}"
 
-# typical game packet ~ 60-150 bytes; size the bucket for ~1 pkt per gap.
-# rate = 1 packet / MIN_GAP_MS. Use a representative packet size for the math.
+# Safer: do NOT try 10ms first.
+# 2-3ms is enough to break true 0ms clumps without destroying handshake bursts.
+MIN_GAP_MS="${1:-3}"
+
 PKT_BYTES=150
-# bits per second to allow 1 pkt of PKT_BYTES every MIN_GAP_MS:
-#   rate_bps = PKT_BYTES*8 * (1000/MIN_GAP_MS)
 RATE_BPS=$(( PKT_BYTES * 8 * 1000 / MIN_GAP_MS ))
-# burst = 1 packet (so 2nd back-to-back packet must wait for next token)
-BURST_BYTES="$PKT_BYTES"
-# small latency cap so held packets don't queue forever (drop if absurdly late)
-TBF_LATENCY_MS=$(( MIN_GAP_MS * 4 ))
+
+# Critical fix: allow at least one full packet/MTU through.
+BURST_BYTES=1600
+
+# Critical fix: don't drop login/checking bursts immediately.
+TBF_LATENCY_MS=250
 
 cleanup() {
-    echo >&2
-    echo "tearing down pacer on $WAN_DEV ..." >&2
+    echo "tearing down pacer..."
     tc qdisc del dev "$WAN_DEV" root 2>/dev/null
-    echo "done. $WAN_DEV restored to default (game traffic no longer paced)." >&2
+    echo "done."
 }
-trap 'cleanup; exit 0' INT TERM
+trap 'cleanup; exit 0' INT TERM EXIT
 
-echo "min-gap pacer: >= ${MIN_GAP_MS}ms between outbound game packets" >&2
-echo "  (rate ~${RATE_BPS}bps, burst ${BURST_BYTES}B, on src ${HOST}:${CONSOLE_PORT})" >&2
+echo "SAFE pacer active: MIN_GAP=${MIN_GAP_MS}ms rate=${RATE_BPS}bit burst=${BURST_BYTES} latency=${TBF_LATENCY_MS}ms"
 
-# prio root: band 1:2 gets the paced flow (tbf), everything else passes untouched
 tc qdisc del dev "$WAN_DEV" root 2>/dev/null
-tc qdisc add dev "$WAN_DEV" root handle 1: prio bands 3 || { echo "prio add failed"; exit 1; }
+tc qdisc add dev "$WAN_DEV" root handle 1: prio bands 3 || exit 1
 
-# tbf on the game band -> enforces minimum spacing
-if ! tc qdisc add dev "$WAN_DEV" parent 1:2 handle 20: tbf \
-        rate "${RATE_BPS}bit" burst "${BURST_BYTES}" latency "${TBF_LATENCY_MS}ms" 2>/dev/null; then
-    echo "tbf add failed (kmod-sched-tbf missing? try: apk add kmod-sched-tbf)" >&2
-    cleanup; exit 1
-fi
+tc qdisc add dev "$WAN_DEV" parent 1:2 handle 20: tbf \
+    rate "${RATE_BPS}bit" \
+    burst "${BURST_BYTES}" \
+    latency "${TBF_LATENCY_MS}ms" || {
+        echo "tbf failed"
+        cleanup
+        exit 1
+    }
 
-# other bands: plain fifo, untouched
 tc qdisc add dev "$WAN_DEV" parent 1:1 handle 10: pfifo 2>/dev/null
 tc qdisc add dev "$WAN_DEV" parent 1:3 handle 30: pfifo 2>/dev/null
 
-# filter: console game UDP -> paced band 1:2
 tc filter add dev "$WAN_DEV" parent 1: protocol ip prio 1 u32 \
-    match ip src "${HOST}/32" match ip sport "$CONSOLE_PORT" 0xffff flowid 1:2 \
-    || { echo "filter add failed"; cleanup; exit 1; }
+    match ip src "${HOST}/32" \
+    match ip sport "$CONSOLE_PORT" 0xffff \
+    flowid 1:2 || {
+        echo "filter failed"
+        cleanup
+        exit 1
+    }
 
-echo "PACER ACTIVE. Play and judge by feel." >&2
-echo "  better/neutral -> the back-to-back bursts were incidental; you smoothed them." >&2
-echo "  worse          -> they were intentional pairs; Ctrl-C to revert and we rethink." >&2
-echo "Ctrl-C to stop." >&2
+echo "Play now. Ctrl-C to revert."
 
-# hold; periodically show how many game packets are getting paced (queue/sent)
 while true; do
-    sleep 30
-    STATS="$(tc -s qdisc show dev "$WAN_DEV" 2>/dev/null | awk '/qdisc tbf 20:/{f=1} f&&/Sent/{print "  paced flow: "$0; f=0}')"
-    [ -n "$STATS" ] && echo "$STATS" >&2
+    sleep 10
+    tc -s qdisc show dev "$WAN_DEV" | awk '/qdisc tbf 20:/{f=1} f&&/Sent/{print; f=0}'
 done
