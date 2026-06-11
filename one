@@ -1,17 +1,13 @@
 #!/bin/sh
-# stream-stats.sh -- interpretation-free time-series diagnostics on the game
-# packet stream. NO claims about what any packet "means". Operates on timestamps
-# (and raw byte counts as a bare scalar) only. Reports STRUCTURE, not stories.
+# stream-stats.sh -- interpretation-free time-series diagnostics (v2).
+# v1 crashed on busybox awk (user-defined function with many locals). v2 has NO
+# user functions -- straight-line code, globals only, busybox-safe.
 #
-# Three standard diagnostics, each assumption-free:
-#   1. AUTOCORRELATION of inter-arrival times -- reveals hidden periodicity at
-#      whatever lag it actually exists (does NOT assume a tick period).
-#   2. INTER-ARRIVAL DISTRIBUTION + modality -- how many modes the gap
-#      distribution has (1 = single-state process; 2+ = distinct states).
-#   3. STATIONARITY -- split capture in halves, compare; did the process drift?
-#
-# Computed per direction (OUT = console->server, IN = server->console) since
-# they are different processes.
+# On timestamps only (no packet "meaning"):
+#   1. AUTOCORRELATION of inter-arrival gaps -> hidden periodicity (no assumed period)
+#   2. MODALITY of the gap distribution -> single-state vs multi-state process
+#   3. STATIONARITY -> did the process drift across the capture
+# Done for OUT (console->server) and IN (server->console) separately.
 #
 # Usage: sh stream-stats.sh [packet_count]   (default 1500)
 
@@ -27,99 +23,97 @@ tcpdump -n -tt -c "$COUNT" -i br-lan \
 LINES=$(wc -l < "$RAW" 2>/dev/null)
 echo "captured ${LINES:-0} packets" >&2
 if [ "${LINES:-0}" -lt 200 ]; then
-    echo "Too few for stable statistics. Need a longer live capture. Aborting." >&2
+    echo "Too few for stable statistics. Aborting." >&2
     rm -f "$RAW"; exit 1
 fi
 
+# Split gaps into two files (OUT, IN) with plain awk, then analyse each with a
+# second awk that has NO functions. Keeps every awk program busybox-simple.
 awk -v HOST="$HOST" '
-function islocal(ip){ return (ip ~ /^192\.168\./ || ip ~ /^239\./ || ip ~ /^224\./ || ip ~ /^255\./) }
-function analyse(name, n, g,    i,mean,sd,ss,mn,mx,half,a1,a2,m1,m2,s1,s2,lag,ac,acsum,acden,acmean,k,bb,modes,prevdir,curdir,peakreport) {
-    if (n < 30){ print "  ["name"] too few samples ("n")"; return }
-    # --- basic moments of inter-arrival gaps (ms) ---
-    mean=0; for(i=1;i<=n;i++) mean+=g[i]; mean/=n
-    ss=0; mn=1e9; mx=-1e9
-    for(i=1;i<=n;i++){ d=g[i]-mean; ss+=d*d; if(g[i]<mn)mn=g[i]; if(g[i]>mx)mx=g[i] }
-    sd=sqrt(ss/n)
-    printf "\n  === %s inter-arrival (ms) ===\n", name
-    printf "    n=%d  mean=%.2f  sd=%.2f  cv=%.2f  min=%.2f  max=%.2f\n", n, mean, sd, (mean>0?sd/mean:0), mn, mx
-
-    # --- 1. AUTOCORRELATION across lags 1..40 (no assumed period) ---
-    # acmean uses the gap series; report lags whose autocorr is a local peak > threshold
-    acmean=mean
-    acden=0; for(i=1;i<=n;i++){ d=g[i]-acmean; acden+=d*d }
-    if(acden<=0){ print "    autocorr: degenerate (no variance)"; }
-    else {
-        printf "    autocorrelation (lag : r):  [peaks = hidden periodicity]\n"
-        prev=0; pprev=0
-        line="    "
-        for(lag=1; lag<=40; lag++){
-            acsum=0
-            for(i=1;i<=n-lag;i++){ acsum += (g[i]-acmean)*(g[i+lag]-acmean) }
-            r = acsum/acden
-            acf[lag]=r
-        }
-        # print compact, and flag local maxima above 0.15 (meaningful positive corr)
-        for(lag=1; lag<=40; lag++){
-            flag=""
-            if(lag>=2 && lag<=39 && acf[lag]>0.15 && acf[lag]>=acf[lag-1] && acf[lag]>=acf[lag+1]) flag=" <=PEAK"
-            if(acf[lag]>0.15 || flag!=""){
-                printf "      lag %2d : %+.2f%s\n", lag, acf[lag], flag
-            }
-        }
-        printf "    (a clear PEAK at lag L means the stream repeats every L packets;\n")
-        printf "     no peaks above +0.15 = no hidden periodic structure)\n")
-    }
-
-    # --- 2. MODALITY of gap distribution (histogram in fixed ms buckets) ---
-    printf "    gap distribution (2ms buckets):\n"
-    for(i=0;i<60;i++) h[i]=0
-    for(i=1;i<=n;i++){ bb=int(g[i]/2); if(bb<0)bb=0; if(bb>59)bb=59; h[bb]++ }
-    maxh=0; for(i=0;i<60;i++) if(h[i]>maxh)maxh=h[i]
-    modes=0
-    for(i=0;i<60;i++){
-        if(h[i]>0){
-            barlen=int(h[i]*30/maxh); bar=""; k=barlen; while(k-->0)bar=bar"#"
-            # local-maximum mode count (bucket higher than both neighbours, and >5% of peak)
-            ismode=""
-            lo=(i>0)?h[i-1]:0; hi=(i<59)?h[i+1]:0
-            if(h[i]>=lo && h[i]>=hi && h[i]>maxh*0.10 && h[i]>=3){ modes++; ismode=" *mode*" }
-            printf "      %2d-%2dms |%-30s %d%s\n", i*2, i*2+1, bar, h[i], ismode
-        }
-    }
-    printf "    -> %d mode(s) detected.  1 mode = single-state process; 2+ = distinct states.\n", modes
-
-    # --- 3. STATIONARITY: split halves, compare mean & sd ---
-    half=int(n/2)
-    m1=0; for(i=1;i<=half;i++) m1+=g[i]; m1/=half
-    m2=0; for(i=half+1;i<=n;i++) m2+=g[i]; m2/=(n-half)
-    s1=0; for(i=1;i<=half;i++){d=g[i]-m1;s1+=d*d} s1=sqrt(s1/half)
-    s2=0; for(i=half+1;i<=n;i++){d=g[i]-m2;s2+=d*d} s2=sqrt(s2/(n-half))
-    printf "    stationarity: 1st half mean=%.2f sd=%.2f | 2nd half mean=%.2f sd=%.2f\n", m1,s1,m2,s2
-    dm = m1-m2; if(dm<0)dm=-dm
-    printf "      mean drift = %.2f ms -> %s\n", dm, (dm > mean*0.15 ? "NON-stationary (process drifted)" : "stationary (stable process)")
-}
 {
     t=$1+0; src=$3; dst=$5; sub(/:$/,"",dst)
     split(src,sa,"."); si=sa[1]"."sa[2]"."sa[3]"."sa[4]
     split(dst,da,"."); di=da[1]"."da[2]"."da[3]"."da[4]
-    if (si==HOST){d="OUT";o=di} else if(di==HOST){d="IN";o=si} else next
-    if (islocal(o)) next
-    if (d=="OUT"){
-        if(lo>0){ og[++on]=(t-lo)*1000 } lo=t
-    } else {
-        if(li>0){ ig[++inn]=(t-li)*1000 } li=t
+    isl = (di ~ /^192\.168\./ || di ~ /^239\./ || di ~ /^224\./ || di ~ /^255\./ || si ~ /^192\.168\./ || si ~ /^239\./ || si ~ /^224\./ || si ~ /^255\./)
+    if (si==HOST){
+        if (di ~ /^192\.168\./ || di ~ /^239\./ || di ~ /^224\./ || di ~ /^255\./) next
+        if (lo>0){ g=(t-lo)*1000; if(g>=0 && g<500) print g > "/tmp/ss-out-'$$'.txt" }
+        lo=t
+    } else if (di==HOST){
+        if (si ~ /^192\.168\./ || si ~ /^239\./ || si ~ /^224\./ || si ~ /^255\./) next
+        if (li>0){ g=(t-li)*1000; if(g>=0 && g<500) print g > "/tmp/ss-in-'$$'.txt" }
+        li=t
     }
 }
-END{
-    # cap gaps at 500ms to drop pauses (still interpretation-free: just outlier trim)
-    j=0; for(i=1;i<=on;i++) if(og[i]>=0 && og[i]<500){ ogc[++j]=og[i] } onc=j
-    j=0; for(i=1;i<=inn;i++) if(ig[i]>=0 && ig[i]<500){ igc[++j]=ig[i] } inc=j
-    analyse("OUTBOUND", onc, ogc)
-    analyse("INBOUND",  inc, igc)
-    print ""
-    print "  All three diagnostics are interpretation-free: they describe the"
-    print "  STRUCTURE of the timing process, not the meaning of any packet."
-    print "  Run 2-3x: real structure reproduces; noise does not."
-}
 ' "$RAW"
-rm -f "$RAW"
+
+# analysis pass -- NO functions, runs once per direction file
+analyse_file() {
+    NAME="$1"; F="$2"
+    [ -s "$F" ] || { echo "  [$NAME] no samples"; return; }
+    awk -v NAME="$NAME" '
+    { n++; x[n]=$1+0; sum+=$1 }
+    END{
+        if(n<30){ printf "  [%s] too few (%d)\n", NAME, n; exit }
+        mean=sum/n
+        ss=0; mn=1e9; mx=-1e9
+        for(i=1;i<=n;i++){ d=x[i]-mean; ss+=d*d; if(x[i]<mn)mn=x[i]; if(x[i]>mx)mx=x[i] }
+        sd=sqrt(ss/n)
+        printf "\n  === %s inter-arrival (ms) ===\n", NAME
+        printf "    n=%d mean=%.2f sd=%.2f cv=%.2f min=%.2f max=%.2f\n", n,mean,sd,(mean>0?sd/mean:0),mn,mx
+
+        # 1. autocorrelation lags 1..40
+        acden=0; for(i=1;i<=n;i++){ d=x[i]-mean; acden+=d*d }
+        if(acden<=0){ print "    autocorr: no variance"; }
+        else {
+            print "    autocorrelation peaks (r>0.15):"
+            anypk=0
+            for(lag=1;lag<=40;lag++){
+                s=0; for(i=1;i<=n-lag;i++){ s+=(x[i]-mean)*(x[i+lag]-mean) }
+                r[lag]=s/acden
+            }
+            for(lag=2;lag<=39;lag++){
+                if(r[lag]>0.15 && r[lag]>=r[lag-1] && r[lag]>=r[lag+1]){
+                    printf "      lag %2d : %+.2f  <= PEAK\n", lag, r[lag]; anypk=1
+                }
+            }
+            if(!anypk) print "      (none -- no hidden periodic structure)"
+        }
+
+        # 2. modality (2ms buckets)
+        for(i=0;i<60;i++) h[i]=0
+        for(i=1;i<=n;i++){ b=int(x[i]/2); if(b<0)b=0; if(b>59)b=59; h[b]++ }
+        maxh=0; for(i=0;i<60;i++) if(h[i]>maxh)maxh=h[i]
+        modes=0
+        for(i=0;i<60;i++){
+            if(h[i]>maxh*0.10 && h[i]>=3){
+                lo2=(i>0)?h[i-1]:0; hi2=(i<59)?h[i+1]:0
+                if(h[i]>=lo2 && h[i]>=hi2) modes++
+            }
+        }
+        printf "    gap distribution modes: %d  (1=single-state, 2+=distinct states)\n", modes
+        # show the populated buckets compactly
+        for(i=0;i<60;i++){
+            if(h[i]>0){
+                bl=int(h[i]*24/maxh); bar=""; k=bl; while(k-->0)bar=bar"#"
+                printf "      %2d-%2dms |%-24s %d\n", i*2,i*2+1,bar,h[i]
+            }
+        }
+
+        # 3. stationarity
+        half=int(n/2)
+        m1=0; for(i=1;i<=half;i++) m1+=x[i]; m1/=half
+        m2=0; for(i=half+1;i<=n;i++) m2+=x[i]; m2/=(n-half)
+        dm=m1-m2; if(dm<0)dm=-dm
+        printf "    stationarity: 1st-half mean=%.2f  2nd-half mean=%.2f  drift=%.2f -> %s\n", \
+            m1,m2,dm,(dm>mean*0.15?"NON-stationary":"stationary")
+    }' "$F"
+}
+
+analyse_file "OUTBOUND" "/tmp/ss-out-$$.txt"
+analyse_file "INBOUND"  "/tmp/ss-in-$$.txt"
+
+echo
+echo "  interpretation-free: structure of the timing process, not packet meaning."
+echo "  run 2-3x; real structure reproduces, noise does not."
+rm -f "$RAW" "/tmp/ss-out-$$.txt" "/tmp/ss-in-$$.txt"
