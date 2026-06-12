@@ -1,58 +1,92 @@
 #!/bin/sh
+# sensor-scan.sh -- READ-ONLY scan of REAL OpenWrt/Protectli sensors we have NOT
+# leveraged. One run reads all five, each with the hypothesis it tests and the
+# feedback that confirms/kills it. Changes nothing. This is the loop: concrete
+# sensors -> falsifiable hypotheses -> data you act/feed back on.
+#
+# Run during a LIVE match for the traffic-dependent sensors (1,2,3).
+# Usage: sh sensor-scan.sh
 
-WAN_DEV="eth1"
 HOST="192.168.10.50"
-CONSOLE_PORT="3659"
+GAMEPORT="3659"
+WAN="eth1"
+LINE="------------------------------------------------------------"
+say(){ echo; echo "$LINE"; echo "== $1"; echo "$LINE"; }
 
-# Safer: do NOT try 10ms first.
-# 2-3ms is enough to break true 0ms clumps without destroying handshake bursts.
-MIN_GAP_MS="${1:-3}"
+echo "sensor-scan: reading 5 unleveraged sensors. PLAY a match for 1-3." >&2
 
-PKT_BYTES=150
-RATE_BPS=$(( PKT_BYTES * 8 * 1000 / MIN_GAP_MS ))
+# ---------------------------------------------------------------
+say "SENSOR 1 -- DSCP / ToS on game packets  (are we erasing a priority signal?)"
+echo "HYP: game marks its UDP priority (EF/CS4); config may be washing it off."
+echo "READ: tos byte on outbound game packets, captured at br-lan (console side)."
+echo "      0x0 = unmarked. 0xb8=EF. 0x80=CS4. 0x88=AF41. nonzero = real mark."
+echo
+tcpdump -n -v -c 20 -i br-lan host "$HOST" and udp and not port 9999 and not port 1900 and not port 53 2>/dev/null \
+  | grep -o 'tos 0x[0-9a-fA-F]*' | sort | uniq -c | sed 's/^/   /'
+echo
+echo "   ^ if all 'tos 0x0' -> game does NOT mark (or it's already stripped upstream)."
+echo "     if you see e.g. 'tos 0xb8' -> there IS a priority signal to preserve/restore."
+echo "   FEEDBACK NEEDED: which tos value(s) appear above?"
 
-# Critical fix: allow at least one full packet/MTU through.
-BURST_BYTES=1600
+# ---------------------------------------------------------------
+say "SENSOR 1b -- does the mark SURVIVE the router? (egress side)"
+echo "Compare: same packets leaving on $WAN. If marked at br-lan but 0x0 here,"
+echo "the router is WASHING the DSCP (qosmate WASHDSCPUP=1 does exactly this)."
+echo
+tcpdump -n -v -c 20 -i "$WAN" host "$HOST" and udp and not port 9999 and not port 1900 and not port 53 2>/dev/null \
+  | grep -o 'tos 0x[0-9a-fA-F]*' | sort | uniq -c | sed 's/^/   /'
+echo
+echo "   FEEDBACK NEEDED: do the tos values here match SENSOR 1? (same=preserved, 0x0=washed)"
 
-# Critical fix: don't drop login/checking bursts immediately.
-TBF_LATENCY_MS=250
+# ---------------------------------------------------------------
+say "SENSOR 2 -- conntrack flow state  (kernel's live view of the game flow)"
+echo "HYP: kernel-tracked flow rate/state reveals contention we can't see per-packet."
+if command -v conntrack >/dev/null 2>&1; then
+    conntrack -L -p udp 2>/dev/null | grep "$GAMEPORT" | head -8 | sed 's/^/   /'
+    echo "   (if empty: flow not active, or conntrack not tracking it. Play during run.)"
+else
+    echo "   conntrack tool not installed. Fallback -- raw table:"
+    grep "$GAMEPORT" /proc/net/nf_conntrack 2>/dev/null | head -8 | sed 's/^/   /'
+    echo "   (install for nicer output: apk add conntrack-tools)"
+fi
+echo "   FEEDBACK: does a udp flow to/from :$GAMEPORT show, with packet/byte counts?"
 
-cleanup() {
-    echo "tearing down pacer..."
-    tc qdisc del dev "$WAN_DEV" root 2>/dev/null
-    echo "done."
-}
-trap 'cleanup; exit 0' INT TERM EXIT
+# ---------------------------------------------------------------
+say "SENSOR 3 -- qdisc backlog on $WAN  (is YOUR egress ever non-empty?)"
+echo "HYP: feel degrades when YOUR egress queues -- only happens under real load."
+echo "Read it once now; read AGAIN while the line is loaded (teammate downloading,"
+echo "or run a big upload from a LAN box) and compare 'backlog'."
+echo
+tc -s qdisc show dev "$WAN" 2>/dev/null | sed 's/^/   /'
+echo
+echo "   FEEDBACK: does 'backlog' ever go above 0b under load? (0 always = not a local queue problem)"
 
-echo "SAFE pacer active: MIN_GAP=${MIN_GAP_MS}ms rate=${RATE_BPS}bit burst=${BURST_BYTES} latency=${TBF_LATENCY_MS}ms"
+# ---------------------------------------------------------------
+say "SENSOR 4 -- NIC interrupt coalescing  (is the OUTBOUND BURST a hardware artifact?)"
+echo "HYP: the ~0ms back-to-back bursts we measured come from NIC batching, not the game."
+if command -v ethtool >/dev/null 2>&1; then
+    echo "   coalescing settings ($WAN):"
+    ethtool -c "$WAN" 2>/dev/null | grep -iE 'rx-usecs|tx-usecs|rx-frames|tx-frames|adaptive' | sed 's/^/     /'
+    echo "   relevant NIC stats:"
+    ethtool -S "$WAN" 2>/dev/null | grep -iE 'tx_packets|tx_bytes|coalesc|irq|tx_queue' | head -10 | sed 's/^/     /'
+else
+    echo "   ethtool not installed. install: apk add ethtool"
+fi
+echo "   FEEDBACK: are rx/tx-usecs > 0 (coalescing ON)? If so, disabling it may"
+echo "   shrink the outbound burst -- a HARDWARE fix, not a game-timing one."
 
-tc qdisc del dev "$WAN_DEV" root 2>/dev/null
-tc qdisc add dev "$WAN_DEV" root handle 1: prio bands 3 || exit 1
+# ---------------------------------------------------------------
+say "SENSOR 5 -- softirq / CPU timing  (is packet jitter from CPU scheduling?)"
+echo "HYP: lower-probability -- timing jitter from softirq handling, not network."
+echo "   NET_RX / NET_TX softirq counts per CPU (watch for imbalance):"
+grep -E 'NET_RX|NET_TX' /proc/softirqs 2>/dev/null | sed 's/^/   /'
+echo "   load:"
+uptime 2>/dev/null | sed 's/^/   /'
+echo "   FEEDBACK: is one CPU handling almost all NET_RX/TX? (imbalance = possible jitter source)"
 
-tc qdisc add dev "$WAN_DEV" parent 1:2 handle 20: tbf \
-    rate "${RATE_BPS}bit" \
-    burst "${BURST_BYTES}" \
-    latency "${TBF_LATENCY_MS}ms" || {
-        echo "tbf failed"
-        cleanup
-        exit 1
-    }
-
-tc qdisc add dev "$WAN_DEV" parent 1:1 handle 10: pfifo 2>/dev/null
-tc qdisc add dev "$WAN_DEV" parent 1:3 handle 30: pfifo 2>/dev/null
-
-tc filter add dev "$WAN_DEV" parent 1: protocol ip prio 1 u32 \
-    match ip src "${HOST}/32" \
-    match ip sport "$CONSOLE_PORT" 0xffff \
-    flowid 1:2 || {
-        echo "filter failed"
-        cleanup
-        exit 1
-    }
-
-echo "Play now. Ctrl-C to revert."
-
-while true; do
-    sleep 10
-    tc -s qdisc show dev "$WAN_DEV" | awk '/qdisc tbf 20:/{f=1} f&&/Sent/{print; f=0}'
-done
+echo
+echo "$LINE"
+echo "PRIORITY ORDER for feedback: Sensor 1/1b first (DSCP -- the signal we may be"
+echo "erasing), then Sensor 4 (NIC burst cause). Those two are highest reward."
+echo "Tell me what 1, 1b, and 4 show and I make the next concrete decision."
+echo "$LINE"
