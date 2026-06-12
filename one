@@ -1,47 +1,49 @@
 #!/bin/sh
-# arb-probe.sh -- multi-flow ARBITRATION ordering probe.
-# You have several simultaneous peer flows (conntrack showed ~6 dst IPs, all
-# sport 3659). This measures how those flows are ORDERED AGAINST EACH OTHER at
-# egress -- not each flow's cadence (done already), but the dequeue race:
-# during sparse contest windows, does the scheduler treat them fairly, or does
-# one peer consistently win/lose the "who leaves first" decision?
+# arb-probe.sh (v2) -- multi-flow ARBITRATION ordering probe. HANG-PROOF.
+# v1 hung waiting for packets. v2 captures with a hard wall-clock cap using a
+# background tcpdump + kill, writes to a file, then analyses. It ALWAYS stops.
 #
-# Interpretation-free. Captures on eth1 (the egress / post-scheduler point),
-# groups packets by destination peer, and measures:
-#   1. PER-PEER share -- packet count per peer (gross fairness)
-#   2. INTERLEAVING -- at "burst instants" (>=2 game packets within WINDOW ms),
-#      which peer's packet leaves FIRST? tallied per peer. A fair scheduler
-#      spreads first-out roughly evenly; a biased one favors/starves a peer.
-#   3. ADJACENCY -- how often the SAME peer's packets go back-to-back vs peers
-#      alternate. High self-adjacency = bursty per-peer; high alternation =
-#      round-robin-like arbitration.
+# Measures how your simultaneous peer flows are ordered against each other at
+# egress (eth1, post-scheduler): per-peer share, who-leaves-first at contest
+# instants, and adjacency. Interpretation-free.
 #
-# This targets the one grounded NEW mechanism: inter-flow dequeue ordering under
-# simultaneous peers, which fq_codel decides even at zero backlog.
+# Usage:
+#   sh arb-probe.sh            # capture ~12s of egress game traffic, analyse
+#   sh arb-probe.sh 20         # capture for 20 seconds instead
 #
-# Run during a LIVE match. Usage: sh arb-probe.sh [packet_count]   (default 1500)
+# Run during a CONTESTED match (several peers active) for meaningful results.
 
 HOST="192.168.10.50"
 WAN="eth1"
-COUNT="${1:-1500}"
-WINDOW=3          # ms: packets within this gap = same "contest instant"
+SECS="${1:-12}"           # capture duration in seconds (NOT a packet count)
+WINDOW=3                  # ms: packets within this = same contest instant
 RAW="/tmp/arb-raw-$$.txt"
 
-echo "Capturing $COUNT egress game packets on $WAN ... PLAY a contested match." >&2
-if command -v timeout >/dev/null 2>&1; then
-    timeout 40 tcpdump -n -tt -c "$COUNT" -i "$WAN" \
-        host "$HOST" and udp and not port 9999 and not port 1900 and not port 53 \
-        2>/dev/null > "$RAW"
-else
-    tcpdump -n -tt -c "$COUNT" -i "$WAN" \
-        host "$HOST" and udp and not port 9999 and not port 1900 and not port 53 \
-        2>/dev/null > "$RAW"
-fi
+echo "Capturing ${SECS}s of egress game traffic on $WAN ... PLAY a contested match." >&2
+
+# background tcpdump, hard-kill after SECS no matter what. No packet count to wait on.
+tcpdump -n -tt -i "$WAN" \
+    host "$HOST" and udp and not port 9999 and not port 1900 and not port 53 \
+    2>/dev/null > "$RAW" &
+TPID=$!
+# countdown so it can't outlive SECS even if tcpdump ignores signals briefly
+i=0
+while [ "$i" -lt "$SECS" ]; do
+    sleep 1
+    kill -0 "$TPID" 2>/dev/null || break
+    i=$((i+1))
+done
+kill "$TPID" 2>/dev/null
+sleep 1
+kill -9 "$TPID" 2>/dev/null    # force if still alive
+wait "$TPID" 2>/dev/null
 
 LN=$(wc -l < "$RAW" 2>/dev/null)
-echo "captured ${LN:-0} packets" >&2
-if [ "${LN:-0}" -lt 100 ]; then
-    echo "Too few. Need a live match with multiple active peers. Aborting." >&2
+echo "captured ${LN:-0} packets in ${SECS}s" >&2
+if [ "${LN:-0}" -lt 40 ]; then
+    echo "Too few egress packets. Either not in an active match, or outbound peer" >&2
+    echo "traffic is sparse (itself a hint: peers rarely race -> little arbitration)." >&2
+    echo "Try a longer capture during heavy action: sh arb-probe.sh 25" >&2
     rm -f "$RAW"; exit 1
 fi
 
@@ -50,7 +52,6 @@ awk -v HOST="$HOST" -v WINDOW="$WINDOW" '
     t=$1+0; src=$3; dst=$5; sub(/:$/,"",dst)
     split(src,sa,"."); si=sa[1]"."sa[2]"."sa[3]"."sa[4]
     split(dst,da,"."); di=da[1]"."da[2]"."da[3]"."da[4]
-    # OUTBOUND only (console -> peer), egress ordering is what the scheduler decides
     if (si!=HOST) next
     if (di ~ /^192\.168\./ || di ~ /^239\./ || di ~ /^224\./ || di ~ /^255\./) next
     n++; T[n]=t; P[n]=di
@@ -58,32 +59,25 @@ awk -v HOST="$HOST" -v WINDOW="$WINDOW" '
     cnt[di]++
 }
 END{
-    if (n < 50){ print "  too few outbound game packets ("n")"; exit }
+    if (n < 30){ print "  too few outbound game packets ("n")"; exit }
     printf "\n  === %d outbound game packets across %d peers ===\n", n, np
 
-    # 1. per-peer share
-    print "\n  1. PER-PEER SHARE (gross fairness):"
+    print "\n  1. PER-PEER SHARE:"
     for (i=1;i<=np;i++){
         p=order[i]; pct=cnt[p]*100/n
         bar=""; k=int(pct/2); while(k-->0)bar=bar"#"
         printf "     %-16s |%-30s %d (%.1f%%)\n", p, bar, cnt[p], pct
     }
 
-    # 2. interleaving: at contest instants (gap to previous <= WINDOW), who is first out?
-    #    we tally, for each adjacent pair within WINDOW, which peer was earlier.
     print "\n  2. FIRST-OUT AT CONTEST INSTANTS (<= " WINDOW "ms apart):"
-    print "     (when two peer flows race, who leaves first? fair = even)"
     instants=0
     for (i=2;i<=n;i++){
         gap=(T[i]-T[i-1])*1000
-        if (gap>=0 && gap<=WINDOW && P[i]!=P[i-1]){
-            firstout[P[i-1]]++   # the earlier packet peer won the race
-            instants++
-        }
+        if (gap>=0 && gap<=WINDOW && P[i]!=P[i-1]){ firstout[P[i-1]]++; instants++ }
     }
     if (instants<5){
-        print "     (only "instants" contested instants -- peers rarely race; arbitration"
-        print "      is not heavily exercised. sparse-but-isolated, likely fine.)"
+        print "     only " instants " contested instants -- peers rarely race."
+        print "     arbitration barely exercised: sparse-but-isolated, likely fine."
     } else {
         for (i=1;i<=np;i++){
             p=order[i]; w=firstout[p]+0; pct=w*100/instants
@@ -91,24 +85,20 @@ END{
             printf "     %-16s |%-30s %d wins (%.1f%%)\n", p, bar, w, pct
         }
         printf "     total contested instants: %d\n", instants
-        print "     READING: shares near each peer traffic-share = FAIR scheduling."
-        print "     One peer winning FAR more/less than its share = arbitration bias."
+        print "     FAIR = each peer win-share ~ its traffic-share above."
+        print "     One peer winning FAR off its share = arbitration bias (a lever)."
     }
 
-    # 3. adjacency: same-peer back-to-back vs alternation
-    print "\n  3. ADJACENCY (per-peer bursting vs round-robin):"
+    print "\n  3. ADJACENCY:"
     same=0; diff=0
     for (i=2;i<=n;i++){ if(P[i]==P[i-1]) same++; else diff++ }
     tot=same+diff
     if (tot>0){
-        printf "     same-peer back-to-back: %d (%.1f%%)\n", same, same*100/tot
-        printf "     peer-alternation:       %d (%.1f%%)\n", diff, diff*100/tot
-        print  "     high alternation = round-robin-like arbitration;"
-        print  "     high back-to-back = each peer flushes in bursts."
+        printf "     same-peer back-to-back: %.1f%%   peer-alternation: %.1f%%\n", same*100/tot, diff*100/tot
+        print  "     high alternation = round-robin-like; high back-to-back = per-peer bursts."
     }
 
-    print "\n  All interpretation-free: counts of ordering decisions, no packet meaning."
-    print "  Run 2-3x: real arbitration bias reproduces; noise does not."
+    print "\n  interpretation-free: ordering counts only. run 2-3x; real bias reproduces."
 }
 ' "$RAW"
 rm -f "$RAW"
