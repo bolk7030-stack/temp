@@ -1,90 +1,82 @@
 #!/bin/sh
-# sensor-scan.sh (v2) -- READ-ONLY scan of real OpenWrt/Protectli sensors.
-# v1 HUNG because tcpdump piped to grep with no count/timeout waits forever.
-# v2 fix: every capture writes to a FILE with BOTH -c COUNT and a timeout
-# guard, then analyses the file. Can't hang, can't lose output.
+# game-dscp.sh -- impose a CONSISTENT priority mark on the game flow, replacing
+# the game's own flaky marking (the sensor scan saw CS3 on ~half the packets one
+# run, almost nothing the next -- not dependable). This stamps ALL the console's
+# game UDP with a reliable DSCP, then (optionally) prioritises it.
 #
-# Run during a LIVE match (sensors 1,1b,2,3 need traffic). Saves a log too.
-# Usage: sh sensor-scan.sh
+# Non-interfering: it does NOT delay or reorder anything. It only sets the DSCP
+# byte so downstream queues (and CAKE, if you enable it) can treat the flow as
+# priority. Zero added latency. Only matters under load -- but it's set-and-forget.
+#
+# HONEST SCOPE: only affects the SERVER-bound half. conntrack showed your game is
+# partly PEER-TO-PEER (residential dst IPs); those paths leave your control after
+# eth1 regardless. This marks everything consistently anyway -- can't hurt.
+#
+# Mark used: CS4 (0x80 tos / DSCP 0x20 '32') -- a real-time/interactive class,
+# one step above the game's own CS3, widely honoured by CAKE diffserv4 as the
+# latency tier. Change MARK below if you prefer EF.
+#
+# Touches ONLY console game UDP (src 192.168.10.50 port 3659).
+# Uses nftables (OpenWrt 25.x default). Reverts cleanly.
+#
+# Usage:
+#   sh game-dscp.sh on      # apply consistent mark (persists until 'off' or reboot)
+#   sh game-dscp.sh off     # remove it
+#   sh game-dscp.sh status  # show whether it's active + live mark counts
 
 HOST="192.168.10.50"
 GAMEPORT="3659"
-WAN="eth1"; LAN="br-lan"
-CAPN=40          # packets per capture
-CAPT=10          # max seconds per capture (safety)
-LOG="/tmp/sensor-scan.log"
-LINE="------------------------------------------------------------"
-say(){ echo; echo "$LINE"; echo "== $1"; echo "$LINE"; }
+WAN="eth1"
+TABLE="inet gamedscp"
+MARK="cs4"          # cs4=interactive. alternatives: ef, cs3, cs5
 
-# capture helper: writes to file, stops at CAPN packets OR CAPT seconds.
-# uses timeout if available; busybox timeout may kill early but -c usually
-# fills first on a live match. Either way it CANNOT hang forever.
-cap(){
-    IFACE="$1"; OUT="$2"
-    if command -v timeout >/dev/null 2>&1; then
-        timeout "$CAPT" tcpdump -n -v -c "$CAPN" -i "$IFACE" \
-            host "$HOST" and udp and not port 9999 and not port 1900 and not port 53 \
-            2>/dev/null > "$OUT"
+apply() {
+    # build a tiny dedicated nft table so we never touch the main firewall
+    nft add table inet gamedscp 2>/dev/null
+    nft 'add chain inet gamedscp postrouting { type filter hook postrouting priority mangle ; policy accept ; }' 2>/dev/null
+    # flush our chain so re-running is idempotent
+    nft flush chain inet gamedscp postrouting 2>/dev/null
+    # stamp DSCP on the console's outbound game UDP
+    nft add rule inet gamedscp postrouting ip saddr "$HOST" udp sport "$GAMEPORT" ip dscp set "$MARK" counter 2>/dev/null \
+        || { echo "nft rule failed (is nftables present? 'nft --version')"; return 1; }
+    echo "applied: console game UDP (${HOST}:${GAMEPORT}) -> DSCP ${MARK}, consistently."
+    echo "non-interfering: no delay, no reorder. only re-classifies."
+    return 0
+}
+
+remove() {
+    nft delete table inet gamedscp 2>/dev/null && echo "removed: game DSCP marking gone." \
+        || echo "nothing to remove (not active)."
+}
+
+status() {
+    echo "== game-dscp status =="
+    if nft list table inet gamedscp >/dev/null 2>&1; then
+        echo "ACTIVE. rule + live packet counter:"
+        nft list table inet gamedscp 2>/dev/null | grep -E 'dscp set|counter' | sed 's/^/   /'
+        echo
+        echo "verify on the wire (run during a match):"
+        echo "  tcpdump -n -v -c 20 -i $WAN host $HOST and udp 2>/dev/null | grep -o 'tos 0x[0-9a-f]*' | sort | uniq -c"
+        echo "  -> you should now see a CONSISTENT mark (cs4 = tos 0x80) on egress."
     else
-        tcpdump -n -v -c "$CAPN" -i "$IFACE" \
-            host "$HOST" and udp and not port 9999 and not port 1900 and not port 53 \
-            2>/dev/null > "$OUT" &
-        TPID=$!
-        i=0; while [ "$i" -lt "$CAPT" ]; do sleep 1; kill -0 "$TPID" 2>/dev/null || break; i=$((i+1)); done
-        kill "$TPID" 2>/dev/null
+        echo "NOT active. (run: sh game-dscp.sh on)"
     fi
 }
 
-{
-echo "sensor-scan v2  $(date 2>/dev/null)"
-echo "PLAY a match so captures fill fast. Each capture: max ${CAPN} pkts / ${CAPT}s."
+case "$1" in
+    on|apply|"" ) apply ;;
+    off|remove )  remove ;;
+    status )      status ;;
+    * ) echo "usage: sh game-dscp.sh [on|off|status]"; exit 1 ;;
+esac
 
-say "SENSOR 1 -- DSCP/ToS on game packets, CONSOLE side ($LAN)"
-echo "HYP: game marks its UDP priority; we may be ignoring/erasing it."
-echo "0x0=unmarked  0x60=CS3  0xb8=EF  0x80=CS4  0x88=AF41"
-cap "$LAN" /tmp/ss-lan.txt
-echo "tos values seen (count, value):"
-grep -o 'tos 0x[0-9a-fA-F]*' /tmp/ss-lan.txt | sort | uniq -c | sed 's/^/   /'
-[ -s /tmp/ss-lan.txt ] || echo "   (no packets captured -- in a match?)"
-
-say "SENSOR 1b -- does the mark SURVIVE the router? EGRESS side ($WAN)"
-echo "If marked at $LAN above but 0x0 here -> router is WASHING the DSCP."
-cap "$WAN" /tmp/ss-wan.txt
-echo "tos values seen on egress (count, value):"
-grep -o 'tos 0x[0-9a-fA-F]*' /tmp/ss-wan.txt | sort | uniq -c | sed 's/^/   /'
-[ -s /tmp/ss-wan.txt ] || echo "   (no packets captured -- in a match?)"
-echo
-echo "VERDICT: compare the two. same nonzero = preserved. nonzero->0x0 = WASHED."
-
-say "SENSOR 2 -- conntrack flow state"
-if command -v conntrack >/dev/null 2>&1; then
-    conntrack -L -p udp 2>/dev/null | grep "$GAMEPORT" | head -6 | sed 's/^/   /'
-else
-    grep "$GAMEPORT" /proc/net/nf_conntrack 2>/dev/null | head -6 | sed 's/^/   /'
+# reminder about the bigger picture, printed after on/off
+if [ "$1" = "on" ] || [ "$1" = "apply" ] || [ -z "$1" ]; then
+    echo
+    echo "NOTE: this is the latency-free, set-and-forget lever the sensor sweep"
+    echo "left standing. It only bites UNDER LOAD (your backlog reads 0 idle) and"
+    echo "only on the server-bound half (peer-to-peer paths leave your control)."
+    echo "To make it actually do work under load, the downstream queue must honour"
+    echo "DSCP -- i.e. enable qosmate/CAKE with diffserv4. Without that, the mark"
+    echo "is set but nothing acts on it yet. Say the word and we wire that next."
 fi
-echo "   (empty = flow not active during scan; play during run)"
-
-say "SENSOR 3 -- qdisc backlog on $WAN (read again under load to compare)"
-tc -s qdisc show dev "$WAN" 2>/dev/null | sed 's/^/   /'
-
-say "SENSOR 4 -- NIC interrupt coalescing (is the outbound burst hardware?)"
-if command -v ethtool >/dev/null 2>&1; then
-    ethtool -c "$WAN" 2>/dev/null | grep -iE 'rx-usecs|tx-usecs|rx-frames|tx-frames|adaptive' | sed 's/^/   /'
-else
-    echo "   ethtool not installed: apk add ethtool"
-fi
-echo "   rx/tx-usecs > 0 or adaptive on = coalescing ON = likely burst cause."
-
-say "SENSOR 5 -- softirq balance"
-grep -E 'NET_RX|NET_TX' /proc/softirqs 2>/dev/null | sed 's/^/   /'
-uptime 2>/dev/null | sed 's/^/   load: /'
-
-echo
-echo "$LINE"
-echo "KEY FEEDBACK: Sensor 1 vs 1b tos values, and Sensor 4 coalescing on/off."
-echo "$LINE"
-} 2>&1 | tee "$LOG"
-
-rm -f /tmp/ss-lan.txt /tmp/ss-wan.txt
-echo
-echo ">>> saved to $LOG  (cat $LOG to re-read)"
