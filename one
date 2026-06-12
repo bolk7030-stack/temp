@@ -1,82 +1,114 @@
 #!/bin/sh
-# game-dscp.sh -- impose a CONSISTENT priority mark on the game flow, replacing
-# the game's own flaky marking (the sensor scan saw CS3 on ~half the packets one
-# run, almost nothing the next -- not dependable). This stamps ALL the console's
-# game UDP with a reliable DSCP, then (optionally) prioritises it.
+# arb-probe.sh -- multi-flow ARBITRATION ordering probe.
+# You have several simultaneous peer flows (conntrack showed ~6 dst IPs, all
+# sport 3659). This measures how those flows are ORDERED AGAINST EACH OTHER at
+# egress -- not each flow's cadence (done already), but the dequeue race:
+# during sparse contest windows, does the scheduler treat them fairly, or does
+# one peer consistently win/lose the "who leaves first" decision?
 #
-# Non-interfering: it does NOT delay or reorder anything. It only sets the DSCP
-# byte so downstream queues (and CAKE, if you enable it) can treat the flow as
-# priority. Zero added latency. Only matters under load -- but it's set-and-forget.
+# Interpretation-free. Captures on eth1 (the egress / post-scheduler point),
+# groups packets by destination peer, and measures:
+#   1. PER-PEER share -- packet count per peer (gross fairness)
+#   2. INTERLEAVING -- at "burst instants" (>=2 game packets within WINDOW ms),
+#      which peer's packet leaves FIRST? tallied per peer. A fair scheduler
+#      spreads first-out roughly evenly; a biased one favors/starves a peer.
+#   3. ADJACENCY -- how often the SAME peer's packets go back-to-back vs peers
+#      alternate. High self-adjacency = bursty per-peer; high alternation =
+#      round-robin-like arbitration.
 #
-# HONEST SCOPE: only affects the SERVER-bound half. conntrack showed your game is
-# partly PEER-TO-PEER (residential dst IPs); those paths leave your control after
-# eth1 regardless. This marks everything consistently anyway -- can't hurt.
+# This targets the one grounded NEW mechanism: inter-flow dequeue ordering under
+# simultaneous peers, which fq_codel decides even at zero backlog.
 #
-# Mark used: CS4 (0x80 tos / DSCP 0x20 '32') -- a real-time/interactive class,
-# one step above the game's own CS3, widely honoured by CAKE diffserv4 as the
-# latency tier. Change MARK below if you prefer EF.
-#
-# Touches ONLY console game UDP (src 192.168.10.50 port 3659).
-# Uses nftables (OpenWrt 25.x default). Reverts cleanly.
-#
-# Usage:
-#   sh game-dscp.sh on      # apply consistent mark (persists until 'off' or reboot)
-#   sh game-dscp.sh off     # remove it
-#   sh game-dscp.sh status  # show whether it's active + live mark counts
+# Run during a LIVE match. Usage: sh arb-probe.sh [packet_count]   (default 1500)
 
 HOST="192.168.10.50"
-GAMEPORT="3659"
 WAN="eth1"
-TABLE="inet gamedscp"
-MARK="cs4"          # cs4=interactive. alternatives: ef, cs3, cs5
+COUNT="${1:-1500}"
+WINDOW=3          # ms: packets within this gap = same "contest instant"
+RAW="/tmp/arb-raw-$$.txt"
 
-apply() {
-    # build a tiny dedicated nft table so we never touch the main firewall
-    nft add table inet gamedscp 2>/dev/null
-    nft 'add chain inet gamedscp postrouting { type filter hook postrouting priority mangle ; policy accept ; }' 2>/dev/null
-    # flush our chain so re-running is idempotent
-    nft flush chain inet gamedscp postrouting 2>/dev/null
-    # stamp DSCP on the console's outbound game UDP
-    nft add rule inet gamedscp postrouting ip saddr "$HOST" udp sport "$GAMEPORT" ip dscp set "$MARK" counter 2>/dev/null \
-        || { echo "nft rule failed (is nftables present? 'nft --version')"; return 1; }
-    echo "applied: console game UDP (${HOST}:${GAMEPORT}) -> DSCP ${MARK}, consistently."
-    echo "non-interfering: no delay, no reorder. only re-classifies."
-    return 0
-}
-
-remove() {
-    nft delete table inet gamedscp 2>/dev/null && echo "removed: game DSCP marking gone." \
-        || echo "nothing to remove (not active)."
-}
-
-status() {
-    echo "== game-dscp status =="
-    if nft list table inet gamedscp >/dev/null 2>&1; then
-        echo "ACTIVE. rule + live packet counter:"
-        nft list table inet gamedscp 2>/dev/null | grep -E 'dscp set|counter' | sed 's/^/   /'
-        echo
-        echo "verify on the wire (run during a match):"
-        echo "  tcpdump -n -v -c 20 -i $WAN host $HOST and udp 2>/dev/null | grep -o 'tos 0x[0-9a-f]*' | sort | uniq -c"
-        echo "  -> you should now see a CONSISTENT mark (cs4 = tos 0x80) on egress."
-    else
-        echo "NOT active. (run: sh game-dscp.sh on)"
-    fi
-}
-
-case "$1" in
-    on|apply|"" ) apply ;;
-    off|remove )  remove ;;
-    status )      status ;;
-    * ) echo "usage: sh game-dscp.sh [on|off|status]"; exit 1 ;;
-esac
-
-# reminder about the bigger picture, printed after on/off
-if [ "$1" = "on" ] || [ "$1" = "apply" ] || [ -z "$1" ]; then
-    echo
-    echo "NOTE: this is the latency-free, set-and-forget lever the sensor sweep"
-    echo "left standing. It only bites UNDER LOAD (your backlog reads 0 idle) and"
-    echo "only on the server-bound half (peer-to-peer paths leave your control)."
-    echo "To make it actually do work under load, the downstream queue must honour"
-    echo "DSCP -- i.e. enable qosmate/CAKE with diffserv4. Without that, the mark"
-    echo "is set but nothing acts on it yet. Say the word and we wire that next."
+echo "Capturing $COUNT egress game packets on $WAN ... PLAY a contested match." >&2
+if command -v timeout >/dev/null 2>&1; then
+    timeout 40 tcpdump -n -tt -c "$COUNT" -i "$WAN" \
+        host "$HOST" and udp and not port 9999 and not port 1900 and not port 53 \
+        2>/dev/null > "$RAW"
+else
+    tcpdump -n -tt -c "$COUNT" -i "$WAN" \
+        host "$HOST" and udp and not port 9999 and not port 1900 and not port 53 \
+        2>/dev/null > "$RAW"
 fi
+
+LN=$(wc -l < "$RAW" 2>/dev/null)
+echo "captured ${LN:-0} packets" >&2
+if [ "${LN:-0}" -lt 100 ]; then
+    echo "Too few. Need a live match with multiple active peers. Aborting." >&2
+    rm -f "$RAW"; exit 1
+fi
+
+awk -v HOST="$HOST" -v WINDOW="$WINDOW" '
+{
+    t=$1+0; src=$3; dst=$5; sub(/:$/,"",dst)
+    split(src,sa,"."); si=sa[1]"."sa[2]"."sa[3]"."sa[4]
+    split(dst,da,"."); di=da[1]"."da[2]"."da[3]"."da[4]
+    # OUTBOUND only (console -> peer), egress ordering is what the scheduler decides
+    if (si!=HOST) next
+    if (di ~ /^192\.168\./ || di ~ /^239\./ || di ~ /^224\./ || di ~ /^255\./) next
+    n++; T[n]=t; P[n]=di
+    if (!(di in seen)){ seen[di]=1; order[++np]=di }
+    cnt[di]++
+}
+END{
+    if (n < 50){ print "  too few outbound game packets ("n")"; exit }
+    printf "\n  === %d outbound game packets across %d peers ===\n", n, np
+
+    # 1. per-peer share
+    print "\n  1. PER-PEER SHARE (gross fairness):"
+    for (i=1;i<=np;i++){
+        p=order[i]; pct=cnt[p]*100/n
+        bar=""; k=int(pct/2); while(k-->0)bar=bar"#"
+        printf "     %-16s |%-30s %d (%.1f%%)\n", p, bar, cnt[p], pct
+    }
+
+    # 2. interleaving: at contest instants (gap to previous <= WINDOW), who is first out?
+    #    we tally, for each adjacent pair within WINDOW, which peer was earlier.
+    print "\n  2. FIRST-OUT AT CONTEST INSTANTS (<= " WINDOW "ms apart):"
+    print "     (when two peer flows race, who leaves first? fair = even)"
+    instants=0
+    for (i=2;i<=n;i++){
+        gap=(T[i]-T[i-1])*1000
+        if (gap>=0 && gap<=WINDOW && P[i]!=P[i-1]){
+            firstout[P[i-1]]++   # the earlier packet peer won the race
+            instants++
+        }
+    }
+    if (instants<5){
+        print "     (only "instants" contested instants -- peers rarely race; arbitration"
+        print "      is not heavily exercised. sparse-but-isolated, likely fine.)"
+    } else {
+        for (i=1;i<=np;i++){
+            p=order[i]; w=firstout[p]+0; pct=w*100/instants
+            bar=""; k=int(pct/2); while(k-->0)bar=bar"#"
+            printf "     %-16s |%-30s %d wins (%.1f%%)\n", p, bar, w, pct
+        }
+        printf "     total contested instants: %d\n", instants
+        print "     READING: shares near each peer traffic-share = FAIR scheduling."
+        print "     One peer winning FAR more/less than its share = arbitration bias."
+    }
+
+    # 3. adjacency: same-peer back-to-back vs alternation
+    print "\n  3. ADJACENCY (per-peer bursting vs round-robin):"
+    same=0; diff=0
+    for (i=2;i<=n;i++){ if(P[i]==P[i-1]) same++; else diff++ }
+    tot=same+diff
+    if (tot>0){
+        printf "     same-peer back-to-back: %d (%.1f%%)\n", same, same*100/tot
+        printf "     peer-alternation:       %d (%.1f%%)\n", diff, diff*100/tot
+        print  "     high alternation = round-robin-like arbitration;"
+        print  "     high back-to-back = each peer flushes in bursts."
+    }
+
+    print "\n  All interpretation-free: counts of ordering decisions, no packet meaning."
+    print "  Run 2-3x: real arbitration bias reproduces; noise does not."
+}
+' "$RAW"
+rm -f "$RAW"
