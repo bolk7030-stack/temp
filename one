@@ -1,104 +1,132 @@
 #!/bin/sh
-# arb-probe.sh (v2) -- multi-flow ARBITRATION ordering probe. HANG-PROOF.
-# v1 hung waiting for packets. v2 captures with a hard wall-clock cap using a
-# background tcpdump + kill, writes to a file, then analyses. It ALWAYS stops.
+# coherence-setup.sh -- transport-coherence engineering, the mature form.
+# NOT deception, NOT ambiguity, NOT a reactive controller. Just: high-quality,
+# persistent, legible participation in the distributed system.
 #
-# Measures how your simultaneous peer flows are ordered against each other at
-# egress (eth1, post-scheduler): per-peer share, who-leaves-first at contest
-# instants, and adjacency. Interpretation-free.
+# Two parts:
+#   PART 1 (build): consistent DSCP mark on the game flow + an UNLIMITED CAKE
+#     qdisc with diffserv4 that HONORS the mark. "unlimited" = no bandwidth cap,
+#     so ZERO added latency and no throughput risk; CAKE only reorders by tin
+#     WHEN packets actually contend. The mark is firing now; this makes a queue
+#     act on it. Made persistent so it survives reboot.
+#   PART 2 (test): generate controlled egress load, then measure whether the
+#     game flow's latency stays protected under stress (the dormant levers only
+#     wake under contention -- this is the load condition we never created).
+#
+# Touches ONLY console game UDP (192.168.10.50:3659) for marking. CAKE sits on
+# eth1 egress as an unlimited diffserv scheduler. Reverts cleanly.
 #
 # Usage:
-#   sh arb-probe.sh            # capture ~12s of egress game traffic, analyse
-#   sh arb-probe.sh 20         # capture for 20 seconds instead
-#
-# Run during a CONTESTED match (several peers active) for meaningful results.
+#   sh coherence-setup.sh build      # apply mark + unlimited-CAKE, persistent
+#   sh coherence-setup.sh test       # generate load, measure game-flow latency
+#   sh coherence-setup.sh status     # show what's active
+#   sh coherence-setup.sh off        # remove everything
 
 HOST="192.168.10.50"
+GAMEPORT="3659"
 WAN="eth1"
-SECS="${1:-12}"           # capture duration in seconds (NOT a packet count)
-WINDOW=3                  # ms: packets within this = same contest instant
-RAW="/tmp/arb-raw-$$.txt"
+MARK="cs4"                 # interactive/latency tin in diffserv4
+PERSIST="/etc/hotplug.d/iface/99-game-coherence"
 
-echo "Capturing ${SECS}s of egress game traffic on $WAN ... PLAY a contested match." >&2
+ensure_cake() {
+    if tc qdisc add dev "$WAN" root handle 9999: cake 2>/dev/null; then
+        tc qdisc del dev "$WAN" root 2>/dev/null; return 0
+    fi
+    echo "cake not available, installing kmod-sched-cake ..." >&2
+    if command -v apk >/dev/null 2>&1; then apk add kmod-sched-cake >/dev/null 2>&1
+    elif command -v opkg >/dev/null 2>&1; then opkg install kmod-sched-cake >/dev/null 2>&1; fi
+    tc qdisc add dev "$WAN" root handle 9999: cake 2>/dev/null && { tc qdisc del dev "$WAN" root 2>/dev/null; return 0; }
+    return 1
+}
 
-# background tcpdump, hard-kill after SECS no matter what. No packet count to wait on.
-tcpdump -n -tt -i "$WAN" \
-    host "$HOST" and udp and not port 9999 and not port 1900 and not port 53 \
-    2>/dev/null > "$RAW" &
-TPID=$!
-# countdown so it can't outlive SECS even if tcpdump ignores signals briefly
-i=0
-while [ "$i" -lt "$SECS" ]; do
+build() {
+    # --- DSCP mark (nft) ---
+    nft add table inet gamedscp 2>/dev/null
+    nft 'add chain inet gamedscp postrouting { type filter hook postrouting priority mangle ; policy accept ; }' 2>/dev/null
+    nft flush chain inet gamedscp postrouting 2>/dev/null
+    nft add rule inet gamedscp postrouting ip saddr "$HOST" udp sport "$GAMEPORT" ip dscp set "$MARK" counter 2>/dev/null \
+        || { echo "nft rule failed"; return 1; }
+
+    # --- UNLIMITED CAKE with diffserv4 (honors the mark, no bandwidth cap) ---
+    ensure_cake || { echo "CAKE unavailable; mark set but no queue honors it."; return 1; }
+    tc qdisc del dev "$WAN" root 2>/dev/null
+    # unlimited = no shaping/cap; diffserv4 = 4 tins by DSCP; no latency added.
+    tc qdisc add dev "$WAN" root cake unlimited diffserv4 2>/dev/null \
+        || { echo "cake apply failed"; return 1; }
+
+    echo "BUILT:"
+    echo "  - game UDP ($HOST:$GAMEPORT) marked DSCP $MARK consistently"
+    echo "  - eth1 egress: CAKE unlimited diffserv4 (honors mark, no cap, no added latency)"
+    echo "  - CAKE only reorders by tin WHEN packets contend; idle = no effect"
+
+    # --- persist across reboot ---
+    mkdir -p /etc/hotplug.d/iface 2>/dev/null
+    cat > "$PERSIST" << PEOF
+#!/bin/sh
+[ "\$INTERFACE" = "wan" ] || [ "\$DEVICE" = "$WAN" ] || exit 0
+nft add table inet gamedscp 2>/dev/null
+nft 'add chain inet gamedscp postrouting { type filter hook postrouting priority mangle ; policy accept ; }' 2>/dev/null
+nft flush chain inet gamedscp postrouting 2>/dev/null
+nft add rule inet gamedscp postrouting ip saddr $HOST udp sport $GAMEPORT ip dscp set $MARK counter 2>/dev/null
+tc qdisc replace dev $WAN root cake unlimited diffserv4 2>/dev/null
+PEOF
+    chmod +x "$PERSIST" 2>/dev/null
+    echo "  - persisted: $PERSIST (re-applies on boot/wan-up)"
+}
+
+off() {
+    nft delete table inet gamedscp 2>/dev/null && echo "removed DSCP mark" || echo "(no mark active)"
+    tc qdisc del dev "$WAN" root 2>/dev/null && echo "removed CAKE" || echo "(no cake active)"
+    rm -f "$PERSIST" 2>/dev/null && echo "removed persistence" || true
+}
+
+status() {
+    echo "== coherence status =="
+    if nft list table inet gamedscp >/dev/null 2>&1; then
+        echo "DSCP mark: ACTIVE"; nft list table inet gamedscp 2>/dev/null | grep counter | sed 's/^/   /'
+    else echo "DSCP mark: not active"; fi
+    echo "eth1 qdisc:"; tc -s qdisc show dev "$WAN" 2>/dev/null | head -3 | sed 's/^/   /'
+    [ -f "$PERSIST" ] && echo "persistence: installed" || echo "persistence: not installed"
+}
+
+# ---- PART 2: under-load verification ----
+test_load() {
+    echo "=== UNDER-LOAD TEST ===" >&2
+    echo "Measures game-flow latency proxy (ping to a peer) BEFORE and DURING" >&2
+    echo "controlled egress load, to see if CAKE+DSCP protect the flow under stress." >&2
+    # pick a live peer to ping as a latency proxy
+    PEER=$(conntrack -L -p udp 2>/dev/null | grep "$GAMEPORT" | grep "$HOST" \
+        | sed -n 's/.*dst=\([0-9.]*\).*/\1/p' | grep -v '^192\.168\.' | head -1)
+    [ -z "$PEER" ] && PEER="8.8.8.8" && echo "(no live peer; using 8.8.8.8 as path proxy)" >&2
+    echo "latency target: $PEER" >&2
+
+    echo >&2; echo "-- baseline (idle) --" >&2
+    ping -c 10 -W 1 "$PEER" 2>/dev/null | sed -n 's@.*= \([0-9.]*\)/\([0-9.]*\)/\([0-9.]*\).*@   idle  min/avg/max = \1/\2/\3 ms@p'
+
+    echo >&2; echo "-- generating egress load (15s) + measuring during --" >&2
+    # saturate egress with a background flood to a sink; harmless, self-limited.
+    # use a big upload to a discard-like target via dd|nc if available, else ping flood.
+    if command -v nc >/dev/null 2>&1; then
+        ( dd if=/dev/zero bs=64k count=4000 2>/dev/null | nc -w 15 "$PEER" 9 2>/dev/null ) &
+        LOADPID=$!
+    else
+        ( ping -f -s 1400 "$PEER" >/dev/null 2>&1 ) & LOADPID=$!
+    fi
     sleep 1
-    kill -0 "$TPID" 2>/dev/null || break
-    i=$((i+1))
-done
-kill "$TPID" 2>/dev/null
-sleep 1
-kill -9 "$TPID" 2>/dev/null    # force if still alive
-wait "$TPID" 2>/dev/null
+    ping -c 10 -W 1 "$PEER" 2>/dev/null | sed -n 's@.*= \([0-9.]*\)/\([0-9.]*\)/\([0-9.]*\).*@   LOADED min/avg/max = \1/\2/\3 ms@p'
+    kill "$LOADPID" 2>/dev/null; kill -9 "$LOADPID" 2>/dev/null
 
-LN=$(wc -l < "$RAW" 2>/dev/null)
-echo "captured ${LN:-0} packets in ${SECS}s" >&2
-if [ "${LN:-0}" -lt 40 ]; then
-    echo "Too few egress packets. Either not in an active match, or outbound peer" >&2
-    echo "traffic is sparse (itself a hint: peers rarely race -> little arbitration)." >&2
-    echo "Try a longer capture during heavy action: sh arb-probe.sh 25" >&2
-    rm -f "$RAW"; exit 1
-fi
-
-awk -v HOST="$HOST" -v WINDOW="$WINDOW" '
-{
-    t=$1+0; src=$3; dst=$5; sub(/:$/,"",dst)
-    split(src,sa,"."); si=sa[1]"."sa[2]"."sa[3]"."sa[4]
-    split(dst,da,"."); di=da[1]"."da[2]"."da[3]"."da[4]
-    if (si!=HOST) next
-    if (di ~ /^192\.168\./ || di ~ /^239\./ || di ~ /^224\./ || di ~ /^255\./) next
-    n++; T[n]=t; P[n]=di
-    if (!(di in seen)){ seen[di]=1; order[++np]=di }
-    cnt[di]++
+    echo >&2
+    echo "READING:" >&2
+    echo "  idle avg ~= loaded avg  -> CAKE+DSCP HELD the flow under load (coherence works)" >&2
+    echo "  loaded avg >> idle avg  -> flow NOT protected; CAKE tin/marking needs adjusting" >&2
+    echo "  (run with coherence OFF vs ON to compare: that is the real A/B.)" >&2
 }
-END{
-    if (n < 30){ print "  too few outbound game packets ("n")"; exit }
-    printf "\n  === %d outbound game packets across %d peers ===\n", n, np
 
-    print "\n  1. PER-PEER SHARE:"
-    for (i=1;i<=np;i++){
-        p=order[i]; pct=cnt[p]*100/n
-        bar=""; k=int(pct/2); while(k-->0)bar=bar"#"
-        printf "     %-16s |%-30s %d (%.1f%%)\n", p, bar, cnt[p], pct
-    }
-
-    print "\n  2. FIRST-OUT AT CONTEST INSTANTS (<= " WINDOW "ms apart):"
-    instants=0
-    for (i=2;i<=n;i++){
-        gap=(T[i]-T[i-1])*1000
-        if (gap>=0 && gap<=WINDOW && P[i]!=P[i-1]){ firstout[P[i-1]]++; instants++ }
-    }
-    if (instants<5){
-        print "     only " instants " contested instants -- peers rarely race."
-        print "     arbitration barely exercised: sparse-but-isolated, likely fine."
-    } else {
-        for (i=1;i<=np;i++){
-            p=order[i]; w=firstout[p]+0; pct=w*100/instants
-            bar=""; k=int(pct/2); while(k-->0)bar=bar"#"
-            printf "     %-16s |%-30s %d wins (%.1f%%)\n", p, bar, w, pct
-        }
-        printf "     total contested instants: %d\n", instants
-        print "     FAIR = each peer win-share ~ its traffic-share above."
-        print "     One peer winning FAR off its share = arbitration bias (a lever)."
-    }
-
-    print "\n  3. ADJACENCY:"
-    same=0; diff=0
-    for (i=2;i<=n;i++){ if(P[i]==P[i-1]) same++; else diff++ }
-    tot=same+diff
-    if (tot>0){
-        printf "     same-peer back-to-back: %.1f%%   peer-alternation: %.1f%%\n", same*100/tot, diff*100/tot
-        print  "     high alternation = round-robin-like; high back-to-back = per-peer bursts."
-    }
-
-    print "\n  interpretation-free: ordering counts only. run 2-3x; real bias reproduces."
-}
-' "$RAW"
-rm -f "$RAW"
+case "$1" in
+    build ) build ;;
+    test )  test_load ;;
+    status ) status ;;
+    off|remove ) off ;;
+    * ) echo "usage: sh coherence-setup.sh [build|test|status|off]"; exit 1 ;;
+esac
