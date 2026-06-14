@@ -1,0 +1,58 @@
+#!/bin/sh
+# rate-hop.sh -- nft deterministic-but-VARYING cadence. Hops the keep-ratio
+# (1/2 .. 5/5) on a fast schedule -- periodic, random, or driven -- to create a
+# non-stationary sampling cadence. nft numgen underneath (NOT netem).
+#
+# HONEST TEST FRAME: the phase test showed the far end does not read your cadence
+# (flat response). This switches the TOOL (nft, clean) but not that finding. Run
+# it as a TEST: judge ONLY by reproducible contest outcomes across many games,
+# NOT by feel (feel is the unreliable signal here). If nft variability does what
+# netem could not, the outcomes will show it. If not, you will have proven the
+# closure yourself instead of taking my word.
+#
+# Timescale reality: packets are ~33ms apart (30Hz). The pattern can only change
+# per-packet at best; sub-33ms / micro / nano / pico hopping has NO packet to act
+# on, so MINHOP is floored near the packet interval. Faster values are clamped.
+#
+# Touches ONLY 192.168.10.50:3659 outbound. Ends clean. Experiment, reversible.
+#
+# Usage:
+#   sh rate-hop.sh periodic [ms]   # hop 1/2..5/5 in order, every [ms] (default 200)
+#   sh rate-hop.sh random   [ms]   # hop to a RANDOM rung every [ms] (max unpredictability)
+#   sh rate-hop.sh off
+
+HOST="192.168.10.50"; GAMEPORT="3659"; TABLE="gamehop"
+RUNGS="1/2 2/3 3/4 4/5 5/5"
+MINMS=33     # floor: cannot meaningfully hop faster than the packet interval
+
+cleanup(){ nft delete table inet "$TABLE" 2>/dev/null; }
+trap 'echo; echo "hop stopped -> full 30Hz"; cleanup; exit 0' INT TERM
+
+set_pattern(){
+    KEEP="${1%/*}"; OF="${1#*/}"
+    nft delete table inet "$TABLE" 2>/dev/null
+    nft add table inet "$TABLE" 2>/dev/null || return 1
+    nft "add chain inet $TABLE post { type filter hook postrouting priority mangle ; policy accept ; }" 2>/dev/null || return 1
+    [ "$KEEP" != "$OF" ] && nft add rule inet "$TABLE" post ip saddr "$HOST" udp sport "$GAMEPORT" \
+        numgen inc mod "$OF" ">=" "$KEEP" counter drop 2>/dev/null
+    return 0
+}
+
+MS="${2:-200}"
+[ "$MS" -lt "$MINMS" ] && { echo "clamping hop interval ${MS}ms -> ${MINMS}ms (packet floor)"; MS="$MINMS"; }
+SLEEP=$(awk -v m="$MS" 'BEGIN{printf "%.3f", m/1000}')
+
+case "$1" in
+    off|remove ) cleanup; echo "OFF -> full 30Hz."; exit 0 ;;
+    periodic )
+        echo "PERIODIC hop 1/2..5/5 every ${MS}ms (nft). TEST by reproducible outcomes. Ctrl-C to revert." >&2
+        while true; do for P in $RUNGS; do set_pattern "$P" || { cleanup; exit 1; }; sleep "$SLEEP"; done; done ;;
+    random )
+        echo "RANDOM hop every ${MS}ms (max non-stationarity). TEST by outcomes, not feel. Ctrl-C to revert." >&2
+        set -- $RUNGS; N=$#
+        while true; do
+            R=$(awk -v n="$N" 'BEGIN{srand(); print int(rand()*n)+1}')
+            P=$(eval echo \${$R}); set_pattern "$P" || { cleanup; exit 1; }; sleep "$SLEEP"
+        done ;;
+    * ) echo "usage: sh rate-hop.sh [periodic [ms] | random [ms] | off]"; exit 1 ;;
+esac
