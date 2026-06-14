@@ -1,34 +1,43 @@
 #!/bin/sh
-# rate-hop.sh -- nft deterministic-but-VARYING cadence. Hops the keep-ratio
-# (1/2 .. 5/5) periodically or randomly. nft numgen underneath (NOT netem).
-# v2 FIX: busybox sleep has no fractional seconds -> use usleep (microseconds).
+# rate-hop.sh (v3) -- nft deterministic varying cadence, LESS EPHEMERAL.
+# v3 changes (for team play -- reduce teammate desync):
+#   - DWELL defaults longer (1200ms) so each rate holds long enough that teammate
+#     interpolation can settle, instead of thrashing.
+#   - FULL-RATE BIAS: spends extra dwell at 5/5 (full 30Hz) so you're well-
+#     represented most of the time; variability is occasional, not constant.
+#   - FLOORED variability: never drops below FLOOR (default 3/4) so even your
+#     sparsest cadence stays well-sampled enough to hold team coherence.
+# nft numgen underneath (NOT netem). usleep (busybox-safe, no fractional sleep).
 #
-# TEST FRAME: judge by REPRODUCIBLE contest outcomes across many games, not feel.
-# Timescale floor: packets ~33ms apart; intervals below 33ms are clamped.
+# HONEST LIMIT: this REDUCES teammate desync, it does not eliminate it. True team
+# sync would require locking to teammates' clocks, which your router cannot read
+# (different machines/networks). The real team-coherence fix is social (shared
+# calls/roles), not a script. This just makes the hop gentle enough to coexist.
 #
-# Touches ONLY 192.168.10.50:3659 outbound. Ends clean. Reversible.
+# TEST FRAME: judge by reproducible contest outcomes, not feel.
+# Touches ONLY 192.168.10.50:3659 outbound. Reversible.
 #
 # Usage:
-#   sh rate-hop.sh periodic [ms]   # hop 1/2..5/5 in order every [ms] (default 200)
-#   sh rate-hop.sh random   [ms]   # hop to a random rung every [ms]
+#   sh rate-hop.sh gentle [dwell_ms]   # floored, full-rate-biased, slow (recommended for team)
+#   sh rate-hop.sh periodic [dwell_ms] # plain ordered hop across the floored range
+#   sh rate-hop.sh random   [dwell_ms] # random within the floored range
 #   sh rate-hop.sh off
 
 HOST="192.168.10.50"; GAMEPORT="3659"; TABLE="gamehop"
-RUNGS="1/2 2/3 3/4 4/5 5/5"
-MINMS=33
+FLOOR_K=3; FLOOR_OF=4                 # sparsest allowed = 3/4 (~22Hz); raise to floor harder
+DWELL_DEFAULT=1200                    # ms per rung -- long, so teammates can settle
+FULLBIAS=2                            # 5/5 gets this many extra dwell-units
+
+# rungs from FLOOR up to full. (3/4, 4/5, 5/5) -- all well-sampled, none below 3/4.
+RUNGS="3/4 4/5 5/5"
 
 cleanup(){ nft delete table inet "$TABLE" 2>/dev/null; }
 trap 'echo; echo "hop stopped -> full 30Hz"; cleanup; exit 0' INT TERM
 
-# portable sub-second sleep: prefer usleep (busybox microseconds); fallback to sleep
-naptime(){   # arg: milliseconds
+naptime(){  # ms, busybox-safe
     _ms="$1"
-    if command -v usleep >/dev/null 2>&1; then
-        usleep $(( _ms * 1000 ))
-    else
-        # last resort: whole-second sleep, min 1s (avoids fractional-sleep crash)
-        _s=$(( _ms / 1000 )); [ "$_s" -lt 1 ] && _s=1; sleep "$_s"
-    fi
+    if command -v usleep >/dev/null 2>&1; then usleep $(( _ms * 1000 ))
+    else _s=$(( _ms / 1000 )); [ "$_s" -lt 1 ] && _s=1; sleep "$_s"; fi
 }
 
 set_pattern(){
@@ -38,23 +47,36 @@ set_pattern(){
     nft "add chain inet $TABLE post { type filter hook postrouting priority mangle ; policy accept ; }" 2>/dev/null || return 1
     [ "$KEEP" != "$OF" ] && nft add rule inet "$TABLE" post ip saddr "$HOST" udp sport "$GAMEPORT" \
         numgen inc mod "$OF" ">=" "$KEEP" counter drop 2>/dev/null
+    EFF=$(awk -v k="$KEEP" -v o="$OF" 'BEGIN{printf "%.0f",30.0*k/o}')
+    printf "  %s ~%sHz\n" "$1" "$EFF" >&2
     return 0
 }
 
-MS="${2:-200}"
-[ "$MS" -lt "$MINMS" ] && { echo "clamping ${MS}ms -> ${MINMS}ms (packet floor)"; MS="$MINMS"; }
+DWELL="${2:-$DWELL_DEFAULT}"
 
 case "$1" in
     off|remove ) cleanup; echo "OFF -> full 30Hz."; exit 0 ;;
+    gentle )
+        echo "GENTLE hop (floor ${FLOOR_K}/${FLOOR_OF}, full-rate biased, ${DWELL}ms dwell)." >&2
+        echo "less ephemeral -> reduces teammate desync. TEST by outcomes. Ctrl-C to revert." >&2
+        while true; do
+            for P in $RUNGS; do
+                set_pattern "$P" || { cleanup; exit 1; }
+                if [ "$P" = "5/5" ]; then naptime $(( DWELL * FULLBIAS )); else naptime "$DWELL"; fi
+            done
+        done ;;
     periodic )
-        echo "PERIODIC hop 1/2..5/5 every ${MS}ms. TEST by outcomes. Ctrl-C to revert." >&2
-        while true; do for P in $RUNGS; do set_pattern "$P" || { cleanup; exit 1; }; naptime "$MS"; done; done ;;
+        echo "PERIODIC hop across ${RUNGS} every ${DWELL}ms. Ctrl-C to revert." >&2
+        while true; do for P in $RUNGS; do set_pattern "$P" || { cleanup; exit 1; }; naptime "$DWELL"; done; done ;;
     random )
-        echo "RANDOM hop every ${MS}ms. TEST by outcomes, not feel. Ctrl-C to revert." >&2
+        echo "RANDOM hop within floored range every ${DWELL}ms. Ctrl-C to revert." >&2
         set -- $RUNGS; N=$#
         while true; do
             R=$(awk -v n="$N" 'BEGIN{srand(); print int(rand()*n)+1}')
-            P=$(eval echo \${$R}); set_pattern "$P" || { cleanup; exit 1; }; naptime "$MS"
+            P=$(eval echo \${$R}); set_pattern "$P" || { cleanup; exit 1; }; naptime "$DWELL"
         done ;;
-    * ) echo "usage: sh rate-hop.sh [periodic [ms] | random [ms] | off]"; exit 1 ;;
+    * )
+        echo "usage: sh rate-hop.sh [gentle [dwell_ms] | periodic [dwell_ms] | random [dwell_ms] | off]"
+        echo "  gentle = recommended for team: floored 3/4..5/5, full-rate biased, slow dwell"
+        exit 1 ;;
 esac
