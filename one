@@ -1,132 +1,77 @@
 #!/bin/sh
-# coherence-setup.sh -- transport-coherence engineering, the mature form.
-# NOT deception, NOT ambiguity, NOT a reactive controller. Just: high-quality,
-# persistent, legible participation in the distributed system.
+# coherence-lite.sh -- LIGHTER CAKE that stops reshaping your game's multi-flow
+# timing (the thing that desynced teammates), while keeping a queue present for
+# under-load bufferbloat control.
 #
-# Two parts:
-#   PART 1 (build): consistent DSCP mark on the game flow + an UNLIMITED CAKE
-#     qdisc with diffserv4 that HONORS the mark. "unlimited" = no bandwidth cap,
-#     so ZERO added latency and no throughput risk; CAKE only reorders by tin
-#     WHEN packets actually contend. The mark is firing now; this makes a queue
-#     act on it. Made persistent so it survives reboot.
-#   PART 2 (test): generate controlled egress load, then measure whether the
-#     game flow's latency stays protected under stress (the dormant levers only
-#     wake under contention -- this is the load condition we never created).
+# WHY: full `cake unlimited diffserv4` actively scheduled your game's MULTIPLE
+# flows (server + peers) against each other via flow-isolation + tin-sorting +
+# ACK-filter + GSO-split. That per-flow reshaping is the likely cause of
+# teammates seeming frozen/desynced. This variant removes those behaviors:
+#   - besteffort  -> ONE tin; stops sorting server vs peer traffic into tiers
+#   - flowblind   -> disables per-flow isolation; stops reshaping flows vs each other
+#   - no-ack-filter, no-split-gso -> stops the other two reshaping behaviors
+#   - unlimited   -> no bandwidth cap, no added latency
+# Net: a queue is present (helps under load) but it no longer meddles with the
+# timing relationship between your game's flows.
 #
-# Touches ONLY console game UDP (192.168.10.50:3659) for marking. CAKE sits on
-# eth1 egress as an unlimited diffserv scheduler. Reverts cleanly.
+# TEAMMATES ARE THE TEST. Workflow: off (confirm team recovers) -> lite (confirm
+# still good) -> compare. If lite reintroduces desync, go fully off (stock).
 #
 # Usage:
-#   sh coherence-setup.sh build      # apply mark + unlimited-CAKE, persistent
-#   sh coherence-setup.sh test       # generate load, measure game-flow latency
-#   sh coherence-setup.sh status     # show what's active
-#   sh coherence-setup.sh off        # remove everything
+#   sh coherence-lite.sh on       # apply lite CAKE (besteffort flowblind), no mark
+#   sh coherence-lite.sh mark     # same + add the CS4 DSCP mark (optional)
+#   sh coherence-lite.sh off      # remove -> back to stock mq/fq_codel
+#   sh coherence-lite.sh status
 
-HOST="192.168.10.50"
-GAMEPORT="3659"
-WAN="eth1"
-MARK="cs4"                 # interactive/latency tin in diffserv4
-PERSIST="/etc/hotplug.d/iface/99-game-coherence"
+WAN="eth1"; HOST="192.168.10.50"; GAMEPORT="3659"
 
-ensure_cake() {
-    if tc qdisc add dev "$WAN" root handle 9999: cake 2>/dev/null; then
-        tc qdisc del dev "$WAN" root 2>/dev/null; return 0
-    fi
-    echo "cake not available, installing kmod-sched-cake ..." >&2
-    if command -v apk >/dev/null 2>&1; then apk add kmod-sched-cake >/dev/null 2>&1
-    elif command -v opkg >/dev/null 2>&1; then opkg install kmod-sched-cake >/dev/null 2>&1; fi
-    tc qdisc add dev "$WAN" root handle 9999: cake 2>/dev/null && { tc qdisc del dev "$WAN" root 2>/dev/null; return 0; }
+ensure_cake(){
+    tc qdisc add dev "$WAN" root handle 9991: cake 2>/dev/null && { tc qdisc del dev "$WAN" root 2>/dev/null; return 0; }
+    command -v apk >/dev/null 2>&1 && apk add kmod-sched-cake >/dev/null 2>&1
+    command -v opkg >/dev/null 2>&1 && opkg install kmod-sched-cake >/dev/null 2>&1
+    tc qdisc add dev "$WAN" root handle 9991: cake 2>/dev/null && { tc qdisc del dev "$WAN" root 2>/dev/null; return 0; }
     return 1
 }
 
-build() {
-    # --- DSCP mark (nft) ---
+apply_lite(){
+    ensure_cake || { echo "CAKE unavailable."; return 1; }
+    tc qdisc del dev "$WAN" root 2>/dev/null
+    # the lightest CAKE: one tin, no flow isolation, no ack-filter, no gso-split, no cap
+    tc qdisc add dev "$WAN" root cake unlimited besteffort flowblind no-ack-filter no-split-gso 2>/dev/null \
+        || { echo "cake apply failed (older cake may lack a keyword; trying minimal)"; \
+             tc qdisc add dev "$WAN" root cake unlimited besteffort flowblind 2>/dev/null || return 1; }
+    echo "LITE CAKE applied on $WAN:"
+    echo "  unlimited besteffort flowblind no-ack-filter no-split-gso"
+    echo "  -> queue present for under-load, but NO per-flow reshaping (the team-desync cause)."
+    return 0
+}
+
+add_mark(){
     nft add table inet gamedscp 2>/dev/null
     nft 'add chain inet gamedscp postrouting { type filter hook postrouting priority mangle ; policy accept ; }' 2>/dev/null
     nft flush chain inet gamedscp postrouting 2>/dev/null
-    nft add rule inet gamedscp postrouting ip saddr "$HOST" udp sport "$GAMEPORT" ip dscp set "$MARK" counter 2>/dev/null \
-        || { echo "nft rule failed"; return 1; }
-
-    # --- UNLIMITED CAKE with diffserv4 (honors the mark, no bandwidth cap) ---
-    ensure_cake || { echo "CAKE unavailable; mark set but no queue honors it."; return 1; }
-    tc qdisc del dev "$WAN" root 2>/dev/null
-    # unlimited = no shaping/cap; diffserv4 = 4 tins by DSCP; no latency added.
-    tc qdisc add dev "$WAN" root cake unlimited diffserv4 2>/dev/null \
-        || { echo "cake apply failed"; return 1; }
-
-    echo "BUILT:"
-    echo "  - game UDP ($HOST:$GAMEPORT) marked DSCP $MARK consistently"
-    echo "  - eth1 egress: CAKE unlimited diffserv4 (honors mark, no cap, no added latency)"
-    echo "  - CAKE only reorders by tin WHEN packets contend; idle = no effect"
-
-    # --- persist across reboot ---
-    mkdir -p /etc/hotplug.d/iface 2>/dev/null
-    cat > "$PERSIST" << PEOF
-#!/bin/sh
-[ "\$INTERFACE" = "wan" ] || [ "\$DEVICE" = "$WAN" ] || exit 0
-nft add table inet gamedscp 2>/dev/null
-nft 'add chain inet gamedscp postrouting { type filter hook postrouting priority mangle ; policy accept ; }' 2>/dev/null
-nft flush chain inet gamedscp postrouting 2>/dev/null
-nft add rule inet gamedscp postrouting ip saddr $HOST udp sport $GAMEPORT ip dscp set $MARK counter 2>/dev/null
-tc qdisc replace dev $WAN root cake unlimited diffserv4 2>/dev/null
-PEOF
-    chmod +x "$PERSIST" 2>/dev/null
-    echo "  - persisted: $PERSIST (re-applies on boot/wan-up)"
-}
-
-off() {
-    nft delete table inet gamedscp 2>/dev/null && echo "removed DSCP mark" || echo "(no mark active)"
-    tc qdisc del dev "$WAN" root 2>/dev/null && echo "removed CAKE" || echo "(no cake active)"
-    rm -f "$PERSIST" 2>/dev/null && echo "removed persistence" || true
-}
-
-status() {
-    echo "== coherence status =="
-    if nft list table inet gamedscp >/dev/null 2>&1; then
-        echo "DSCP mark: ACTIVE"; nft list table inet gamedscp 2>/dev/null | grep counter | sed 's/^/   /'
-    else echo "DSCP mark: not active"; fi
-    echo "eth1 qdisc:"; tc -s qdisc show dev "$WAN" 2>/dev/null | head -3 | sed 's/^/   /'
-    [ -f "$PERSIST" ] && echo "persistence: installed" || echo "persistence: not installed"
-}
-
-# ---- PART 2: under-load verification ----
-test_load() {
-    echo "=== UNDER-LOAD TEST ===" >&2
-    echo "Measures game-flow latency proxy (ping to a peer) BEFORE and DURING" >&2
-    echo "controlled egress load, to see if CAKE+DSCP protect the flow under stress." >&2
-    # pick a live peer to ping as a latency proxy
-    PEER=$(conntrack -L -p udp 2>/dev/null | grep "$GAMEPORT" | grep "$HOST" \
-        | sed -n 's/.*dst=\([0-9.]*\).*/\1/p' | grep -v '^192\.168\.' | head -1)
-    [ -z "$PEER" ] && PEER="8.8.8.8" && echo "(no live peer; using 8.8.8.8 as path proxy)" >&2
-    echo "latency target: $PEER" >&2
-
-    echo >&2; echo "-- baseline (idle) --" >&2
-    ping -c 10 -W 1 "$PEER" 2>/dev/null | sed -n 's@.*= \([0-9.]*\)/\([0-9.]*\)/\([0-9.]*\).*@   idle  min/avg/max = \1/\2/\3 ms@p'
-
-    echo >&2; echo "-- generating egress load (15s) + measuring during --" >&2
-    # saturate egress with a background flood to a sink; harmless, self-limited.
-    # use a big upload to a discard-like target via dd|nc if available, else ping flood.
-    if command -v nc >/dev/null 2>&1; then
-        ( dd if=/dev/zero bs=64k count=4000 2>/dev/null | nc -w 15 "$PEER" 9 2>/dev/null ) &
-        LOADPID=$!
-    else
-        ( ping -f -s 1400 "$PEER" >/dev/null 2>&1 ) & LOADPID=$!
-    fi
-    sleep 1
-    ping -c 10 -W 1 "$PEER" 2>/dev/null | sed -n 's@.*= \([0-9.]*\)/\([0-9.]*\)/\([0-9.]*\).*@   LOADED min/avg/max = \1/\2/\3 ms@p'
-    kill "$LOADPID" 2>/dev/null; kill -9 "$LOADPID" 2>/dev/null
-
-    echo >&2
-    echo "READING:" >&2
-    echo "  idle avg ~= loaded avg  -> CAKE+DSCP HELD the flow under load (coherence works)" >&2
-    echo "  loaded avg >> idle avg  -> flow NOT protected; CAKE tin/marking needs adjusting" >&2
-    echo "  (run with coherence OFF vs ON to compare: that is the real A/B.)" >&2
+    nft add rule inet gamedscp postrouting ip saddr "$HOST" udp sport "$GAMEPORT" ip dscp set cs4 counter 2>/dev/null \
+        && echo "  + DSCP CS4 mark added (note: besteffort = CAKE ignores it locally; mark only matters downstream)"
 }
 
 case "$1" in
-    build ) build ;;
-    test )  test_load ;;
-    status ) status ;;
-    off|remove ) off ;;
-    * ) echo "usage: sh coherence-setup.sh [build|test|status|off]"; exit 1 ;;
+    on )   apply_lite ;;
+    mark ) apply_lite && add_mark ;;
+    off|remove )
+        tc qdisc del dev "$WAN" root 2>/dev/null && echo "CAKE removed -> stock mq/fq_codel restored." || echo "(no cake active)"
+        nft delete table inet gamedscp 2>/dev/null && echo "DSCP mark removed." || true
+        ;;
+    status )
+        echo "== coherence-lite status =="
+        echo "$WAN qdisc:"; tc -s qdisc show dev "$WAN" 2>/dev/null | head -3 | sed 's/^/   /'
+        nft list table inet gamedscp >/dev/null 2>&1 && echo "DSCP mark: ACTIVE" || echo "DSCP mark: not active"
+        ;;
+    * ) echo "usage: sh coherence-lite.sh [on|mark|off|status]" ;;
 esac
+
+if [ "$1" = "on" ] || [ "$1" = "mark" ]; then
+    echo
+    echo "TEAMMATES ARE THE TEST: play a session, watch if they are free again."
+    echo "  free again -> lite coexists with team play, keep it."
+    echo "  still desynced -> go fully stock: sh coherence-lite.sh off"
+fi
