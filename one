@@ -51,4 +51,4 @@ case "$1" in
         nft delete table inet "$TABLE" 2>/dev/null && echo "torn down -> game flow no longer queued." || echo "(not active)"
         ;;
     * ) echo "usage: sh phase-pacer.sh [on|off]" ;;
-esac
+esac 
