@@ -9,13 +9,13 @@ wire(){
     nft add table ip "$TABLE" || return 1
 
     nft "add chain ip $TABLE post { type filter hook postrouting priority 0 ; policy accept ; }" || return 1
-    nft "add chain ip $TABLE pre  { type filter hook prerouting  priority 0 ; policy accept ; }" || return 1
+    nft "add chain ip $TABLE fwd  { type filter hook forward     priority 0 ; policy accept ; }" || return 1
 
-    # outbound console -> server: PS5 source port is 3659
+    # outbound console -> server
     nft add rule ip "$TABLE" post ip saddr "$HOST" udp sport "$GP" counter queue num "$QNUM" || return 1
 
-    # inbound server -> console: PS5 destination port is 3659
-    nft add rule ip "$TABLE" pre ip daddr "$HOST" udp dport "$GP" counter queue num "$QNUM" || return 1
+    # inbound server -> console, after routing/NAT decision
+    nft add rule ip "$TABLE" fwd ip daddr "$HOST" udp dport "$GP" counter queue num "$QNUM" || return 1
 
     return 0
 }
@@ -34,7 +34,7 @@ case "$1" in
             exit 1
         }
 
-        echo "wired IPv4 game flow (both dirs) -> NFQUEUE $QNUM. Launching ctypes pacer." >&2
+        echo "wired IPv4 game flow (out postrouting, in forward) -> NFQUEUE $QNUM. Launching ctypes pacer." >&2
         echo "Ctrl-C to stop & tear down. WATCH the lock= value." >&2
 
         trap 'nft delete table ip "$TABLE" 2>/dev/null; echo; echo "torn down."; exit 0' INT TERM
