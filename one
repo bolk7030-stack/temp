@@ -38,10 +38,21 @@ cleanup(){ tc qdisc del dev "$WAN" root 2>/dev/null; nft delete table inet phase
 trap 'echo; echo "phase-fold OFF -> restored"; cleanup; exit 0' INT TERM
 
 ensure_netem(){
-    tc qdisc add dev "$WAN" root handle 99: netem delay 1ms 2>/dev/null && { tc qdisc del dev "$WAN" root 2>/dev/null; return 0; }
+    # clear any existing root first so an OCCUPIED root doesn't masquerade as
+    # "netem missing" (your box prints netem: version 1.3 -> netem IS present).
+    tc qdisc del dev "$WAN" root 2>/dev/null
+    if tc qdisc replace dev "$WAN" root handle 99: netem delay 1ms 2>/dev/null; then
+        tc qdisc del dev "$WAN" root 2>/dev/null
+        return 0
+    fi
+    # try install only if the replace genuinely failed
     command -v apk >/dev/null 2>&1 && apk add kmod-sched-netem >/dev/null 2>&1
     command -v opkg >/dev/null 2>&1 && opkg install kmod-sched-netem >/dev/null 2>&1
-    tc qdisc add dev "$WAN" root handle 99: netem delay 1ms 2>/dev/null && { tc qdisc del dev "$WAN" root 2>/dev/null; return 0; }
+    tc qdisc del dev "$WAN" root 2>/dev/null
+    if tc qdisc replace dev "$WAN" root handle 99: netem delay 1ms 2>/dev/null; then
+        tc qdisc del dev "$WAN" root 2>/dev/null
+        return 0
+    fi
     return 1
 }
 
