@@ -1,84 +1,71 @@
 #!/usr/bin/env python3
-# flow-fusion.py -- isolate each game flow, measure each INDEPENDENTLY, FUSE into
-# one connection-state estimate, and act ONLY when independent sources AGREE.
+# flow-fusion.py v1.1 -- v1 (no game-filter, correct for a box that ONLY carries
+# game traffic) + two minimal, honest improvements:
+#   (1) LIVENESS guard: a flow only votes if it's still actually moving bytes,
+#       so stale/dead conntrack entries don't pollute the agreement count.
+#       This is NOT the v3 game-filter (which wrongly discarded real game flows
+#       on a single-purpose box) -- it only drops DEAD flows, keeps every live one.
+#   (2) Tunable baseline-rate + threshold (the knobs that actually matter in v1).
 #
-# The honest fusion idea (NOT the dead fold): your traffic is multi-source P2P
-# (server :3659 + peers), so you have GENUINELY INDEPENDENT views of your
-# connection state. Fusion absorbs per-path noise and surfaces the shared signal.
-# When independent flows AGREE quality is degrading, that's real (agreement =
-# signal). When one spikes alone, it's that path's noise (no agreement -> ignore).
+# All flows on this Protectli are your game/EA/peer traffic, so we fuse ALL live
+# flows -- that's the full set of independent sources, exactly what fusion wants.
 #
-# ACTION at agreement: invariant-preserving only -- it RE-MARKS (DSCP) to a
-# degraded-state profile when sources agree, reverts when they agree it's clean.
-# It does NOT perturb timing/content (that lever is measured-dead). Marking is
-# the only operation that holds the flow invariant.
-#
-# READ-ONLY by default (MODE=monitor): just prints the fused state so you can SEE
-# the agreement working before letting it act. Set MODE=act to enable re-marking.
-#
-# Reads flows passively via conntrack/ss sampling (no NFQUEUE hop, no added
-# latency). Env: HOST, MODE(monitor|act), WIN, AGREE_THRESH
+# Env: FF_HOST, FF_MODE(monitor|act), FF_WIN, FF_AGREE, FF_BASE, FF_SENS, FF_STALE
 
 import os, time, subprocess, collections, sys, re
 
 HOST   = os.environ.get("FF_HOST", "192.168.10.50")
-MODE   = os.environ.get("FF_MODE", "monitor")   # monitor | act
-WIN    = float(os.environ.get("FF_WIN", "2.0"))  # sampling window seconds
-# how many independent flows must agree "degraded" to call it real
+MODE   = os.environ.get("FF_MODE", "monitor")
+WIN    = float(os.environ.get("FF_WIN", "2.0"))
 AGREE  = int(os.environ.get("FF_AGREE", "2"))
+# the two knobs that matter in v1:
+BASE   = float(os.environ.get("FF_BASE", "0.02"))  # baseline adapt rate (higher=faster forget)
+SENS   = float(os.environ.get("FF_SENS", "1.5"))   # degraded = jitter > SENS*baseline
+# liveness: a flow must have moved bytes within this many windows to still vote
+STALE  = int(os.environ.get("FF_STALE", "2"))
 TABLE  = "gamefusion"
 
-# ---- per-flow independent jitter sensor ----
 class FlowSensor:
-    """Tracks one remote endpoint's packet timing independently."""
     def __init__(s, key):
-        s.key=key
-        s.last_bytes=None
-        s.iv=collections.deque(maxlen=30)   # inter-sample deltas
-        s.base_jit=None                      # learned baseline jitter
-    def update(s, bytecount, t):
-        # we can't timestamp each packet without NFQUEUE, so we sample the flow's
-        # byte-rate cadence via conntrack counters; jitter in the rate of change
-        # is our per-flow independent quality proxy.
+        s.key=key; s.last_bytes=None
+        s.iv=collections.deque(maxlen=30)
+        s.base_jit=None
+        s.idle_windows=0            # consecutive windows with no byte movement
+    def update(s, bytecount):
         if s.last_bytes is not None:
-            d = bytecount - s.last_bytes
-            if d >= 0:
-                s.iv.append(d)
-        s.last_bytes = bytecount
+            d=bytecount-s.last_bytes
+            if d>0:
+                s.iv.append(d); s.idle_windows=0
+            else:
+                s.idle_windows+=1   # no movement this window
+        s.last_bytes=bytecount
+    def live(s):
+        # still an active flow (not a stale conntrack leftover)
+        return s.idle_windows < STALE
     def jitter(s):
-        if len(s.iv) < 8: return None
-        m = sum(s.iv)/len(s.iv)
-        if m <= 0: return None
-        var = sum((x-m)**2 for x in s.iv)/len(s.iv)
-        cv = (var**0.5)/m
-        return cv
+        if len(s.iv)<8: return None
+        m=sum(s.iv)/len(s.iv)
+        if m<=0: return None
+        var=sum((x-m)**2 for x in s.iv)/len(s.iv)
+        return (var**0.5)/m
     def degraded(s):
-        # degraded = current jitter notably above this flow's own baseline
-        j = s.jitter()
+        j=s.jitter()
         if j is None: return None
         if s.base_jit is None:
-            s.base_jit = j; return False
-        # slow-adapt baseline; flag if 50% above baseline
-        s.base_jit = 0.98*s.base_jit + 0.02*j
-        return j > 1.5*s.base_jit
+            s.base_jit=j; return False
+        s.base_jit=(1.0-BASE)*s.base_jit + BASE*j   # tunable adapt rate
+        return j > SENS*s.base_jit
 
 def sample_flows():
-    """Return {remote_key: total_bytes} for UDP flows involving HOST, via conntrack."""
     flows={}
     try:
         out=subprocess.run(["conntrack","-L","-p","udp"],capture_output=True,
                            text=True,timeout=2).stdout
     except Exception:
-        # fallback: /proc/net/nf_conntrack
-        try:
-            out=open("/proc/net/nf_conntrack").read()
-        except Exception:
-            return flows
+        try: out=open("/proc/net/nf_conntrack").read()
+        except Exception: return flows
     for line in out.splitlines():
         if HOST not in line: continue
-        # pull remote ip:port pairs and byte counts where present
-        ips=re.findall(r'src=(\S+) dst=(\S+).*?bytes=(\d+)', line)
-        # build a key from the non-HOST endpoint
         m=re.findall(r'(\d+\.\d+\.\d+\.\d+)',line)
         b=re.findall(r'bytes=(\d+)',line)
         remote=None
@@ -89,61 +76,48 @@ def sample_flows():
             flows[remote]=flows.get(remote,0)+tot
     return flows
 
-# ---- DSCP re-mark actions (invariant-preserving) ----
-def mark(profile):
-    # profile 'clean' -> EF, 'degraded' -> still EF but could shift; here we keep
-    # marking consistent and just (re)assert it. The hook for state-based change.
-    dscp = "ef"
-    subprocess.run(["nft","delete","table","ip",TABLE],
-                   stderr=subprocess.DEVNULL)
-    rules=f"""table ip {TABLE} {{
-  chain post {{
-    type filter hook postrouting priority 0; policy accept;
-    ip saddr {HOST} udp ip dscp set {dscp} counter
-    ip daddr {HOST} udp ip dscp set {dscp} counter
-  }}
-}}"""
-    subprocess.run(["nft","-f","-"],input=rules,text=True,
-                   stderr=subprocess.DEVNULL)
-
+def mark(_p=None):
+    subprocess.run(["nft","delete","table","ip",TABLE],stderr=subprocess.DEVNULL)
+    rules=(f"table ip {TABLE} {{ chain post {{ "
+           f"type filter hook postrouting priority 0; policy accept; "
+           f"ip saddr {HOST} udp ip dscp set ef counter; "
+           f"ip daddr {HOST} udp ip dscp set ef counter; }} }}")
+    subprocess.run(["nft","-f","-"],input=rules,text=True,stderr=subprocess.DEVNULL)
 def unmark():
     subprocess.run(["nft","delete","table","ip",TABLE],stderr=subprocess.DEVNULL)
 
 def main():
-    sensors={}
-    state="clean"
-    sys.stderr.write(f"flow-fusion: HOST={HOST} MODE={MODE} need {AGREE} independent "
-                     f"flows to agree. {'(monitoring only)' if MODE!='act' else '(WILL act)'}\n")
-    if MODE=="act": mark("clean")
+    sensors={}; state="clean"
+    sys.stderr.write(f"flow-fusion v1.1: HOST={HOST} MODE={MODE} AGREE={AGREE} "
+                     f"BASE={BASE} SENS={SENS} (all live flows, no game-filter)\n")
+    if MODE=="act": mark()
     try:
         while True:
-            t=time.time()
             flows=sample_flows()
-            # update each independent flow sensor
-            for key,b in flows.items():
-                if key not in sensors: sensors[key]=FlowSensor(key)
-                sensors[key].update(b,t)
-            # fuse: count how many INDEPENDENT flows say "degraded"
-            verdicts={k:s.degraded() for k,s in sensors.items()}
-            ready=[v for v in verdicts.values() if v is not None]
-            deg=sum(1 for v in verdicts.values() if v is True)
+            for k,b in flows.items():
+                sensors.setdefault(k,FlowSensor(k)).update(b)
+            # vote: ALL LIVE flows (liveness guard only -- no game-filtering)
+            verdicts={k:s.degraded() for k,s in sensors.items() if s.live()}
+            ready={k:v for k,v in verdicts.items() if v is not None}
+            deg=sum(1 for v in ready.values() if v)
             total=len(ready)
-            # agreement gate: only real if >=AGREE independent flows agree
-            agreed = deg>=AGREE
-            jits={k:(round(s.jitter(),3) if s.jitter() else None) for k,s in sensors.items()}
-            sys.stderr.write(f"[fusion] flows={total} degraded={deg} agreed={agreed} "
-                             f"state={state} jit={jits}\n"); sys.stderr.flush()
-            # act on AGREEMENT transitions only (hysteresis via state)
+            agreed=deg>=AGREE
+            live_n=sum(1 for s in sensors.values() if s.live())
+            trans=""
             if agreed and state=="clean":
                 state="degraded"
-                if MODE=="act":
-                    mark("degraded")
-                    sys.stderr.write("  >> AGREEMENT: independent flows concur degraded -> re-marked.\n")
+                if MODE=="act": mark(); trans="  >> AGREEMENT degraded -> re-marked"
+                else: trans="  >> AGREEMENT degraded"
             elif not agreed and state=="degraded":
                 state="clean"
-                if MODE=="act":
-                    mark("clean")
-                    sys.stderr.write("  >> cleared: flows no longer agree degraded -> reverted.\n")
+                if MODE=="act": mark(); trans="  >> cleared -> reverted"
+                else: trans="  >> cleared"
+            jits={k:(round(s.jitter(),3) if s.jitter() else None)
+                  for k,s in sensors.items() if s.live()}
+            sys.stderr.write(f"[fusion] live={live_n} voting={total} degraded={deg} "
+                             f"agreed={agreed} state={state} jit={jits}\n")
+            if trans: sys.stderr.write(trans+"\n")
+            sys.stderr.flush()
             time.sleep(WIN)
     except KeyboardInterrupt:
         pass
