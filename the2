@@ -1,77 +1,28 @@
 #!/bin/sh
-# phase-pacer.sh -- wire game flow into NFQUEUE (BOTH dirs at postrouting, post-NAT)
-# and run the ctypes pacer. Adds a `test` mode + flow-offload check to fix in=0.
+# flow-fusion.sh -- run the isolate+fuse connection-state estimator.
+# Isolates each game flow (server + peers), measures each INDEPENDENTLY, fuses,
+# acts ONLY when independent sources AGREE. Passive sampling (no added latency).
 #
-# Usage:
-#   sh phase-pacer.sh test   # diagnostic: port-less inbound, see if `in` climbs
-#   sh phase-pacer.sh on      # real run, both dirs matched at postrouting
-#   sh phase-pacer.sh off     # tear down
+#   sh flow-fusion.sh monitor   # READ-ONLY: watch the fused agreement signal
+#   sh flow-fusion.sh act        # enable invariant-preserving re-marking on agreement
+#   sh flow-fusion.sh off        # remove any marking table
 
-HOST="192.168.10.50"; GP="3659"; QNUM="0"; TABLE="phasepacer"
-DIR="$(dirname "$0")"
+HOST="192.168.10.50"; DIR="$(dirname "$0")"
 
-offload_check(){
-    if nft list ruleset 2>/dev/null | grep -qi "flow.*offload\|offload.*flow"; then
-        echo "*** WARNING: flow offloading appears ENABLED. This BYPASSES nft hooks" >&2
-        echo "    and is the likely cause of in=0. Disable it: LuCI > Network >" >&2
-        echo "    Firewall > uncheck 'Software flow offloading', then retry." >&2
-        echo "    (continuing anyway, but inbound may stay 0 until offload is off)" >&2
-    fi
-}
-
-# diagnostic: match inbound by ADDRESS ONLY (no port) at postrouting (post-NAT).
-# if `in` climbs -> hook+address correct, only the port assumption was wrong.
-wire_test(){
-    nft delete table ip "$TABLE" 2>/dev/null
-    nft -f - <<EOF || return 1
-table ip $TABLE {
-    chain post {
-        type filter hook postrouting priority 0; policy accept;
-        ip saddr $HOST udp sport $GP counter queue num $QNUM
-        ip daddr $HOST counter queue num $QNUM
-    }
-}
-EOF
-    return 0
-}
-
-# real: both directions, port-constrained, at postrouting (post-NAT addresses visible)
-wire_on(){
-    nft delete table ip "$TABLE" 2>/dev/null
-    nft -f - <<EOF || return 1
-table ip $TABLE {
-    chain post {
-        type filter hook postrouting priority 0; policy accept;
-        ip saddr $HOST udp sport $GP counter queue num $QNUM
-        ip daddr $HOST udp dport $GP counter queue num $QNUM
-    }
-}
-EOF
-    return 0
-}
-
-launch(){
-    modprobe nfnetlink_queue 2>/dev/null; modprobe nft_queue 2>/dev/null
-    python3 -c "import ctypes; ctypes.CDLL('/usr/lib/libnetfilter_queue.so.1')" 2>/dev/null \
-        || { echo "ERROR: can't load libnetfilter_queue.so.1"; exit 1; }
-    offload_check
-    trap 'nft delete table ip "$TABLE" 2>/dev/null; echo; echo "torn down."; exit 0' INT TERM
-    echo "running. WATCH: in= should climb now. Then watch lock= (>=0.6 = real tick)." >&2
-    PHASE_HOST="$HOST" PHASE_PORT="$GP" PHASE_QNUM="$QNUM" python3 "$DIR/phase-pacer-ctypes.py"
-    nft delete table ip "$TABLE" 2>/dev/null
-}
+# ensure conntrack tool exists (for passive per-flow sampling)
+have_ct(){ command -v conntrack >/dev/null 2>&1 || [ -r /proc/net/nf_conntrack ]; }
 
 case "$1" in
-    test )
-        wire_test || { echo "nft wiring failed"; nft delete table ip "$TABLE" 2>/dev/null; exit 1; }
-        echo "TEST MODE: inbound matched by ADDRESS ONLY (no port). If in= climbs," >&2
-        echo "the hook+address are right and only the port was wrong. Ctrl-C to stop." >&2
-        launch ;;
-    on )
-        wire_on || { echo "nft wiring failed"; nft delete table ip "$TABLE" 2>/dev/null; exit 1; }
-        echo "ON: both directions at postrouting, port $GP. Ctrl-C to stop & tear down." >&2
-        launch ;;
+    monitor )
+        have_ct || { echo "need conntrack or /proc/net/nf_conntrack"; exit 1; }
+        echo "MONITOR: watching independent flows for AGREEMENT. Ctrl-C to stop." >&2
+        FF_HOST="$HOST" FF_MODE="monitor" python3 "$DIR/flow-fusion.py" ;;
+    act )
+        have_ct || { echo "need conntrack or /proc/net/nf_conntrack"; exit 1; }
+        echo "ACT: will re-mark on independent-flow agreement. Ctrl-C stops & cleans." >&2
+        trap 'nft delete table ip gamefusion 2>/dev/null; exit 0' INT TERM
+        FF_HOST="$HOST" FF_MODE="act" python3 "$DIR/flow-fusion.py" ;;
     off )
-        nft delete table ip "$TABLE" 2>/dev/null && echo "torn down." || echo "(not active)" ;;
-    * ) echo "usage: sh phase-pacer.sh [test|on|off]" ;;
+        nft delete table ip gamefusion 2>/dev/null && echo "removed." || echo "(not active)" ;;
+    * ) echo "usage: sh flow-fusion.sh [monitor|act|off]" ;;
 esac
