@@ -1,147 +1,54 @@
-#!/usr/bin/env python3
-# phase-pacer.py -- REAL phase folding by INCOMING-inferred tick.
+#!/bin/sh
+# phase-pacer.sh -- wire the game flow into NFQUEUE and run the REAL phase pacer
+# (phase-pacer.py), which folds outbound packets by INFERRED TICK PHASE from the
+# inbound stream -- the honest "fold by incoming, not by count" version.
 #
-# This is the honest version of "fold by phase, not by count." It:
-#   1. watches INBOUND game packets, learns the server tick period + phase,
-#   2. classifies each OUTBOUND packet by its phase vs that inferred tick,
-#   3. FOLDS only the slow-phase outbound packets (holds them briefly so they
-#      land at the start of the next tick window), passes fast-phase ones clean.
+# Requires: python3, python3-netfilterqueue. Installs attempt via apk/opkg.
 #
-# *** EXPLORATORY. Works ONLY if inbound reveals a STABLE tick. If inbound is a
-#     smear, the phase estimate is garbage and this folds noise. It self-reports
-#     the tick-lock quality so you can SEE whether the phase is real. ***
+# Usage:
+#   sh phase-pacer.sh on     # wire nft -> NFQUEUE, launch pacer (watch the lock!)
+#   sh phase-pacer.sh off    # tear down
 #
-# Mechanism: nftables enqueues the game flow to NFQUEUE; this daemon decides
-# per-packet to accept-now or hold-then-accept. Inserts a userspace hop (has its
-# own small cost) -- measure that it nets positive.
-#
-# Requires: python3, python3-netfilterqueue, python3-scapy (or raw parsing).
-# Setup (run the companion phase-pacer.sh to wire nft + launch this).
-#
-# Tunables via env: PHASE_HOST, PHASE_PORT, FOLD_GUARD_MS, SLOW_FRAC
+# WATCH THE OUTPUT: it prints tick-lock quality every 5s. If lock stays <0.4,
+# inbound is a smear -> there's no stable tick -> the pacer correctly DOESN'T fold,
+# and that's your answer that the phase isn't real. If lock is high (>0.6) and
+# stable, the phase is real and the pacer is genuinely folding slow-phase packets.
 
-import os, time, struct, threading, collections, sys
-try:
-    from netfilterqueue import NetfilterQueue
-except ImportError:
-    sys.exit("need python3-netfilterqueue: opkg/apk add python3-netfilterqueue")
+HOST="192.168.10.50"; GP="3659"; QNUM=0
+TABLE="phasepacer"
 
-HOST = os.environ.get("PHASE_HOST", "192.168.10.50")
-PORT = int(os.environ.get("PHASE_PORT", "3659"))
-# guard: don't fold a packet by more than this (safety: never add huge delay)
-FOLD_GUARD_MS = float(os.environ.get("FOLD_GUARD_MS", "16"))
-# what fraction of the tick counts as "slow phase" (the late part of the window)
-SLOW_FRAC = float(os.environ.get("SLOW_FRAC", "0.5"))
+deps(){
+    if python3 -c "import netfilterqueue" 2>/dev/null; then return 0; fi
+    echo "installing python3-netfilterqueue ..." >&2
+    command -v apk >/dev/null 2>&1 && apk add python3-netfilterqueue python3 >/dev/null 2>&1
+    command -v opkg >/dev/null 2>&1 && opkg update >/dev/null 2>&1 && opkg install python3-netfilterqueue python3 >/dev/null 2>&1
+    python3 -c "import netfilterqueue" 2>/dev/null
+}
 
-# ---- tick estimator (learned from INBOUND inter-arrival) ----
-class TickEstimator:
-    def __init__(self):
-        self.last_in = None
-        self.intervals = collections.deque(maxlen=64)
-        self.period = 0.0333   # seed: 30Hz
-        self.phase0 = None     # reference epoch for phase=0
-        self.lock = threading.Lock()
+wire(){
+    nft delete table inet "$TABLE" 2>/dev/null
+    nft add table inet "$TABLE" || return 1
+    nft "add chain inet $TABLE q { type filter hook postrouting priority mangle ; policy accept ; }" || return 1
+    # enqueue BOTH directions of the game flow to NFQUEUE so the pacer sees inbound+outbound
+    nft add rule inet "$TABLE" q ip saddr "$HOST" udp sport "$GP" queue num "$QNUM" bypass 2>/dev/null
+    nft add rule inet "$TABLE" q ip daddr "$HOST" udp dport "$GP" queue num "$QNUM" bypass 2>/dev/null
+    # also catch inbound on prerouting (server->console arrives there)
+    nft "add chain inet $TABLE pre { type filter hook prerouting priority mangle ; policy accept ; }" 2>/dev/null
+    nft add rule inet "$TABLE" pre ip daddr "$HOST" udp sport "$GP" queue num "$QNUM" bypass 2>/dev/null
+    return 0
+}
 
-    def on_inbound(self, t):
-        with self.lock:
-            if self.last_in is not None:
-                dt = t - self.last_in
-                if 0.005 < dt < 0.100:        # plausible 10-200Hz
-                    self.intervals.append(dt)
-                    if len(self.intervals) >= 8:
-                        s = sorted(self.intervals)
-                        self.period = s[len(s)//2]   # median interval = tick period
-                    self.phase0 = t              # anchor phase to latest inbound
-            self.last_in = t
-
-    def quality(self):
-        # tick-lock quality: low spread of intervals = stable tick = real phase
-        with self.lock:
-            if len(self.intervals) < 8: return 0.0, self.period
-            m = sum(self.intervals)/len(self.intervals)
-            var = sum((x-m)**2 for x in self.intervals)/len(self.intervals)
-            # coefficient of variation inverted -> 1.0 = rock-steady, ~0 = smear
-            cv = (var**0.5)/m if m>0 else 1.0
-            return max(0.0, 1.0 - cv), self.period
-
-    def outbound_phase(self, t):
-        # phase in [0,1): where in the current tick window this outbound packet sits
-        with self.lock:
-            if self.phase0 is None: return None
-            p = ((t - self.phase0) % self.period) / self.period
-            return p
-
-est = TickEstimator()
-stats = {"in":0,"out":0,"folded":0,"passed":0}
-
-def handle(pkt):
-    raw = pkt.get_payload()
-    t = time.time()
-    # parse IP src/dst + UDP ports minimally (IPv4)
-    try:
-        ihl = (raw[0] & 0x0F) * 4
-        proto = raw[9]
-        src = ".".join(str(b) for b in raw[12:16])
-        dst = ".".join(str(b) for b in raw[16:20])
-        if proto != 17:   # not UDP
-            pkt.accept(); return
-        sport = struct.unpack("!H", raw[ihl:ihl+2])[0]
-        dport = struct.unpack("!H", raw[ihl+2:ihl+4])[0]
-    except Exception:
-        pkt.accept(); return
-
-    # INBOUND: server -> console (learn tick)
-    if dst == HOST and sport == PORT:
-        stats["in"] += 1
-        est.on_inbound(t)
-        pkt.accept(); return
-
-    # OUTBOUND: console -> server (classify + maybe fold)
-    if src == HOST and sport == PORT:
-        stats["out"] += 1
-        ph = est.outbound_phase(t)
-        if ph is None:
-            pkt.accept(); stats["passed"] += 1; return
-        # slow phase = the LATE part of the window (ph in [1-SLOW_FRAC, 1))
-        if ph >= (1.0 - SLOW_FRAC):
-            # fold: hold so it lands at the start of next window
-            q, period = est.quality()
-            fold_s = (1.0 - ph) * period
-            fold_s = min(fold_s, FOLD_GUARD_MS/1000.0)
-            # only fold if tick-lock quality is decent; else it's noise -> pass
-            if q >= 0.4 and fold_s > 0.0005:
-                time.sleep(fold_s)      # the fold (userspace hold)
-                stats["folded"] += 1
-            else:
-                stats["passed"] += 1
-        else:
-            stats["passed"] += 1
-        pkt.accept(); return
-
-    pkt.accept()
-
-def reporter():
-    while True:
-        time.sleep(5)
-        q, period = est.quality()
-        tickhz = (1.0/period) if period>0 else 0
-        print(f"[pacer] tick~{tickhz:.1f}Hz lock={q:.2f} "
-              f"in={stats['in']} out={stats['out']} "
-              f"folded={stats['folded']} passed={stats['passed']}", file=sys.stderr)
-        if q < 0.4 and stats['in'] > 50:
-            print("        ^ LOW LOCK: inbound is a smear, no stable tick -> "
-                  "pacer is NOT folding (correctly). Phase may not be real.", file=sys.stderr)
-
-if __name__ == "__main__":
-    threading.Thread(target=reporter, daemon=True).start()
-    nfq = NetfilterQueue()
-    nfq.bind(int(os.environ.get("PHASE_QNUM","0")), handle)
-    print(f"phase-pacer running: host={HOST} port={PORT} slow_frac={SLOW_FRAC} "
-          f"guard={FOLD_GUARD_MS}ms. Watching tick-lock; folds only when lock>=0.4.",
-          file=sys.stderr)
-    try:
-        nfq.run()
-    except KeyboardInterrupt:
-        print("\nphase-pacer stopped.", file=sys.stderr)
-    finally:
-        nfq.unbind()
+case "$1" in
+    on )
+        deps || { echo "ERROR: python3-netfilterqueue unavailable. Can't run real pacer."; exit 1; }
+        wire || { echo "nft wiring failed"; nft delete table inet "$TABLE" 2>/dev/null; exit 1; }
+        echo "wired game flow -> NFQUEUE $QNUM. Launching pacer (Ctrl-C to stop & tear down)." >&2
+        trap 'nft delete table inet "$TABLE" 2>/dev/null; echo; echo "torn down."; exit 0' INT TERM
+        PHASE_HOST="$HOST" PHASE_PORT="$GP" PHASE_QNUM="$QNUM" python3 "$(dirname "$0")/phase-pacer.py"
+        nft delete table inet "$TABLE" 2>/dev/null
+        ;;
+    off )
+        nft delete table inet "$TABLE" 2>/dev/null && echo "torn down -> game flow no longer queued." || echo "(not active)"
+        ;;
+    * ) echo "usage: sh phase-pacer.sh [on|off]" ;;
+esac
