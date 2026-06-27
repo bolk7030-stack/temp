@@ -1,14 +1,5 @@
 #!/bin/sh
 # phase-pacer.sh -- wire game flow into NFQUEUE and run the ctypes pacer.
-# Uses phase-pacer-ctypes.py (binds libnetfilter_queue.so.1 directly; no
-# python3-netfilterqueue package needed).
-#
-# Usage:
-#   sh phase-pacer.sh on     # wire nft -> NFQUEUE q0, launch pacer (WATCH THE LOCK)
-#   sh phase-pacer.sh off    # tear down
-#
-# WATCH lock= in the output. lock>=0.6 stable = real tick (pacer folds).
-# lock<0.4 = inbound smear, no stable phase (pacer correctly does NOT fold).
 
 HOST="192.168.10.50"; GP="3659"; QNUM=0; TABLE="phasepacer"
 DIR="$(dirname "$0")"
@@ -18,8 +9,7 @@ wire(){
     nft add table inet "$TABLE" || return 1
     nft "add chain inet $TABLE post { type filter hook postrouting priority mangle ; policy accept ; }" || return 1
     nft "add chain inet $TABLE pre  { type filter hook prerouting  priority mangle ; policy accept ; }" || return 1
-    # outbound console->server  AND inbound server->console -> queue 0 (bypass = if no
-    # listener, packets pass instead of dropping; safety)
+
     nft add rule inet "$TABLE" post ip saddr "$HOST" udp sport "$GP" queue num "$QNUM" bypass || return 1
     nft add rule inet "$TABLE" pre  ip daddr "$HOST" udp sport "$GP" queue num "$QNUM" bypass || return 1
     return 0
@@ -28,17 +18,51 @@ wire(){
 case "$1" in
     on )
         modprobe nfnetlink_queue 2>/dev/null
-        python3 -c "import ctypes; ctypes.CDLL('/usr/lib/libnetfilter_queue.so.1')" 2>/dev/null \
-            || { echo "ERROR: can't load libnetfilter_queue.so.1"; exit 1; }
-        wire || { echo "nft wiring failed"; nft delete table inet "$TABLE" 2>/dev/null; exit 1; }
+
+        NFQ_LIB=""
+        for L in \
+            /usr/lib/libnetfilter_queue.so.1 \
+            /usr/lib/libnetfilter_queue.so.1.5.0 \
+            libnetfilter_queue.so.1
+        do
+            python3 -c "import ctypes; ctypes.CDLL('$L')" 2>/tmp/nfq-load.err && {
+                NFQ_LIB="$L"
+                break
+            }
+        done
+
+        [ -n "$NFQ_LIB" ] || {
+            echo "ERROR: can't load libnetfilter_queue"
+            cat /tmp/nfq-load.err
+            exit 1
+        }
+
+        wire || {
+            echo "nft wiring failed"
+            nft delete table inet "$TABLE" 2>/dev/null
+            exit 1
+        }
+
         echo "wired game flow (both dirs) -> NFQUEUE $QNUM. Launching ctypes pacer." >&2
+        echo "using NFQ lib: $NFQ_LIB" >&2
         echo "Ctrl-C to stop & tear down. WATCH the lock= value." >&2
+
         trap 'nft delete table inet "$TABLE" 2>/dev/null; echo; echo "torn down."; exit 0' INT TERM
-        PHASE_HOST="$HOST" PHASE_PORT="$GP" PHASE_QNUM="$QNUM" python3 "$DIR/phase-pacer-ctypes.py"
+
+        PHASE_HOST="$HOST" \
+        PHASE_PORT="$GP" \
+        PHASE_QNUM="$QNUM" \
+        PHASE_NFQ_LIB="$NFQ_LIB" \
+        python3 "$DIR/phase-pacer-ctypes.py"
+
         nft delete table inet "$TABLE" 2>/dev/null
         ;;
+
     off )
         nft delete table inet "$TABLE" 2>/dev/null && echo "torn down." || echo "(not active)"
         ;;
-    * ) echo "usage: sh phase-pacer.sh [on|off]" ;;
+
+    * )
+        echo "usage: sh phase-pacer.sh [on|off]"
+        ;;
 esac
