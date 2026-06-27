@@ -22,6 +22,7 @@ AGREE    = int(os.environ.get("FF_AGREE", "2"))      # independent flows needed
 MINBYTES = int(os.environ.get("FF_MINBYTES", "1"))   # "moved >0 bytes" floor (latency-tolerant)
 PERSIST  = int(os.environ.get("FF_PERSIST", "4"))    # windows a flow must persist to qualify
 SENS     = float(os.environ.get("FF_SENS", "1.5"))   # degraded = jitter > SENS*baseline
+DWELL    = int(os.environ.get("FF_DWELL", "3"))      # windows agreement must persist before acting (anti-flicker)
 TABLE    = "gamefusion"
 
 class FlowSensor:
@@ -92,11 +93,11 @@ def unmark():
     subprocess.run(["nft","delete","table","ip",TABLE],stderr=subprocess.DEVNULL)
 
 def main():
-    sensors={}; state="clean"
+    sensors={}; state="clean"; persist_ctr=[0]
     sys.stderr.write(f"flow-fusion v3: HOST={HOST} MODE={MODE} "
                      f"need {AGREE} independent game-flows to AGREE degraded "
-                     f"(discrete+persistence-filter, latency-tolerant)\n")
-    if MODE=="act": mark()
+                     f"(discrete+persistence-filter, anti-flicker dwell, no-churn)\n")
+    if MODE=="act": mark()   # set marking table ONCE; never rebuilt on transitions
     try:
         while True:
             flows=sample_flows()
@@ -108,18 +109,19 @@ def main():
             deg=sum(1 for v in ready.values() if v)
             ng=len(ready)
             agreed = deg>=AGREE
+            # anti-flicker: require agreement to PERSIST DWELL windows before flipping.
+            if agreed: persist_ctr[0]=min(DWELL, persist_ctr[0]+1)
+            else:      persist_ctr[0]=max(0, persist_ctr[0]-1)
             trans=""
-            if state=="clean" and agreed:
-                state="degraded"
-                if MODE=="act": mark(); trans="  >> AGREEMENT degraded -> re-marked"
-                else: trans="  >> AGREEMENT degraded"
-            elif state=="degraded" and not agreed:
-                state="clean"
-                if MODE=="act": mark(); trans="  >> cleared -> reverted"
-                else: trans="  >> cleared"
+            if state=="clean" and persist_ctr[0]>=DWELL:
+                state="degraded"; trans="  >> AGREEMENT degraded (persisted)"
+                # NOTE: table is set ONCE at startup; we do NOT rebuild it here,
+                # so the live flow's marking rule is never torn down mid-game.
+            elif state=="degraded" and persist_ctr[0]<=0:
+                state="clean"; trans="  >> cleared"
             seen_total=len(sensors)
             sys.stderr.write(f"[fusion] seen={seen_total} game-flows={ng} degraded={deg} "
-                             f"agreed={agreed} state={state} votes={ready}\n")
+                             f"agreed={agreed} dwell={persist_ctr[0]}/{DWELL} state={state} votes={ready}\n")
             if trans: sys.stderr.write(trans+"\n")
             sys.stderr.flush()
             time.sleep(WIN)
