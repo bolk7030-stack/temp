@@ -1,105 +1,147 @@
-#!/bin/sh
-# phase-fold.sh -- EXPLORATORY parallel test. Approximate "phase folding": instead
-# of block-shifting ALL game packets by a fixed delay (which drags fast packets
-# late too), fold ONLY the slow-phase packets forward to catch the next tick,
-# leaving the already-fast ones untouched. The honest "act at the edge" version.
+#!/usr/bin/env python3
+# phase-pacer.py -- REAL phase folding by INCOMING-inferred tick.
 #
-# *** NOT HARDENED. ASSUMES the bimodal phase (~7ms fast / ~22ms slow, ~15ms
-#     apart => ~60Hz tick) is real and stable. We did NOT confirm that (it read
-#     as a smear). This is a FEEL PROBE to see if there's anything here, to be
-#     refined/validated later if it's worth it. Judge by feel + the fast-fraction
-#     readout; do not trust it as proven. ***
+# This is the honest version of "fold by phase, not by count." It:
+#   1. watches INBOUND game packets, learns the server tick period + phase,
+#   2. classifies each OUTBOUND packet by its phase vs that inferred tick,
+#   3. FOLDS only the slow-phase outbound packets (holds them briefly so they
+#      land at the start of the next tick window), passes fast-phase ones clean.
 #
-# MECHANISM (approximation buildable on OpenWrt today, no eBPF):
-#   - Uses nft numgen to split the game flow into PHASE BANDS deterministically
-#     (a proxy for arrival-phase, since true per-packet timestamping needs a
-#     userspace pacer we can't test from here).
-#   - Routes one band through a small netem fold-delay (~FOLD_MS, sized to push
-#     a slow-phase packet forward into the next fast window), the other untouched.
-#   - Net intent: collapse the two peaks toward one fast peak, instead of sliding
-#     the whole block. If the peaks are real, fast-fraction should rise MORE than
-#     a flat offset achieved, with LESS "times of delayed" feel (fast packets
-#     never get delayed).
+# *** EXPLORATORY. Works ONLY if inbound reveals a STABLE tick. If inbound is a
+#     smear, the phase estimate is garbage and this folds noise. It self-reports
+#     the tick-lock quality so you can SEE whether the phase is real. ***
 #
-# Touches ONLY console game UDP (192.168.10.50:3659) egress on eth1. Reverts clean.
+# Mechanism: nftables enqueues the game flow to NFQUEUE; this daemon decides
+# per-packet to accept-now or hold-then-accept. Inserts a userspace hop (has its
+# own small cost) -- measure that it nets positive.
 #
-# Usage:
-#   sh phase-fold.sh on            # apply fold (FOLD_MS to the folded band)
-#   sh phase-fold.sh on 15         # custom fold delay ms
-#   sh phase-fold.sh flat 7        # comparison: plain flat offset (block-shift)
-#   sh phase-fold.sh off
-#   (run phase-probe.sh alongside to watch fast-fraction; this is a parallel test)
+# Requires: python3, python3-netfilterqueue, python3-scapy (or raw parsing).
+# Setup (run the companion phase-pacer.sh to wire nft + launch this).
+#
+# Tunables via env: PHASE_HOST, PHASE_PORT, FOLD_GUARD_MS, SLOW_FRAC
 
-WAN="eth1"; HOST="192.168.10.50"; GP="3659"
-FOLD_MS_DEFAULT=15      # ~one 60Hz tick: pushes a slow-phase pkt into next window
-FOLD_EVERY=2           # fold 1 of every FOLD_EVERY pkts (phase-band proxy)
+import os, time, struct, threading, collections, sys
+try:
+    from netfilterqueue import NetfilterQueue
+except ImportError:
+    sys.exit("need python3-netfilterqueue: opkg/apk add python3-netfilterqueue")
 
-cleanup(){ tc qdisc del dev "$WAN" root 2>/dev/null; nft delete table inet phasefold 2>/dev/null; }
-trap 'echo; echo "phase-fold OFF -> restored"; cleanup; exit 0' INT TERM
+HOST = os.environ.get("PHASE_HOST", "192.168.10.50")
+PORT = int(os.environ.get("PHASE_PORT", "3659"))
+# guard: don't fold a packet by more than this (safety: never add huge delay)
+FOLD_GUARD_MS = float(os.environ.get("FOLD_GUARD_MS", "16"))
+# what fraction of the tick counts as "slow phase" (the late part of the window)
+SLOW_FRAC = float(os.environ.get("SLOW_FRAC", "0.5"))
 
-ensure_netem(){
-    # clear any existing root first so an OCCUPIED root doesn't masquerade as
-    # "netem missing" (your box prints netem: version 1.3 -> netem IS present).
-    tc qdisc del dev "$WAN" root 2>/dev/null
-    if tc qdisc replace dev "$WAN" root handle 99: netem delay 1ms 2>/dev/null; then
-        tc qdisc del dev "$WAN" root 2>/dev/null
-        return 0
-    fi
-    # try install only if the replace genuinely failed
-    command -v apk >/dev/null 2>&1 && apk add kmod-sched-netem >/dev/null 2>&1
-    command -v opkg >/dev/null 2>&1 && opkg install kmod-sched-netem >/dev/null 2>&1
-    tc qdisc del dev "$WAN" root 2>/dev/null
-    if tc qdisc replace dev "$WAN" root handle 99: netem delay 1ms 2>/dev/null; then
-        tc qdisc del dev "$WAN" root 2>/dev/null
-        return 0
-    fi
-    return 1
-}
+# ---- tick estimator (learned from INBOUND inter-arrival) ----
+class TickEstimator:
+    def __init__(self):
+        self.last_in = None
+        self.intervals = collections.deque(maxlen=64)
+        self.period = 0.0333   # seed: 30Hz
+        self.phase0 = None     # reference epoch for phase=0
+        self.lock = threading.Lock()
 
-# fold mode: split flow into two bands; fold-band gets netem delay, pass-band clean
-apply_fold(){
-    FOLD="$1"
-    ensure_netem || { echo "netem unavailable"; return 1; }
-    cleanup
-    # prio root: band 1:1 = pass (clean), band 1:2 = folded (delayed)
-    tc qdisc add dev "$WAN" root handle 1: prio bands 3 || return 1
-    tc qdisc add dev "$WAN" parent 1:1 handle 10: pfifo 2>/dev/null
-    tc qdisc add dev "$WAN" parent 1:2 handle 20: netem delay "${FOLD}ms" 2>/dev/null || return 1
-    tc qdisc add dev "$WAN" parent 1:3 handle 30: pfifo 2>/dev/null
-    # nft marks the "slow-phase proxy" band: 1 of every FOLD_EVERY game packets -> fwmark 0x2
-    nft add table inet phasefold 2>/dev/null
-    nft "add chain inet phasefold post { type filter hook postrouting priority mangle ; policy accept ; }" 2>/dev/null
-    nft add rule inet phasefold post ip saddr "$HOST" udp sport "$GP" \
-        numgen inc mod "$FOLD_EVERY" "==" 0 meta mark set 0x2 counter 2>/dev/null || return 1
-    # tc filter: fwmark 0x2 -> folded band 1:2 ; rest of game flow -> pass band 1:1
-    tc filter add dev "$WAN" parent 1: protocol ip prio 1 handle 0x2 fw flowid 1:2 2>/dev/null
-    tc filter add dev "$WAN" parent 1: protocol ip prio 2 u32 \
-        match ip src "${HOST}/32" match ip sport "$GP" 0xffff flowid 1:1 2>/dev/null
-    echo "PHASE-FOLD ON: folding 1/${FOLD_EVERY} of game pkts by ${FOLD}ms (slow-phase proxy)."
-    echo "  fast-phase band passes clean; only the folded band is delayed."
-    echo "  EXPLORATORY -- assumes bimodal phase is real. Judge by feel + fast-fraction."
-}
+    def on_inbound(self, t):
+        with self.lock:
+            if self.last_in is not None:
+                dt = t - self.last_in
+                if 0.005 < dt < 0.100:        # plausible 10-200Hz
+                    self.intervals.append(dt)
+                    if len(self.intervals) >= 8:
+                        s = sorted(self.intervals)
+                        self.period = s[len(s)//2]   # median interval = tick period
+                    self.phase0 = t              # anchor phase to latest inbound
+            self.last_in = t
 
-# flat comparison: block-shift everything (the crude version, to A/B against fold)
-apply_flat(){
-    D="$1"; ensure_netem || return 1; cleanup
-    tc qdisc add dev "$WAN" root handle 1: prio bands 3
-    tc qdisc add dev "$WAN" parent 1:2 handle 20: netem delay "${D}ms"
-    tc qdisc add dev "$WAN" parent 1:1 handle 10: pfifo 2>/dev/null
-    tc qdisc add dev "$WAN" parent 1:3 handle 30: pfifo 2>/dev/null
-    tc filter add dev "$WAN" parent 1: protocol ip prio 1 u32 \
-        match ip src "${HOST}/32" match ip sport "$GP" 0xffff flowid 1:2
-    echo "FLAT ${D}ms (block-shift ALL game pkts). Comparison baseline vs fold."
-}
+    def quality(self):
+        # tick-lock quality: low spread of intervals = stable tick = real phase
+        with self.lock:
+            if len(self.intervals) < 8: return 0.0, self.period
+            m = sum(self.intervals)/len(self.intervals)
+            var = sum((x-m)**2 for x in self.intervals)/len(self.intervals)
+            # coefficient of variation inverted -> 1.0 = rock-steady, ~0 = smear
+            cv = (var**0.5)/m if m>0 else 1.0
+            return max(0.0, 1.0 - cv), self.period
 
-case "$1" in
-    on )   apply_fold "${2:-$FOLD_MS_DEFAULT}" ;;
-    flat ) apply_flat "${2:-7}" ;;
-    off )  cleanup; echo "OFF -> restored." ;;
-    * )    echo "usage: sh phase-fold.sh [on [ms] | flat [ms] | off]" ;;
-esac
+    def outbound_phase(self, t):
+        # phase in [0,1): where in the current tick window this outbound packet sits
+        with self.lock:
+            if self.phase0 is None: return None
+            p = ((t - self.phase0) % self.period) / self.period
+            return p
 
-if [ "$1" = "on" ] || [ "$1" = "flat" ]; then
-    echo; echo "PARALLEL TEST: run phase-probe.sh alongside to watch fast-fraction."
-    echo "Compare: fold vs flat vs off. Feel + numbers. Revert: sh phase-fold.sh off"
-fi
+est = TickEstimator()
+stats = {"in":0,"out":0,"folded":0,"passed":0}
+
+def handle(pkt):
+    raw = pkt.get_payload()
+    t = time.time()
+    # parse IP src/dst + UDP ports minimally (IPv4)
+    try:
+        ihl = (raw[0] & 0x0F) * 4
+        proto = raw[9]
+        src = ".".join(str(b) for b in raw[12:16])
+        dst = ".".join(str(b) for b in raw[16:20])
+        if proto != 17:   # not UDP
+            pkt.accept(); return
+        sport = struct.unpack("!H", raw[ihl:ihl+2])[0]
+        dport = struct.unpack("!H", raw[ihl+2:ihl+4])[0]
+    except Exception:
+        pkt.accept(); return
+
+    # INBOUND: server -> console (learn tick)
+    if dst == HOST and sport == PORT:
+        stats["in"] += 1
+        est.on_inbound(t)
+        pkt.accept(); return
+
+    # OUTBOUND: console -> server (classify + maybe fold)
+    if src == HOST and sport == PORT:
+        stats["out"] += 1
+        ph = est.outbound_phase(t)
+        if ph is None:
+            pkt.accept(); stats["passed"] += 1; return
+        # slow phase = the LATE part of the window (ph in [1-SLOW_FRAC, 1))
+        if ph >= (1.0 - SLOW_FRAC):
+            # fold: hold so it lands at the start of next window
+            q, period = est.quality()
+            fold_s = (1.0 - ph) * period
+            fold_s = min(fold_s, FOLD_GUARD_MS/1000.0)
+            # only fold if tick-lock quality is decent; else it's noise -> pass
+            if q >= 0.4 and fold_s > 0.0005:
+                time.sleep(fold_s)      # the fold (userspace hold)
+                stats["folded"] += 1
+            else:
+                stats["passed"] += 1
+        else:
+            stats["passed"] += 1
+        pkt.accept(); return
+
+    pkt.accept()
+
+def reporter():
+    while True:
+        time.sleep(5)
+        q, period = est.quality()
+        tickhz = (1.0/period) if period>0 else 0
+        print(f"[pacer] tick~{tickhz:.1f}Hz lock={q:.2f} "
+              f"in={stats['in']} out={stats['out']} "
+              f"folded={stats['folded']} passed={stats['passed']}", file=sys.stderr)
+        if q < 0.4 and stats['in'] > 50:
+            print("        ^ LOW LOCK: inbound is a smear, no stable tick -> "
+                  "pacer is NOT folding (correctly). Phase may not be real.", file=sys.stderr)
+
+if __name__ == "__main__":
+    threading.Thread(target=reporter, daemon=True).start()
+    nfq = NetfilterQueue()
+    nfq.bind(int(os.environ.get("PHASE_QNUM","0")), handle)
+    print(f"phase-pacer running: host={HOST} port={PORT} slow_frac={SLOW_FRAC} "
+          f"guard={FOLD_GUARD_MS}ms. Watching tick-lock; folds only when lock>=0.4.",
+          file=sys.stderr)
+    try:
+        nfq.run()
+    except KeyboardInterrupt:
+        print("\nphase-pacer stopped.", file=sys.stderr)
+    finally:
+        nfq.unbind()
