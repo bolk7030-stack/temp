@@ -1,75 +1,51 @@
 #!/bin/sh
-# phase-pacer.sh -- wire game flow into NFQUEUE using iptables, then run pacer.
+# phase-pacer.sh -- wire game flow into NFQUEUE and run the ctypes pacer.
 
-HOST="192.168.10.50"; GP="3659"; QNUM=0
+HOST="192.168.10.50"; GP="3659"; QNUM=0; TABLE="phasepacer"
 DIR="$(dirname "$0")"
 
 wire(){
-    iptables -t mangle -D POSTROUTING -s "$HOST" -p udp --dport "$GP" -j NFQUEUE --queue-num "$QNUM" 2>/dev/null
-    iptables -t mangle -D PREROUTING  -d "$HOST" -p udp --sport "$GP" -j NFQUEUE --queue-num "$QNUM" 2>/dev/null
+    nft delete table ip "$TABLE" 2>/dev/null
+    nft add table ip "$TABLE" || return 1
 
-    iptables -t mangle -A POSTROUTING -s "$HOST" -p udp --dport "$GP" -j NFQUEUE --queue-num "$QNUM" || return 1
-    iptables -t mangle -A PREROUTING  -d "$HOST" -p udp --sport "$GP" -j NFQUEUE --queue-num "$QNUM" || return 1
+    nft "add chain ip $TABLE post { type filter hook postrouting priority 0 ; policy accept ; }" || return 1
+    nft "add chain ip $TABLE pre  { type filter hook prerouting  priority 0 ; policy accept ; }" || return 1
+
+    # outbound console -> server
+    nft add rule ip "$TABLE" post ip saddr "$HOST" udp dport "$GP" queue num "$QNUM" || return 1
+
+    # inbound server -> console
+    nft add rule ip "$TABLE" pre ip daddr "$HOST" udp sport "$GP" queue num "$QNUM" || return 1
+
     return 0
-}
-
-teardown(){
-    iptables -t mangle -D POSTROUTING -s "$HOST" -p udp --dport "$GP" -j NFQUEUE --queue-num "$QNUM" 2>/dev/null
-    iptables -t mangle -D PREROUTING  -d "$HOST" -p udp --sport "$GP" -j NFQUEUE --queue-num "$QNUM" 2>/dev/null
 }
 
 case "$1" in
     on )
         modprobe nfnetlink_queue 2>/dev/null
-        modprobe xt_NFQUEUE 2>/dev/null
+        modprobe nft_queue 2>/dev/null
 
-        command -v python3 >/dev/null 2>&1 || {
-            echo "ERROR: python3 not found"
-            exit 1
-        }
-
-        NFQ_LIB=""
-        for L in \
-            /usr/lib/libnetfilter_queue.so.1 \
-            /usr/lib/libnetfilter_queue.so.1.5.0 \
-            libnetfilter_queue.so.1
-        do
-            python3 -c "import ctypes; ctypes.CDLL('$L')" 2>/tmp/nfq-load.err && {
-                NFQ_LIB="$L"
-                break
-            }
-        done
-
-        [ -n "$NFQ_LIB" ] || {
-            echo "ERROR: can't load libnetfilter_queue"
-            cat /tmp/nfq-load.err
-            exit 1
-        }
+        python3 -c "import ctypes; ctypes.CDLL('/usr/lib/libnetfilter_queue.so.1')" 2>/dev/null \
+            || { echo "ERROR: can't load libnetfilter_queue.so.1"; exit 1; }
 
         wire || {
-            echo "iptables NFQUEUE wiring failed"
-            teardown
+            echo "nft wiring failed"
+            nft delete table ip "$TABLE" 2>/dev/null
             exit 1
         }
 
-        echo "wired game flow via iptables -> NFQUEUE $QNUM"
-        echo "using NFQ lib: $NFQ_LIB"
-        echo "Ctrl-C to stop & tear down."
+        echo "wired IPv4 game flow (both dirs) -> NFQUEUE $QNUM. Launching ctypes pacer." >&2
+        echo "Ctrl-C to stop & tear down. WATCH the lock= value." >&2
 
-        trap 'teardown; echo; echo "torn down."; exit 0' INT TERM
+        trap 'nft delete table ip "$TABLE" 2>/dev/null; echo; echo "torn down."; exit 0' INT TERM
 
-        PHASE_HOST="$HOST" \
-        PHASE_PORT="$GP" \
-        PHASE_QNUM="$QNUM" \
-        PHASE_NFQ_LIB="$NFQ_LIB" \
-        python3 "$DIR/phase-pacer-ctypes.py"
+        PHASE_HOST="$HOST" PHASE_PORT="$GP" PHASE_QNUM="$QNUM" python3 "$DIR/phase-pacer-ctypes.py"
 
-        teardown
+        nft delete table ip "$TABLE" 2>/dev/null
         ;;
 
     off )
-        teardown
-        echo "torn down."
+        nft delete table ip "$TABLE" 2>/dev/null && echo "torn down." || echo "(not active)"
         ;;
 
     * )
