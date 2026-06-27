@@ -5,18 +5,23 @@ HOST="192.168.10.50"; GP="3659"; QNUM=0; TABLE="phasepacer"
 DIR="$(dirname "$0")"
 
 wire(){
+    # 1. Start fresh by clearing the layout table
     nft delete table ip "$TABLE" 2>/dev/null
     nft add table ip "$TABLE" || return 1
 
-    # Pass the entire configuration block as a single quoted literal to the parser
-    nft "add chain ip $TABLE post { type filter hook postrouting priority 0 ; policy accept ; }" || return 1
-    nft "add chain ip $TABLE fwd  { type filter hook forward     priority 0 ; policy accept ; }" || return 1
+    # 2. Add raw base chains with explicit family hooks sequentially (No inline configurations)
+    nft add chain ip "$TABLE" post \{ type filter hook postrouting priority 0 \; \} || return 1
+    nft add chain ip "$TABLE" inbound \{ type filter hook forward priority 0 \; \} || return 1
 
-    # outbound console -> server: PS5 source port is 3659
+    # 3. Explicitly append default policy configurations as standalone updates
+    nft add chain ip "$TABLE" post \{ policy accept \; \} || return 1
+    nft add chain ip "$TABLE" inbound \{ policy accept \; \} || return 1
+
+    # 4. Outbound console -> server: PS5 source port is 3659
     nft add rule ip "$TABLE" post ip saddr "$HOST" udp sport "$GP" counter queue num "$QNUM" || return 1
 
-    # inbound server -> console: after routing/NAT, PS5 destination port is 3659
-    nft add rule ip "$TABLE" fwd ip daddr "$HOST" udp dport "$GP" counter queue num "$QNUM" || return 1
+    # 5. Inbound server -> console: after routing/NAT, PS5 destination port is 3659
+    nft add rule ip "$TABLE" inbound ip daddr "$HOST" udp dport "$GP" counter queue num "$QNUM" || return 1
 
     return 0
 }
