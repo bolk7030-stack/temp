@@ -6,11 +6,19 @@ DIR="$(dirname "$0")"
 
 wire(){
     nft delete table ip "$TABLE" 2>/dev/null
-    nft add table ip "$TABLE" || return 1
 
-    # Pass the entire configuration block as a single quoted literal to the parser
-    nft "add chain ip $TABLE post { type filter hook postrouting priority 0 ; policy accept ; }" || return 1
-    nft "add chain ip $TABLE fwd  { type filter hook forward     priority 0 ; policy accept ; }" || return 1
+    # Commit the entire structural layout atomically via stdin to bypass CLI tokenizer bugs
+    nft -f - <<EOF
+table ip $TABLE {
+    chain post {
+        type filter hook postrouting priority 0; policy accept;
+    }
+    chain fwd {
+        type filter hook forward priority 0; policy accept;
+    }
+}
+EOF
+    [ $? -eq 0 ] || return 1
 
     # outbound console -> server: PS5 source port is 3659
     nft add rule ip "$TABLE" post ip saddr "$HOST" udp sport "$GP" counter queue num "$QNUM" || return 1
