@@ -10,7 +10,7 @@ wire(){
     nft "add chain inet $TABLE post { type filter hook postrouting priority mangle ; policy accept ; }" || return 1
     nft "add chain inet $TABLE pre  { type filter hook prerouting  priority mangle ; policy accept ; }" || return 1
 
-    nft add rule inet "$TABLE" post ip saddr "$HOST" udp sport "$GP" queue num "$QNUM" bypass || return 1
+    nft add rule inet "$TABLE" post ip saddr "$HOST" udp dport "$GP" queue num "$QNUM" bypass || return 1
     nft add rule inet "$TABLE" pre  ip daddr "$HOST" udp sport "$GP" queue num "$QNUM" bypass || return 1
     return 0
 }
