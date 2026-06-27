@@ -19,7 +19,8 @@ HOST     = os.environ.get("FF_HOST", "192.168.10.50")
 MODE     = os.environ.get("FF_MODE", "monitor")
 WIN      = float(os.environ.get("FF_WIN", "2.0"))
 AGREE    = int(os.environ.get("FF_AGREE", "2"))      # independent flows needed
-MINBYTES = int(os.environ.get("FF_MINBYTES", "200")) # game-flow activity floor
+MINBYTES = int(os.environ.get("FF_MINBYTES", "1"))   # "moved >0 bytes" floor (latency-tolerant)
+PERSIST  = int(os.environ.get("FF_PERSIST", "4"))    # windows a flow must persist to qualify
 SENS     = float(os.environ.get("FF_SENS", "1.5"))   # degraded = jitter > SENS*baseline
 TABLE    = "gamefusion"
 
@@ -27,17 +28,23 @@ class FlowSensor:
     def __init__(s, key):
         s.key=key; s.last=None
         s.iv=collections.deque(maxlen=30)
-        s.base=None; s.active_seen=0
+        s.base=None
+        s.moved_windows=0   # windows where flow moved >=MINBYTES (any movement)
+        s.seen_windows=0    # windows where flow was present at all
     def update(s, bytecount):
+        s.seen_windows+=1
         if s.last is not None:
             d=bytecount-s.last
             if d>=0: s.iv.append(d)
-            if d>=MINBYTES: s.active_seen+=1
+            if d>=MINBYTES: s.moved_windows+=1   # latency-tolerant: ANY movement counts
         s.last=bytecount
     def is_game(s):
-        return s.active_seen>=3 and len(s.iv)>=6
+        # qualify by PERSISTENCE (keeps appearing & moving at all), NOT byte
+        # volume per window -- so a high-latency flow that trickles fewer bytes
+        # per window still qualifies instead of being starved out of the fusion.
+        return s.moved_windows>=PERSIST and len(s.iv)>=4
     def jitter(s):
-        if len(s.iv)<6: return None
+        if len(s.iv)<4: return None
         m=sum(s.iv)/len(s.iv)
         if m<=0: return None
         var=sum((x-m)**2 for x in s.iv)/len(s.iv)
@@ -88,7 +95,7 @@ def main():
     sensors={}; state="clean"
     sys.stderr.write(f"flow-fusion v3: HOST={HOST} MODE={MODE} "
                      f"need {AGREE} independent game-flows to AGREE degraded "
-                     f"(discrete+filter)\n")
+                     f"(discrete+persistence-filter, latency-tolerant)\n")
     if MODE=="act": mark()
     try:
         while True:
@@ -110,7 +117,8 @@ def main():
                 state="clean"
                 if MODE=="act": mark(); trans="  >> cleared -> reverted"
                 else: trans="  >> cleared"
-            sys.stderr.write(f"[fusion] game-flows={ng} degraded={deg} "
+            seen_total=len(sensors)
+            sys.stderr.write(f"[fusion] seen={seen_total} game-flows={ng} degraded={deg} "
                              f"agreed={agreed} state={state} votes={ready}\n")
             if trans: sys.stderr.write(trans+"\n")
             sys.stderr.flush()
