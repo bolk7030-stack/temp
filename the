@@ -1,29 +1,26 @@
 #!/usr/bin/env python3
-# flow-fusion.py v2 -- CONTINUOUS isolate+fuse connection-state estimator.
+# flow-fusion.py v3 -- DISCRETE agreement (robust) + v2's game-flow FILTER.
 #
-# Fixes over v1:
-#  1. FILTERS to real game flows only (was drowning in ~150 conntrack entries).
-#     Game flows = UDP, involving HOST, small packets, active byte movement.
-#  2. CONTINUOUS deviation per flow (jitter/baseline ratio) -- not boolean.
-#  3. WEIGHTED FUSION to a single continuous "stress" score -- not a 2-of-N vote.
-#  4. ONE threshold with HYSTERESIS (separate on/off) -- not discrete 50/50 moments.
+# Takes what each version got right:
+#  - v1: discrete agreement count -> robust to dirty/outlier flow magnitudes
+#        (a garbage flow casts at most ONE vote; it can't drag a weighted mean).
+#  - v2: game-flow filter -> not drowning in ~150 conntrack entries.
 #
-# Principle (same as your trading P): keep each source continuous, fuse the
-# scores weighted by independence*reliability, threshold ONCE at the end.
-# Action stays invariant-preserving (DSCP re-mark); monitor mode is read-only.
+# Each REAL game flow independently votes degraded/not (binary, robust). Action
+# fires only when >=AGREE independent game flows AGREE. Agreement of independent
+# sources = real event; lone spikes = that path's noise, ignored.
 #
-# Env: FF_HOST, FF_MODE(monitor|act), FF_WIN, FF_ON, FF_OFF, FF_MINBYTES
+# Action is invariant-preserving (DSCP re-mark). monitor mode = read-only.
+# Env: FF_HOST, FF_MODE(monitor|act), FF_WIN, FF_AGREE, FF_MINBYTES, FF_SENS
 
 import os, time, subprocess, collections, sys, re
 
 HOST     = os.environ.get("FF_HOST", "192.168.10.50")
 MODE     = os.environ.get("FF_MODE", "monitor")
 WIN      = float(os.environ.get("FF_WIN", "2.0"))
-# hysteresis thresholds on the fused stress score (tune from monitor output):
-ON_THR   = float(os.environ.get("FF_ON", "2.0"))   # cross UP -> degraded
-OFF_THR  = float(os.environ.get("FF_OFF", "1.3"))  # fall BELOW -> clean
-# game-flow filter: a flow must move at least this many bytes/window to count
-MINBYTES = int(os.environ.get("FF_MINBYTES", "200"))
+AGREE    = int(os.environ.get("FF_AGREE", "2"))      # independent flows needed
+MINBYTES = int(os.environ.get("FF_MINBYTES", "200")) # game-flow activity floor
+SENS     = float(os.environ.get("FF_SENS", "1.5"))   # degraded = jitter > SENS*baseline
 TABLE    = "gamefusion"
 
 class FlowSensor:
@@ -38,7 +35,6 @@ class FlowSensor:
             if d>=MINBYTES: s.active_seen+=1
         s.last=bytecount
     def is_game(s):
-        # heuristic: a real game flow keeps moving bytes across windows
         return s.active_seen>=3 and len(s.iv)>=6
     def jitter(s):
         if len(s.iv)<6: return None
@@ -46,22 +42,19 @@ class FlowSensor:
         if m<=0: return None
         var=sum((x-m)**2 for x in s.iv)/len(s.iv)
         return (var**0.5)/m
-    def deviation(s):
-        # CONTINUOUS: how many baselines above normal (1.0 = at baseline)
+    def degraded(s):
+        # DISCRETE vote: True/False/None. Robust -- magnitude not trusted, just
+        # "is this flow clearly above its OWN baseline."
         j=s.jitter()
         if j is None: return None
         if s.base is None:
-            s.base=j; return 1.0
-        s.base=0.98*s.base+0.02*j   # slow-adapt baseline
-        if s.base<=0: return 1.0
-        return j/s.base
-    def reliability(s):
-        # more samples + clearly active = more trustworthy contributor
-        return min(1.0, len(s.iv)/30.0)
+            s.base=j; return False
+        s.base=0.98*s.base+0.02*j
+        if s.base<=0: return False
+        return j > SENS*s.base
 
 def sample_flows():
-    flows={}
-    out=""
+    flows={}; out=""
     try:
         out=subprocess.run(["conntrack","-L","-p","udp"],capture_output=True,
                            text=True,timeout=2).stdout
@@ -81,19 +74,6 @@ def sample_flows():
             flows[remote]=flows.get(remote,0)+tot
     return flows
 
-def fuse(sensors):
-    """Weighted continuous fusion -> single stress score + contributing game flows."""
-    num=0.0; den=0.0; contributors={}
-    for k,s in sensors.items():
-        if not s.is_game(): continue
-        dev=s.deviation()
-        if dev is None: continue
-        w=s.reliability()
-        num+=w*dev; den+=w
-        contributors[k]=round(dev,2)
-    if den<=0: return None, contributors
-    return num/den, contributors   # weighted-average deviation (1.0=normal)
-
 def mark():
     subprocess.run(["nft","delete","table","ip",TABLE],stderr=subprocess.DEVNULL)
     rules=(f"table ip {TABLE} {{ chain post {{ "
@@ -106,32 +86,33 @@ def unmark():
 
 def main():
     sensors={}; state="clean"
-    sys.stderr.write(f"flow-fusion v2: HOST={HOST} MODE={MODE} "
-                     f"ON>{ON_THR} OFF<{OFF_THR} (continuous fused score)\n")
+    sys.stderr.write(f"flow-fusion v3: HOST={HOST} MODE={MODE} "
+                     f"need {AGREE} independent game-flows to AGREE degraded "
+                     f"(discrete+filter)\n")
     if MODE=="act": mark()
     try:
         while True:
             flows=sample_flows()
             for k,b in flows.items():
                 sensors.setdefault(k,FlowSensor(k)).update(b)
-            score,contrib=fuse(sensors)
-            ng=len(contrib)
-            if score is None:
-                sys.stderr.write(f"[fusion] game-flows={ng} (warming up / none active yet)\n")
-            else:
-                # hysteresis on the single continuous fused score
-                trans=""
-                if state=="clean" and score>=ON_THR:
-                    state="degraded"
-                    if MODE=="act": mark(); trans="  >> DEGRADED (fused) -> re-marked"
-                    else: trans="  >> DEGRADED (fused)"
-                elif state=="degraded" and score<OFF_THR:
-                    state="clean"
-                    if MODE=="act": mark(); trans="  >> CLEARED -> reverted"
-                    else: trans="  >> CLEARED"
-                sys.stderr.write(f"[fusion] game-flows={ng} stress={score:.2f} "
-                                 f"state={state} flows={contrib}\n")
-                if trans: sys.stderr.write(trans+"\n")
+            # consider ONLY real game flows; each casts a discrete vote
+            votes={k:s.degraded() for k,s in sensors.items() if s.is_game()}
+            ready={k:v for k,v in votes.items() if v is not None}
+            deg=sum(1 for v in ready.values() if v)
+            ng=len(ready)
+            agreed = deg>=AGREE
+            trans=""
+            if state=="clean" and agreed:
+                state="degraded"
+                if MODE=="act": mark(); trans="  >> AGREEMENT degraded -> re-marked"
+                else: trans="  >> AGREEMENT degraded"
+            elif state=="degraded" and not agreed:
+                state="clean"
+                if MODE=="act": mark(); trans="  >> cleared -> reverted"
+                else: trans="  >> cleared"
+            sys.stderr.write(f"[fusion] game-flows={ng} degraded={deg} "
+                             f"agreed={agreed} state={state} votes={ready}\n")
+            if trans: sys.stderr.write(trans+"\n")
             sys.stderr.flush()
             time.sleep(WIN)
     except KeyboardInterrupt:
