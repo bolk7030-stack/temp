@@ -1,77 +1,94 @@
 #!/bin/sh
-# coherence-lite.sh -- LIGHTER CAKE that stops reshaping your game's multi-flow
-# timing (the thing that desynced teammates), while keeping a queue present for
-# under-load bufferbloat control.
+# phase-fold.sh -- EXPLORATORY parallel test. Approximate "phase folding": instead
+# of block-shifting ALL game packets by a fixed delay (which drags fast packets
+# late too), fold ONLY the slow-phase packets forward to catch the next tick,
+# leaving the already-fast ones untouched. The honest "act at the edge" version.
 #
-# WHY: full `cake unlimited diffserv4` actively scheduled your game's MULTIPLE
-# flows (server + peers) against each other via flow-isolation + tin-sorting +
-# ACK-filter + GSO-split. That per-flow reshaping is the likely cause of
-# teammates seeming frozen/desynced. This variant removes those behaviors:
-#   - besteffort  -> ONE tin; stops sorting server vs peer traffic into tiers
-#   - flowblind   -> disables per-flow isolation; stops reshaping flows vs each other
-#   - no-ack-filter, no-split-gso -> stops the other two reshaping behaviors
-#   - unlimited   -> no bandwidth cap, no added latency
-# Net: a queue is present (helps under load) but it no longer meddles with the
-# timing relationship between your game's flows.
+# *** NOT HARDENED. ASSUMES the bimodal phase (~7ms fast / ~22ms slow, ~15ms
+#     apart => ~60Hz tick) is real and stable. We did NOT confirm that (it read
+#     as a smear). This is a FEEL PROBE to see if there's anything here, to be
+#     refined/validated later if it's worth it. Judge by feel + the fast-fraction
+#     readout; do not trust it as proven. ***
 #
-# TEAMMATES ARE THE TEST. Workflow: off (confirm team recovers) -> lite (confirm
-# still good) -> compare. If lite reintroduces desync, go fully off (stock).
+# MECHANISM (approximation buildable on OpenWrt today, no eBPF):
+#   - Uses nft numgen to split the game flow into PHASE BANDS deterministically
+#     (a proxy for arrival-phase, since true per-packet timestamping needs a
+#     userspace pacer we can't test from here).
+#   - Routes one band through a small netem fold-delay (~FOLD_MS, sized to push
+#     a slow-phase packet forward into the next fast window), the other untouched.
+#   - Net intent: collapse the two peaks toward one fast peak, instead of sliding
+#     the whole block. If the peaks are real, fast-fraction should rise MORE than
+#     a flat offset achieved, with LESS "times of delayed" feel (fast packets
+#     never get delayed).
+#
+# Touches ONLY console game UDP (192.168.10.50:3659) egress on eth1. Reverts clean.
 #
 # Usage:
-#   sh coherence-lite.sh on       # apply lite CAKE (besteffort flowblind), no mark
-#   sh coherence-lite.sh mark     # same + add the CS4 DSCP mark (optional)
-#   sh coherence-lite.sh off      # remove -> back to stock mq/fq_codel
-#   sh coherence-lite.sh status
+#   sh phase-fold.sh on            # apply fold (FOLD_MS to the folded band)
+#   sh phase-fold.sh on 15         # custom fold delay ms
+#   sh phase-fold.sh flat 7        # comparison: plain flat offset (block-shift)
+#   sh phase-fold.sh off
+#   (run phase-probe.sh alongside to watch fast-fraction; this is a parallel test)
 
-WAN="eth1"; HOST="192.168.10.50"; GAMEPORT="3659"
+WAN="eth1"; HOST="192.168.10.50"; GP="3659"
+FOLD_MS_DEFAULT=15      # ~one 60Hz tick: pushes a slow-phase pkt into next window
+FOLD_EVERY=2           # fold 1 of every FOLD_EVERY pkts (phase-band proxy)
 
-ensure_cake(){
-    tc qdisc add dev "$WAN" root handle 9991: cake 2>/dev/null && { tc qdisc del dev "$WAN" root 2>/dev/null; return 0; }
-    command -v apk >/dev/null 2>&1 && apk add kmod-sched-cake >/dev/null 2>&1
-    command -v opkg >/dev/null 2>&1 && opkg install kmod-sched-cake >/dev/null 2>&1
-    tc qdisc add dev "$WAN" root handle 9991: cake 2>/dev/null && { tc qdisc del dev "$WAN" root 2>/dev/null; return 0; }
+cleanup(){ tc qdisc del dev "$WAN" root 2>/dev/null; nft delete table inet phasefold 2>/dev/null; }
+trap 'echo; echo "phase-fold OFF -> restored"; cleanup; exit 0' INT TERM
+
+ensure_netem(){
+    tc qdisc add dev "$WAN" root handle 99: netem delay 1ms 2>/dev/null && { tc qdisc del dev "$WAN" root 2>/dev/null; return 0; }
+    command -v apk >/dev/null 2>&1 && apk add kmod-sched-netem >/dev/null 2>&1
+    command -v opkg >/dev/null 2>&1 && opkg install kmod-sched-netem >/dev/null 2>&1
+    tc qdisc add dev "$WAN" root handle 99: netem delay 1ms 2>/dev/null && { tc qdisc del dev "$WAN" root 2>/dev/null; return 0; }
     return 1
 }
 
-apply_lite(){
-    ensure_cake || { echo "CAKE unavailable."; return 1; }
-    tc qdisc del dev "$WAN" root 2>/dev/null
-    # the lightest CAKE: one tin, no flow isolation, no ack-filter, no gso-split, no cap
-    tc qdisc add dev "$WAN" root cake unlimited besteffort flowblind no-ack-filter no-split-gso 2>/dev/null \
-        || { echo "cake apply failed (older cake may lack a keyword; trying minimal)"; \
-             tc qdisc add dev "$WAN" root cake unlimited besteffort flowblind 2>/dev/null || return 1; }
-    echo "LITE CAKE applied on $WAN:"
-    echo "  unlimited besteffort flowblind no-ack-filter no-split-gso"
-    echo "  -> queue present for under-load, but NO per-flow reshaping (the team-desync cause)."
-    return 0
+# fold mode: split flow into two bands; fold-band gets netem delay, pass-band clean
+apply_fold(){
+    FOLD="$1"
+    ensure_netem || { echo "netem unavailable"; return 1; }
+    cleanup
+    # prio root: band 1:1 = pass (clean), band 1:2 = folded (delayed)
+    tc qdisc add dev "$WAN" root handle 1: prio bands 3 || return 1
+    tc qdisc add dev "$WAN" parent 1:1 handle 10: pfifo 2>/dev/null
+    tc qdisc add dev "$WAN" parent 1:2 handle 20: netem delay "${FOLD}ms" 2>/dev/null || return 1
+    tc qdisc add dev "$WAN" parent 1:3 handle 30: pfifo 2>/dev/null
+    # nft marks the "slow-phase proxy" band: 1 of every FOLD_EVERY game packets -> fwmark 0x2
+    nft add table inet phasefold 2>/dev/null
+    nft "add chain inet phasefold post { type filter hook postrouting priority mangle ; policy accept ; }" 2>/dev/null
+    nft add rule inet phasefold post ip saddr "$HOST" udp sport "$GP" \
+        numgen inc mod "$FOLD_EVERY" "==" 0 meta mark set 0x2 counter 2>/dev/null || return 1
+    # tc filter: fwmark 0x2 -> folded band 1:2 ; rest of game flow -> pass band 1:1
+    tc filter add dev "$WAN" parent 1: protocol ip prio 1 handle 0x2 fw flowid 1:2 2>/dev/null
+    tc filter add dev "$WAN" parent 1: protocol ip prio 2 u32 \
+        match ip src "${HOST}/32" match ip sport "$GP" 0xffff flowid 1:1 2>/dev/null
+    echo "PHASE-FOLD ON: folding 1/${FOLD_EVERY} of game pkts by ${FOLD}ms (slow-phase proxy)."
+    echo "  fast-phase band passes clean; only the folded band is delayed."
+    echo "  EXPLORATORY -- assumes bimodal phase is real. Judge by feel + fast-fraction."
 }
 
-add_mark(){
-    nft add table inet gamedscp 2>/dev/null
-    nft 'add chain inet gamedscp postrouting { type filter hook postrouting priority mangle ; policy accept ; }' 2>/dev/null
-    nft flush chain inet gamedscp postrouting 2>/dev/null
-    nft add rule inet gamedscp postrouting ip saddr "$HOST" udp sport "$GAMEPORT" ip dscp set cs4 counter 2>/dev/null \
-        && echo "  + DSCP CS4 mark added (note: besteffort = CAKE ignores it locally; mark only matters downstream)"
+# flat comparison: block-shift everything (the crude version, to A/B against fold)
+apply_flat(){
+    D="$1"; ensure_netem || return 1; cleanup
+    tc qdisc add dev "$WAN" root handle 1: prio bands 3
+    tc qdisc add dev "$WAN" parent 1:2 handle 20: netem delay "${D}ms"
+    tc qdisc add dev "$WAN" parent 1:1 handle 10: pfifo 2>/dev/null
+    tc qdisc add dev "$WAN" parent 1:3 handle 30: pfifo 2>/dev/null
+    tc filter add dev "$WAN" parent 1: protocol ip prio 1 u32 \
+        match ip src "${HOST}/32" match ip sport "$GP" 0xffff flowid 1:2
+    echo "FLAT ${D}ms (block-shift ALL game pkts). Comparison baseline vs fold."
 }
 
 case "$1" in
-    on )   apply_lite ;;
-    mark ) apply_lite && add_mark ;;
-    off|remove )
-        tc qdisc del dev "$WAN" root 2>/dev/null && echo "CAKE removed -> stock mq/fq_codel restored." || echo "(no cake active)"
-        nft delete table inet gamedscp 2>/dev/null && echo "DSCP mark removed." || true
-        ;;
-    status )
-        echo "== coherence-lite status =="
-        echo "$WAN qdisc:"; tc -s qdisc show dev "$WAN" 2>/dev/null | head -3 | sed 's/^/   /'
-        nft list table inet gamedscp >/dev/null 2>&1 && echo "DSCP mark: ACTIVE" || echo "DSCP mark: not active"
-        ;;
-    * ) echo "usage: sh coherence-lite.sh [on|mark|off|status]" ;;
+    on )   apply_fold "${2:-$FOLD_MS_DEFAULT}" ;;
+    flat ) apply_flat "${2:-7}" ;;
+    off )  cleanup; echo "OFF -> restored." ;;
+    * )    echo "usage: sh phase-fold.sh [on [ms] | flat [ms] | off]" ;;
 esac
 
-if [ "$1" = "on" ] || [ "$1" = "mark" ]; then
-    echo
-    echo "TEAMMATES ARE THE TEST: play a session, watch if they are free again."
-    echo "  free again -> lite coexists with team play, keep it."
-    echo "  still desynced -> go fully stock: sh coherence-lite.sh off"
+if [ "$1" = "on" ] || [ "$1" = "flat" ]; then
+    echo; echo "PARALLEL TEST: run phase-probe.sh alongside to watch fast-fraction."
+    echo "Compare: fold vs flat vs off. Feel + numbers. Revert: sh phase-fold.sh off"
 fi
