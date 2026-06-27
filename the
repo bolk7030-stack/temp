@@ -1,97 +1,82 @@
-#!/bin/sh
-# rate-knob.sh -- EXPERIMENTAL deterministic send-rate divider for the game flow.
-# Drops a DETERMINISTIC pattern of outbound game packets (NOT random/netem) to
-# lower the effective send rate. For experimentation only -- feeling whether an
-# off-standard cadence changes contest feel.
+##!/bin/sh
+# phase-probe.sh -- READ-ONLY phase probe (v4).
 #
-# HONEST MECHANICS (you asked):
-#   - Pure selective DROP via nftables, deterministic (counter % N), evenly placed
-#     where the divisor is clean.
-#   - DOWN only. Cannot raise rate (information wall). Never alters/fabricates.
-#   - Clean even rates = integer divisors of 30: keep 1/2 ->15Hz, 1/3 ->10Hz, 1/5 ->6Hz.
-#   - "In-between" (25,24,etc) = 30Hz-with-periodic-gaps (uneven), not smooth.
-#   - COST: every dropped packet is a movement update the server must extrapolate
-#     through -> you trade representation freshness for the rate change.
+# v3 bugs (found by auditing against your known-good command):
+#   1. I QUOTED the filter as one argument; your working command passed it as
+#      separate unquoted words. busybox tcpdump parses these differently and the
+#      quoted blob compiled to a filter matching nothing.
+#   2. I added a 5th clause ("and not port 5353"); your working filter had 4.
+#      The longer chain silently compiled to match-nothing on busybox.
+# Fix: reproduce your EXACT working invocation, filter unquoted, 4 clauses.
+# Keep -tt (absolute epoch) -- verified to parse cleanly; awk computes deltas.
 #
-# Touches ONLY console game UDP (192.168.10.50:3659) outbound. Reverts cleanly.
-# This is NOT persistent -- experiment, toggle, revert. No hotplug install.
-#
-# Usage:
-#   sh rate-knob.sh 15        # ~15Hz: drop every 2nd packet (clean, even)
-#   sh rate-knob.sh 10        # ~10Hz: keep 1 of 3 (clean, even)
-#   sh rate-knob.sh 25        # ~25Hz: keep 5 of 6 (GAPPY -- 30Hz with holes)
-#   sh rate-knob.sh keep N M  # general: keep N of every M packets
-#   sh rate-knob.sh off       # remove, back to full 30Hz
-#   sh rate-knob.sh status    # show active drop pattern + live counters
+# Usage: sh phase-probe.sh [count]   (default 400)
 
 HOST="192.168.10.50"
-GAMEPORT="3659"
-TABLE="gamerate"
+COUNT="${1:-400}"
+RAW="/tmp/phase-raw-$$.txt"
 
-# map a requested Hz to a keep/of pattern over the ~30Hz base
-hz_to_pattern() {
-    case "$1" in
-        15) KEEP=1; OF=2 ;;     # clean
-        10) KEEP=1; OF=3 ;;     # clean
-        6)  KEEP=1; OF=5 ;;     # clean
-        20) KEEP=2; OF=3 ;;     # gappy
-        25) KEEP=5; OF=6 ;;     # gappy
-        24) KEEP=4; OF=5 ;;     # gappy
-        18) KEEP=3; OF=5 ;;     # gappy
-        12) KEEP=2; OF=5 ;;     # clean-ish
-        *)  return 1 ;;
-    esac
-    return 0
+echo "Capturing $COUNT UDP packets for $HOST (br-lan) ..." >&2
+echo "  -> PLAY NOW." >&2
+
+# Filter passed UNQUOTED as separate words (matches your working command).
+# Exactly 4 'and' clauses, same as the command you confirmed works.
+tcpdump -n -tt -c "$COUNT" -i br-lan \
+    host "$HOST" and udp and not port 9999 and not port 1900 and not port 53 \
+    2>/dev/null > "$RAW"
+
+LINES=$(wc -l < "$RAW" 2>/dev/null)
+echo "captured ${LINES:-0} packets" >&2
+if [ "${LINES:-0}" -lt 20 ]; then
+    echo "Too few. Run the known-good command by hand to confirm traffic:" >&2
+    echo "  tcpdump -n -ttt -c 60 -i br-lan host $HOST and udp and not port 9999 and not port 1900 and not port 53" >&2
+    rm -f "$RAW"; exit 1
+fi
+
+awk -v HOST="$HOST" '
+function islocal(ip){ return (ip ~ /^192\.168\./ || ip ~ /^239\./ || ip ~ /^224\./ || ip ~ /^255\./) }
+{
+    t=$1+0
+    src=$3; dst=$5; sub(/:$/,"",dst)
+    split(src,sa,"."); srcip=sa[1]"."sa[2]"."sa[3]"."sa[4]
+    split(dst,da,"."); dstip=da[1]"."da[2]"."da[3]"."da[4]
+    if (srcip==HOST) { dir="OUT"; otherip=dstip }
+    else if (dstip==HOST) { dir="IN"; otherip=srcip }
+    else next
+    if (islocal(otherip)) next
+
+    kept++
+    if (dir=="OUT") {
+        no++
+        if (lastout>0){ g=(t-lastout)*1000; if(g>0&&g<500){oc++;osum+=g;ogap[oc]=g;if(omin==""||g<omin)omin=g;if(g>omax)omax=g} }
+        lastout=t
+    } else {
+        ni++
+        if (lastin>0){ g=(t-lastin)*1000; if(g>0&&g<500){ic++;isum+=g;igap[ic]=g;if(imin==""||g<imin)imin=g;if(g>imax)imax=g} }
+        lastin=t
+        if (lastout>0){ rd=(t-lastout)*1000; if(rd>=0&&rd<500){rc++;rsum+=rd;rdel[rc]=rd} }
+    }
 }
-
-apply_pattern() {
-    KEEP="$1"; OF="$2"
-    # drop when (counter % OF) >= KEEP  -> keeps KEEP out of every OF packets
-    nft delete table inet "$TABLE" 2>/dev/null
-    nft add table inet "$TABLE" || { echo "nft add table failed"; return 1; }
-    nft "add chain inet $TABLE post { type filter hook postrouting priority mangle ; policy accept ; }" || return 1
-    # use numgen inc (deterministic incrementing counter) modulo OF; drop high residues
-    # keep residues 0..KEEP-1, drop KEEP..OF-1
-    nft add rule inet "$TABLE" post ip saddr "$HOST" udp sport "$GAMEPORT" \
-        numgen inc mod "$OF" ">=" "$KEEP" counter drop 2>/dev/null \
-        || { echo "numgen rule failed (kernel/nft too old for numgen?)"; return 1; }
-    # a counter on the kept ones too, for status visibility
-    nft add rule inet "$TABLE" post ip saddr "$HOST" udp sport "$GAMEPORT" counter 2>/dev/null
-    EFF=$(awk -v k="$KEEP" -v o="$OF" 'BEGIN{printf "%.1f", 30.0*k/o}')
-    echo "APPLIED: keep $KEEP of every $OF outbound game packets -> ~${EFF}Hz effective"
-    case "$KEEP/$OF" in
-        1/2|1/3|1/5) echo "  (clean even spacing)";;
-        *) echo "  (GAPPY: 30Hz with periodic holes, not smooth -- as discussed)";;
-    esac
-    echo "  cost: dropped packets = movement updates server must extrapolate through."
+END{
+    if(kept<10){ print "  too few remote-server packets ("kept") -- match may be all-P2P/local."; exit }
+    printf "\n  (kept %d remote game-server packets)\n\n", kept
+    print "==== OUTBOUND cadence (console -> server) ===="
+    if(oc>0){ om=osum/oc; for(i=1;i<=oc;i++){d=ogap[i]-om;oss+=d*d}osd=sqrt(oss/oc)
+        printf "  pkts:%d mean:%.2fms min/max:%.2f/%.2f jitter:%.2fms\n",no,om,omin,omax,osd } else print "  (none)"
+    print "\n==== INBOUND cadence (server -> console) ===="
+    if(ic>0){ im=isum/ic; for(i=1;i<=ic;i++){d=igap[i]-im;iss+=d*d}isd=sqrt(iss/ic)
+        printf "  pkts:%d mean:%.2fms min/max:%.2f/%.2f jitter:%.2fms\n",ni,im,imin,imax,isd } else print "  (none)"
+    print "\n==== RESPONSE DELAY (OUT -> next IN) : the PHASE signal ===="
+    if(rc>0){ rm=rsum/rc
+        for(i=1;i<=rc;i++){ b=int(rdel[i]/5); h[b]++; if(b>maxb)maxb=b }
+        printf "  samples:%d mean:%.2fms\n  distribution (5ms buckets):\n",rc,rm
+        for(b=0;b<=maxb;b++){ if(h[b]>0){ bar="";k=h[b];while(k-->0&&length(bar)<50)bar=bar"#"
+            printf "   %3d-%3dms | %-50s %d\n",b*5,(b*5)+4,bar,h[b] } }
+        print "\n  READING: one peak = stable phase; two+ peaks = phase target,"
+        print "           peak spacing ~ remote tick period."
+    } else print "  (no OUT->IN pairs)"
+    print ""
 }
-
-case "$1" in
-    off|remove )
-        nft delete table inet "$TABLE" 2>/dev/null && echo "rate-knob OFF -> full 30Hz restored." || echo "(not active)"
-        ;;
-    status )
-        if nft list table inet "$TABLE" >/dev/null 2>&1; then
-            echo "ACTIVE:"; nft list table inet "$TABLE" 2>/dev/null | grep -E 'numgen|counter' | sed 's/^/   /'
-        else echo "rate-knob not active (full 30Hz)."; fi
-        ;;
-    keep )
-        # general: sh rate-knob.sh keep N M
-        [ -n "$2" ] && [ -n "$3" ] || { echo "usage: sh rate-knob.sh keep N M"; exit 1; }
-        apply_pattern "$2" "$3"
-        ;;
-    "" )
-        echo "usage: sh rate-knob.sh [15|10|25|...|keep N M|off|status]"
-        echo "clean: 15 10 6 | gappy: 25 24 20 18 12 | general: keep N M"
-        ;;
-    * )
-        if hz_to_pattern "$1"; then apply_pattern "$KEEP" "$OF"
-        else echo "no preset for ${1}Hz. use: sh rate-knob.sh keep N M  (keep N of every M)"; exit 1; fi
-        ;;
-esac
-
-if [ "$1" != "off" ] && [ "$1" != "status" ] && [ -n "$1" ]; then
-    echo
-    echo "EXPERIMENT, not optimization. Judge by FEEL + reproducibility across games."
-    echo "Prior: likely neutral-to-slightly-negative (freshness cost). Revert: sh rate-knob.sh off"
+' "$RAW"
+rm -f "$RAW"
 fi
