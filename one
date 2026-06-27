@@ -1,64 +1,77 @@
 #!/bin/sh
-# phase-pacer.sh -- wire game flow into NFQUEUE and run the ctypes pacer.
+# phase-pacer.sh -- wire game flow into NFQUEUE (BOTH dirs at postrouting, post-NAT)
+# and run the ctypes pacer. Adds a `test` mode + flow-offload check to fix in=0.
+#
+# Usage:
+#   sh phase-pacer.sh test   # diagnostic: port-less inbound, see if `in` climbs
+#   sh phase-pacer.sh on      # real run, both dirs matched at postrouting
+#   sh phase-pacer.sh off     # tear down
 
-HOST="192.168.10.50"
-GP="3659"
-QNUM="0"
-TABLE="phasepacer"
+HOST="192.168.10.50"; GP="3659"; QNUM="0"; TABLE="phasepacer"
 DIR="$(dirname "$0")"
 
-wire(){
-    # 1. Clear previous tables cleanly
+offload_check(){
+    if nft list ruleset 2>/dev/null | grep -qi "flow.*offload\|offload.*flow"; then
+        echo "*** WARNING: flow offloading appears ENABLED. This BYPASSES nft hooks" >&2
+        echo "    and is the likely cause of in=0. Disable it: LuCI > Network >" >&2
+        echo "    Firewall > uncheck 'Software flow offloading', then retry." >&2
+        echo "    (continuing anyway, but inbound may stay 0 until offload is off)" >&2
+    fi
+}
+
+# diagnostic: match inbound by ADDRESS ONLY (no port) at postrouting (post-NAT).
+# if `in` climbs -> hook+address correct, only the port assumption was wrong.
+wire_test(){
     nft delete table ip "$TABLE" 2>/dev/null
-    nft add table ip "$TABLE" || return 1
-
-    # 2. Sequential base chain allocation with script-safe formatting
-    # Priority -150 grabs ingress frames immediately at the edge
-    nft add chain ip "$TABLE" post \{ type filter hook postrouting priority 0 \; \} || return 1
-    nft add chain ip "$TABLE" pre  \{ type filter hook prerouting priority -150 \; \} || return 1
-
-    nft add chain ip "$TABLE" post \{ policy accept \; \} || return 1
-    nft add chain ip "$TABLE" pre  \{ policy accept \; \} || return 1
-
-    # 3. Outbound Match: Capture packets originating from the host console's game profile
-    nft add rule ip "$TABLE" post ip saddr "$HOST" udp sport "$GP" counter queue num "$QNUM" || return 1
-
-    # 4. Inbound Match: Capture ANY incoming packet that conntrack identifies as the return stream 
-    # of the console's outbound flow. This completely bypasses port shifts.
-    nft add rule ip "$TABLE" pre ct direction reply counter queue num "$QNUM" || return 1
-
+    nft -f - <<EOF || return 1
+table ip $TABLE {
+    chain post {
+        type filter hook postrouting priority 0; policy accept;
+        ip saddr $HOST udp sport $GP counter queue num $QNUM
+        ip daddr $HOST counter queue num $QNUM
+    }
+}
+EOF
     return 0
 }
 
+# real: both directions, port-constrained, at postrouting (post-NAT addresses visible)
+wire_on(){
+    nft delete table ip "$TABLE" 2>/dev/null
+    nft -f - <<EOF || return 1
+table ip $TABLE {
+    chain post {
+        type filter hook postrouting priority 0; policy accept;
+        ip saddr $HOST udp sport $GP counter queue num $QNUM
+        ip daddr $HOST udp dport $GP counter queue num $QNUM
+    }
+}
+EOF
+    return 0
+}
+
+launch(){
+    modprobe nfnetlink_queue 2>/dev/null; modprobe nft_queue 2>/dev/null
+    python3 -c "import ctypes; ctypes.CDLL('/usr/lib/libnetfilter_queue.so.1')" 2>/dev/null \
+        || { echo "ERROR: can't load libnetfilter_queue.so.1"; exit 1; }
+    offload_check
+    trap 'nft delete table ip "$TABLE" 2>/dev/null; echo; echo "torn down."; exit 0' INT TERM
+    echo "running. WATCH: in= should climb now. Then watch lock= (>=0.6 = real tick)." >&2
+    PHASE_HOST="$HOST" PHASE_PORT="$GP" PHASE_QNUM="$QNUM" python3 "$DIR/phase-pacer-ctypes.py"
+    nft delete table ip "$TABLE" 2>/dev/null
+}
+
 case "$1" in
+    test )
+        wire_test || { echo "nft wiring failed"; nft delete table ip "$TABLE" 2>/dev/null; exit 1; }
+        echo "TEST MODE: inbound matched by ADDRESS ONLY (no port). If in= climbs," >&2
+        echo "the hook+address are right and only the port was wrong. Ctrl-C to stop." >&2
+        launch ;;
     on )
-        modprobe nfnetlink_queue 2>/dev/null
-        modprobe nft_queue 2>/dev/null
-
-        python3 -c "import ctypes; ctypes.CDLL('/usr/lib/libnetfilter_queue.so.1')" 2>/dev/null \
-            || { echo "ERROR: can't load libnetfilter_queue.so.1"; exit 1; }
-
-        wire || {
-            echo "nft wiring failed"
-            nft delete table ip "$TABLE" 2>/dev/null
-            exit 1
-        }
-
-        echo "wired IPv4 stateful game flow -> NFQUEUE $QNUM. Launching ctypes pacer." >&2
-        echo "Ctrl-C to stop & tear down. WATCH the lock= value." >&2
-
-        trap 'nft delete table ip "$TABLE" 2>/dev/null; echo; echo "torn down."; exit 0' INT TERM
-
-        PHASE_HOST="$HOST" PHASE_PORT="$GP" PHASE_QNUM="$QNUM" python3 "$DIR/phase-pacer-ctypes.py"
-
-        nft delete table ip "$TABLE" 2>/dev/null
-        ;;
-
+        wire_on || { echo "nft wiring failed"; nft delete table ip "$TABLE" 2>/dev/null; exit 1; }
+        echo "ON: both directions at postrouting, port $GP. Ctrl-C to stop & tear down." >&2
+        launch ;;
     off )
-        nft delete table ip "$TABLE" 2>/dev/null && echo "torn down." || echo "(not active)"
-        ;;
-
-    * )
-        echo "usage: sh phase-pacer.sh [on|off]"
-        ;;
+        nft delete table ip "$TABLE" 2>/dev/null && echo "torn down." || echo "(not active)" ;;
+    * ) echo "usage: sh phase-pacer.sh [test|on|off]" ;;
 esac
