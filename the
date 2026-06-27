@@ -1,27 +1,30 @@
 #!/bin/sh
 # phase-pacer.sh -- wire game flow into NFQUEUE and run the ctypes pacer.
 
-HOST="192.168.10.50"; GP="3659"; QNUM=0; TABLE="phasepacer"
+HOST="192.168.10.50"
+# Dynamic extraction of the true destination server port from the active conntrack table
+GP=$(cat /proc/net/nf_conntrack | grep "sport=3659" | grep -oE "dport=[0-9]+" | head -n1 | cut -d= -f2)
+[ -z "$GP" ] && GP="21052" # Failover to the proven port from your logs if conntrack is cold
+
+QNUM=0; TABLE="phasepacer"
 DIR="$(dirname "$0")"
 
 wire(){
-    # 1. Start fresh by clearing the layout table
     nft delete table ip "$TABLE" 2>/dev/null
     nft add table ip "$TABLE" || return 1
 
-    # 2. Add raw base chains with explicit family hooks sequentially (No inline configurations)
+    # Add raw base chains with explicit family hooks sequentially
     nft add chain ip "$TABLE" post \{ type filter hook postrouting priority 0 \; \} || return 1
     nft add chain ip "$TABLE" inbound \{ type filter hook forward priority 0 \; \} || return 1
 
-    # 3. Explicitly append default policy configurations as standalone updates
     nft add chain ip "$TABLE" post \{ policy accept \; \} || return 1
     nft add chain ip "$TABLE" inbound \{ policy accept \; \} || return 1
 
-    # 4. Outbound console -> server: PS5 source port is 3659
-    nft add rule ip "$TABLE" post ip saddr "$HOST" udp sport "$GP" counter queue num "$QNUM" || return 1
+    # outbound console -> server: Match console IP and target server game port
+    nft add rule ip "$TABLE" post ip saddr "$HOST" udp dport "$GP" counter queue num "$QNUM" || return 1
 
-    # 5. Inbound server -> console: after routing/NAT, PS5 destination port is 3659
-    nft add rule ip "$TABLE" inbound ip daddr "$HOST" udp dport "$GP" counter queue num "$QNUM" || return 1
+    # inbound server -> console: Bypasses NAT string limits by targeting the game server's return source port
+    nft add rule ip "$TABLE" inbound udp sport "$GP" counter queue num "$QNUM" || return 1
 
     return 0
 }
@@ -40,7 +43,7 @@ case "$1" in
             exit 1
         }
 
-        echo "wired IPv4 game flow (out postrouting, in forward) -> NFQUEUE $QNUM. Launching ctypes pacer." >&2
+        echo "wired IPv4 game flow (Target Server Port: $GP) -> NFQUEUE $QNUM. Launching ctypes pacer." >&2
         echo "Ctrl-C to stop & tear down. WATCH the lock= value." >&2
 
         trap 'nft delete table ip "$TABLE" 2>/dev/null; echo; echo "torn down."; exit 0' INT TERM
