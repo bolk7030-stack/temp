@@ -8,8 +8,8 @@ wire(){
     nft delete table ip "$TABLE" 2>/dev/null
     nft add table ip "$TABLE" || return 1
 
-    nft add chain ip "$TABLE" post \{ type filter hook postrouting priority 0 \; policy accept \; \} || return 1
-    nft add chain ip "$TABLE" fwd  \{ type filter hook forward     priority 0 \; policy accept \; \} || return 1
+    nft add chain ip "$TABLE" post type filter hook postrouting priority 0 \; policy accept || return 1
+    nft add chain ip "$TABLE" fwd  type filter hook forward     priority 0 \; policy accept || return 1
 
     # outbound console -> server: PS5 source port is 3659
     nft add rule ip "$TABLE" post ip saddr "$HOST" udp sport "$GP" counter queue num "$QNUM" || return 1
@@ -52,31 +52,3 @@ case "$1" in
         echo "usage: sh phase-pacer.sh [on|off]"
         ;;
 esac
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#########
