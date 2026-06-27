@@ -1,185 +1,44 @@
-#!/usr/bin/env python3
-# phase-pacer-ctypes.py -- REAL phase pacer binding libnetfilter_queue DIRECTLY
-# via ctypes (no python3-netfilterqueue package needed). Folds outbound game
-# packets by the tick phase inferred from the INBOUND stream.
+#!/bin/sh
+# phase-pacer.sh -- wire game flow into NFQUEUE and run the ctypes pacer.
+# Uses phase-pacer-ctypes.py (binds libnetfilter_queue.so.1 directly; no
+# python3-netfilterqueue package needed).
 #
-# Target lib: /usr/lib/libnetfilter_queue.so.1  (confirmed present on box)
-# Needs nft to enqueue the game flow (companion phase-pacer.sh wires it).
+# Usage:
+#   sh phase-pacer.sh on     # wire nft -> NFQUEUE q0, launch pacer (WATCH THE LOCK)
+#   sh phase-pacer.sh off    # tear down
 #
-# *** BLIND-BUILT ctypes binding. Expect possibly 1-2 debug rounds: the struct
-#     offsets / callback ABI are written against the standard libnfq 1.0.5 layout.
-#     It PRINTS tick-lock quality so you can SEE if the phase is real before
-#     trusting any fold. Folds ONLY when lock>=0.4. ***
-#
-# Env: PHASE_HOST PHASE_PORT PHASE_QNUM FOLD_GUARD_MS SLOW_FRAC
+# WATCH lock= in the output. lock>=0.6 stable = real tick (pacer folds).
+# lock<0.4 = inbound smear, no stable phase (pacer correctly does NOT fold).
 
-import ctypes as C
-import os, sys, time, socket, struct, threading, collections
+HOST="192.168.10.50"; GP="3659"; QNUM=0; TABLE="phasepacer"
+DIR="$(dirname "$0")"
 
-HOST     = os.environ.get("PHASE_HOST", "192.168.10.50")
-PORT     = int(os.environ.get("PHASE_PORT", "3659"))
-QNUM     = int(os.environ.get("PHASE_QNUM", "0"))
-GUARD_MS = float(os.environ.get("FOLD_GUARD_MS", "16"))
-SLOW_FRAC= float(os.environ.get("SLOW_FRAC", "0.5"))
+wire(){
+    nft delete table inet "$TABLE" 2>/dev/null
+    nft add table inet "$TABLE" || return 1
+    nft "add chain inet $TABLE post { type filter hook postrouting priority mangle ; policy accept ; }" || return 1
+    nft "add chain inet $TABLE pre  { type filter hook prerouting  priority mangle ; policy accept ; }" || return 1
+    # outbound console->server  AND inbound server->console -> queue 0 (bypass = if no
+    # listener, packets pass instead of dropping; safety)
+    nft add rule inet "$TABLE" post ip saddr "$HOST" udp sport "$GP" queue num "$QNUM" bypass || return 1
+    nft add rule inet "$TABLE" pre  ip daddr "$HOST" udp sport "$GP" queue num "$QNUM" bypass || return 1
+    return 0
+}
 
-LIBPATHS = ["/usr/lib/libnetfilter_queue.so.1",
-            "/usr/lib/libnetfilter_queue.so.1.5.0",
-            "libnetfilter_queue.so.1"]
-nfq = None
-for p in LIBPATHS:
-    try:
-        nfq = C.CDLL(p); break
-    except OSError:
-        continue
-if nfq is None:
-    sys.exit("cannot load libnetfilter_queue .so")
-
-# ---- C function signatures (libnetfilter_queue 1.0.x) ----
-nfq.nfq_open.restype  = C.c_void_p
-nfq.nfq_close.argtypes= [C.c_void_p]
-nfq.nfq_bind_pf.argtypes   = [C.c_void_p, C.c_uint16]
-nfq.nfq_unbind_pf.argtypes = [C.c_void_p, C.c_uint16]
-
-# callback type: int cb(nfq_q_handle*, nfgenmsg*, nfq_data*, void*)
-CB = C.CFUNCTYPE(C.c_int, C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p)
-nfq.nfq_create_queue.restype  = C.c_void_p
-nfq.nfq_create_queue.argtypes = [C.c_void_p, C.c_uint16, CB, C.c_void_p]
-nfq.nfq_destroy_queue.argtypes= [C.c_void_p]
-nfq.nfq_set_mode.argtypes     = [C.c_void_p, C.c_uint8, C.c_uint32]
-nfq.nfq_fd.restype  = C.c_int
-nfq.nfq_fd.argtypes = [C.c_void_p]
-nfq.nfq_handle_packet.argtypes = [C.c_void_p, C.c_char_p, C.c_int]
-nfq.nfq_handle_packet.restype  = C.c_int
-
-# nfq_get_payload(nfq_data*, unsigned char**) -> int len
-nfq.nfq_get_payload.argtypes = [C.c_void_p, C.POINTER(C.POINTER(C.c_ubyte))]
-nfq.nfq_get_payload.restype  = C.c_int
-# nfq_get_msg_packet_hdr -> struct with packet_id (network byte order)
-nfq.nfq_get_msg_packet_hdr.argtypes = [C.c_void_p]
-nfq.nfq_get_msg_packet_hdr.restype  = C.c_void_p
-# nfq_set_verdict(qh, id, verdict, data_len, buf)
-nfq.nfq_set_verdict.argtypes = [C.c_void_p, C.c_uint32, C.c_uint32, C.c_uint32, C.c_char_p]
-nfq.nfq_set_verdict.restype  = C.c_int
-
-NF_ACCEPT = 1
-COPY_PACKET = 2
-
-# packet hdr: struct nfqnl_msg_packet_hdr { __be32 packet_id; __be16 hw_protocol; __u8 hook; }
-class PktHdr(C.Structure):
-    _fields_ = [("packet_id", C.c_uint32),
-                ("hw_protocol", C.c_uint16),
-                ("hook", C.c_uint8)]
-
-# ---- tick estimator (from inbound inter-arrival) ----
-class Tick:
-    def __init__(s):
-        s.last=None; s.iv=collections.deque(maxlen=64)
-        s.period=0.0333; s.phase0=None; s.lk=threading.Lock()
-    def inbound(s,t):
-        with s.lk:
-            if s.last is not None:
-                dt=t-s.last
-                if 0.005<dt<0.100:
-                    s.iv.append(dt)
-                    if len(s.iv)>=8:
-                        srt=sorted(s.iv); s.period=srt[len(srt)//2]
-                    s.phase0=t
-            s.last=t
-    def quality(s):
-        with s.lk:
-            if len(s.iv)<8: return 0.0,s.period
-            m=sum(s.iv)/len(s.iv)
-            var=sum((x-m)**2 for x in s.iv)/len(s.iv)
-            cv=(var**0.5)/m if m>0 else 1.0
-            return max(0.0,1.0-cv),s.period
-    def phase(s,t):
-        with s.lk:
-            if s.phase0 is None: return None
-            return ((t-s.phase0)%s.period)/s.period
-
-tick=Tick()
-st={"in":0,"out":0,"fold":0,"pass":0}
-
-def parse(buf,n):
-    if n<28: return None
-    ihl=(buf[0]&0x0F)*4
-    if buf[9]!=17: return None  # not UDP
-    src=".".join(str(b) for b in buf[12:16])
-    dst=".".join(str(b) for b in buf[16:20])
-    sport=(buf[ihl]<<8)|buf[ihl+1]
-    return src,dst,sport
-
-def callback(qh, nfmsg, nfad, data):
-    t=time.time()
-    ph=nfq.nfq_get_msg_packet_hdr(nfad)
-    if not ph:
-        return NF_ACCEPT
-    hdr=C.cast(ph, C.POINTER(PktHdr)).contents
-    pid=socket.ntohl(hdr.packet_id)
-
-    pp=C.POINTER(C.c_ubyte)()
-    ln=nfq.nfq_get_payload(nfad, C.byref(pp))
-    if ln<=0:
-        nfq.nfq_set_verdict(qh,pid,NF_ACCEPT,0,None); return 0
-    buf=bytes(pp[i] for i in range(min(ln,40)))
-    info=parse(buf,ln)
-    if not info:
-        nfq.nfq_set_verdict(qh,pid,NF_ACCEPT,0,None); return 0
-    src,dst,sport=info
-
-    # inbound: server->console
-    if dst==HOST and sport==PORT:
-        st["in"]+=1; tick.inbound(t)
-        nfq.nfq_set_verdict(qh,pid,NF_ACCEPT,0,None); return 0
-    # outbound: console->server
-    if src==HOST and sport==PORT:
-        st["out"]+=1
-        p=tick.phase(t)
-        if p is not None and p>=(1.0-SLOW_FRAC):
-            q,period=tick.quality()
-            fold=min((1.0-p)*period, GUARD_MS/1000.0)
-            if q>=0.4 and fold>0.0005:
-                time.sleep(fold); st["fold"]+=1
-            else:
-                st["pass"]+=1
-        else:
-            st["pass"]+=1
-        nfq.nfq_set_verdict(qh,pid,NF_ACCEPT,0,None); return 0
-
-    nfq.nfq_set_verdict(qh,pid,NF_ACCEPT,0,None); return 0
-
-def reporter():
-    while True:
-        time.sleep(5)
-        q,period=tick.quality(); hz=(1/period) if period>0 else 0
-        sys.stderr.write(f"[pacer] tick~{hz:.1f}Hz lock={q:.2f} in={st['in']} "
-                         f"out={st['out']} fold={st['fold']} pass={st['pass']}\n")
-        if q<0.4 and st['in']>50:
-            sys.stderr.write("        ^ LOW LOCK: inbound smear, no stable tick -> NOT folding (correct).\n")
-        sys.stderr.flush()
-
-def main():
-    h=nfq.nfq_open()
-    if not h: sys.exit("nfq_open failed")
-    nfq.nfq_unbind_pf(h,socket.AF_INET); nfq.nfq_bind_pf(h,socket.AF_INET)
-    cb=CB(callback)
-    qh=nfq.nfq_create_queue(h,QNUM,cb,None)
-    if not qh: sys.exit("nfq_create_queue failed (is something else on this qnum?)")
-    nfq.nfq_set_mode(qh,COPY_PACKET,0xffff)
-    fd=nfq.nfq_fd(h)
-    sk=socket.fromfd(fd,socket.AF_UNIX,socket.SOCK_RAW)
-    threading.Thread(target=reporter,daemon=True).start()
-    sys.stderr.write(f"phase-pacer(ctypes) running on q{QNUM}: host={HOST} port={PORT}. "
-                     f"Watch the lock value.\n"); sys.stderr.flush()
-    try:
-        while True:
-            d=sk.recv(65535)
-            if d: nfq.nfq_handle_packet(h,d,len(d))
-    except KeyboardInterrupt:
-        pass
-    finally:
-        nfq.nfq_destroy_queue(qh); nfq.nfq_close(h)
-        sys.stderr.write("\npacer stopped.\n")
-
-if __name__=="__main__":
-    main()
+case "$1" in
+    on )
+        modprobe nfnetlink_queue 2>/dev/null
+        python3 -c "import ctypes; ctypes.CDLL('/usr/lib/libnetfilter_queue.so.1')" 2>/dev/null \
+            || { echo "ERROR: can't load libnetfilter_queue.so.1"; exit 1; }
+        wire || { echo "nft wiring failed"; nft delete table inet "$TABLE" 2>/dev/null; exit 1; }
+        echo "wired game flow (both dirs) -> NFQUEUE $QNUM. Launching ctypes pacer." >&2
+        echo "Ctrl-C to stop & tear down. WATCH the lock= value." >&2
+        trap 'nft delete table inet "$TABLE" 2>/dev/null; echo; echo "torn down."; exit 0' INT TERM
+        PHASE_HOST="$HOST" PHASE_PORT="$GP" PHASE_QNUM="$QNUM" python3 "$DIR/phase-pacer-ctypes.py"
+        nft delete table inet "$TABLE" 2>/dev/null
+        ;;
+    off )
+        nft delete table inet "$TABLE" 2>/dev/null && echo "torn down." || echo "(not active)"
+        ;;
+    * ) echo "usage: sh phase-pacer.sh [on|off]" ;;
+esac
