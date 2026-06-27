@@ -2,26 +2,30 @@
 # phase-pacer.sh -- wire game flow into NFQUEUE and run the ctypes pacer.
 
 HOST="192.168.10.50"
-GP="3659" # Hardcoded to the console's permanent local game port
-QNUM=0; TABLE="phasepacer"
+GP="3659"
+QNUM="0"
+TABLE="phasepacer"
 DIR="$(dirname "$0")"
 
 wire(){
+    # 1. Clear previous tables cleanly
     nft delete table ip "$TABLE" 2>/dev/null
     nft add table ip "$TABLE" || return 1
 
-    # Base chain setup
+    # 2. Sequential base chain allocation with script-safe formatting
+    # Priority -150 grabs ingress frames immediately at the edge
     nft add chain ip "$TABLE" post \{ type filter hook postrouting priority 0 \; \} || return 1
-    nft add chain ip "$TABLE" pre  \{ type filter hook prerouting  priority 0 \; \} || return 1
+    nft add chain ip "$TABLE" pre  \{ type filter hook prerouting priority -150 \; \} || return 1
 
     nft add chain ip "$TABLE" post \{ policy accept \; \} || return 1
     nft add chain ip "$TABLE" pre  \{ policy accept \; \} || return 1
 
-    # outbound: Catch traffic originating from the console's port
+    # 3. Outbound Match: Capture packets originating from the host console's game profile
     nft add rule ip "$TABLE" post ip saddr "$HOST" udp sport "$GP" counter queue num "$QNUM" || return 1
 
-    # inbound: Catch return traffic hitting the console's destination port at WAN ingress
-    nft add rule ip "$TABLE" pre udp dport "$GP" counter queue num "$QNUM" || return 1
+    # 4. Inbound Match: Capture ANY incoming packet that conntrack identifies as the return stream 
+    # of the console's outbound flow. This completely bypasses port shifts.
+    nft add rule ip "$TABLE" pre ct direction reply counter queue num "$QNUM" || return 1
 
     return 0
 }
@@ -40,7 +44,7 @@ case "$1" in
             exit 1
         }
 
-        echo "wired IPv4 game flow (Port: $GP) -> NFQUEUE $QNUM. Launching ctypes pacer." >&2
+        echo "wired IPv4 stateful game flow -> NFQUEUE $QNUM. Launching ctypes pacer." >&2
         echo "Ctrl-C to stop & tear down. WATCH the lock= value." >&2
 
         trap 'nft delete table ip "$TABLE" 2>/dev/null; echo; echo "torn down."; exit 0' INT TERM
