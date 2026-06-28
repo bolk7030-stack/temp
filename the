@@ -1,160 +1,62 @@
-#!/usr/bin/env python3
-# flow-fusion-anchored.py -- INVARIANT-ANCHORED fusion for churning flows (Pro Clubs 11v11).
+#!/bin/sh
+# egress-smooth.sh -- the CLEAN isolation of "flowy": even out the cadence of
+# your own outbound game packets (reduce egress jitter), with the MINIMUM added
+# delay possible. Nothing else -- no fold, no fusion, no reshaping, no per-flow
+# isolation. Just: release your packets at a steadier pace.
 #
-# The problem this solves: in 11v11 the PEER flows churn (join/drop/migrate), so
-# per-flow baselining never settles -> fusion is inconsistent. The fix, per the
-# framework: don't baseline the things that churn. Anchor the absorber to the
-# INVARIANT that SURVIVES the churn, and absorb the churning peers against it.
+# *** HONEST TENSION: smoothing and delay are physically coupled. Any pacer evens
+#     spacing by holding early packets slightly to align them -- so "smoother"
+#     costs a little "held." This uses the SMALLEST buffer that still smooths, so
+#     you can feel whether the result lands on FLOWY or tips into HELD. That IS
+#     the test. ***
 #
-# Two invariants that survive 11v11 churn:
-#   ANCHOR  = the persistent server flow (one stable independent source; peers
-#             churn but the server connection persists the whole match).
-#   AGGREGATE = the combined rhythm of ALL game traffic (stable even as individual
-#               members come/go -- the sum is steadier than any part).
+# Mechanism: a token-bucket (tbf) on JUST the game flow, rate set HIGH (near line)
+# so it doesn't throttle throughput, with a SMALL burst + tiny latency target --
+# this evens inter-packet spacing (paces release) without meaningfully delaying.
+# tbf is the lightest cadence-shaping tool; no netem, no NFQUEUE, no userspace hop.
 #
-# Mechanism (noise LEFT of an invariant absorber, signal on the RIGHT):
-#   - Baseline the ANCHOR (server) and the AGGREGATE -- both stable, so they
-#     baseline cleanly even while peers churn.
-#   - Each churning PEER is measured as DEVIATION FROM THE AGGREGATE (not its own
-#     unstable baseline) -- so a peer that's worse than the pack stands out even
-#     if it just appeared (no per-peer history needed). The aggregate is the
-#     invariant the peer is judged against.
-#   - SIGNAL = anchor degraded AND aggregate degraded AGREE. That's real shared
-#     degradation (the invariant moved), not one churning peer's noise.
-#
-# This works amid churn because nothing load-bearing depends on a stable PER-PEER
-# baseline -- only on the anchor + aggregate, which survive the churn.
-#
-# Env: FF_HOST, FF_SERVER (server IP, the anchor), FF_MODE, FF_WIN, FF_BASE, FF_SENS
+# Usage:
+#   sh egress-smooth.sh on            # smooth with default (gentle) settings
+#   sh egress-smooth.sh on 50 1540    # custom: rate(mbit) burst(bytes)
+#   sh egress-smooth.sh off
+#   sh egress-smooth.sh status
 
-import os, time, subprocess, collections, sys, re
+WAN="eth1"; HOST="192.168.10.50"; GP="3659"
+RATE_DEFAULT="90mbit"    # high -- near line speed, so throughput isn't throttled
+BURST_DEFAULT="1600"     # ~1 packet; small burst = tighter pacing (smoother)
+LAT_DEFAULT="2ms"        # tiny latency target -- minimum hold to even spacing
 
-HOST   = os.environ.get("FF_HOST", "192.168.10.50")
-SERVER = os.environ.get("FF_SERVER", "")          # anchor IP; if blank, auto-pick steadiest
-MODE   = os.environ.get("FF_MODE", "monitor")
-WIN    = float(os.environ.get("FF_WIN", "2.0"))
-BASE   = float(os.environ.get("FF_BASE", "0.01")) # slow baseline (your tuned value)
-SENS   = float(os.environ.get("FF_SENS", "1.5"))
-TABLE  = "gamefusion"
+cleanup(){ tc qdisc del dev "$WAN" root 2>/dev/null; nft delete table inet esmooth 2>/dev/null; }
+trap 'echo; echo "egress-smooth OFF -> restored"; cleanup; exit 0' INT TERM
 
-class Baseline:
-    """Slow-adapt baseline + deviation, for a stable invariant (anchor/aggregate)."""
-    def __init__(s):
-        s.iv=collections.deque(maxlen=40); s.last=None; s.base=None
-        s.seen=0
-    def update(s, bytecount):
-        if s.last is not None:
-            d=bytecount-s.last
-            if d>=0: s.iv.append(d); s.seen+=1
-        s.last=bytecount
-    def jitter(s):
-        if len(s.iv)<8: return None
-        m=sum(s.iv)/len(s.iv)
-        if m<=0: return None
-        var=sum((x-m)**2 for x in s.iv)/len(s.iv)
-        return (var**0.5)/m
-    def deviation(s):
-        j=s.jitter()
-        if j is None: return None
-        if s.base is None: s.base=j; return 1.0
-        s.base=(1.0-BASE)*s.base + BASE*j
-        return (j/s.base) if s.base>0 else 1.0
-    def degraded(s):
-        d=s.deviation()
-        return None if d is None else d>SENS
+apply(){
+    RATE="$1"; BURST="$2"; LAT="$3"
+    cleanup
+    # prio root: game flow -> band 1:1 (tbf-paced), everything else -> 1:2 (clean)
+    tc qdisc add dev "$WAN" root handle 1: prio bands 3 || return 1
+    # tbf on the game band: high rate (no throttle) + small burst + tiny latency
+    # = evens packet spacing (paces) with minimal delay
+    tc qdisc add dev "$WAN" parent 1:1 handle 10: tbf \
+        rate "$RATE" burst "$BURST" latency "$LAT" 2>/dev/null || {
+        echo "tbf unavailable on this build"; cleanup; return 1; }
+    tc qdisc add dev "$WAN" parent 1:2 handle 20: pfifo 2>/dev/null
+    tc qdisc add dev "$WAN" parent 1:3 handle 30: pfifo 2>/dev/null
+    # send ONLY game egress to the paced band
+    tc filter add dev "$WAN" parent 1: protocol ip prio 1 u32 \
+        match ip src "${HOST}/32" match ip sport "$GP" 0xffff flowid 1:1 2>/dev/null
+    echo "EGRESS-SMOOTH ON: game flow paced at rate=$RATE burst=$BURST latency=$LAT"
+    echo "  Evens your outbound cadence (smoother) with minimal hold."
+    echo "  FEEL TEST: is it FLOWY (smoother helps) or HELD (the hold dominates)?"
+    echo "  Tighten burst (smaller=smoother,more hold) or raise it (looser,less hold)."
+}
 
-def sample_flows():
-    flows={}
-    try:
-        out=subprocess.run(["conntrack","-L","-p","udp"],capture_output=True,
-                           text=True,timeout=2).stdout
-    except Exception:
-        try: out=open("/proc/net/nf_conntrack").read()
-        except Exception: return flows
-    for line in out.splitlines():
-        if HOST not in line: continue
-        m=re.findall(r'(\d+\.\d+\.\d+\.\d+)',line)
-        b=re.findall(r'bytes=(\d+)',line)
-        remote=None
-        for ip in m:
-            if ip!=HOST and not ip.startswith("192.168."): remote=ip; break
-        if remote:
-            tot=sum(int(x) for x in b) if b else 0
-            flows[remote]=flows.get(remote,0)+tot
-    return flows
-
-def mark():
-    subprocess.run(["nft","delete","table","ip",TABLE],stderr=subprocess.DEVNULL)
-    rules=(f"table ip {TABLE} {{ chain post {{ "
-           f"type filter hook postrouting priority 0; policy accept; "
-           f"ip saddr {HOST} udp ip dscp set ef counter; "
-           f"ip daddr {HOST} udp ip dscp set ef counter; }} }}")
-    subprocess.run(["nft","-f","-"],input=rules,text=True,stderr=subprocess.DEVNULL)
-def unmark():
-    subprocess.run(["nft","delete","table","ip",TABLE],stderr=subprocess.DEVNULL)
-
-def main():
-    anchor=Baseline()          # the server (persistent invariant)
-    aggregate=Baseline()       # combined rhythm of all flows (invariant sum)
-    prev_totals={}
-    server_ip=SERVER
-    server_seen=collections.Counter()
-    state="clean"
-    sys.stderr.write(f"flow-fusion-anchored: HOST={HOST} anchor="
-                     f"{server_ip or 'auto'} (invariant-anchored for churn)\n")
-    if MODE=="act": mark()
-    try:
-        while True:
-            flows=sample_flows()
-            # aggregate = sum of all game bytes (invariant that survives churn)
-            agg_total=sum(flows.values())
-            aggregate.update(agg_total)
-
-            # pick/track the anchor = the most PERSISTENT flow (server shows up
-            # every window; peers churn). Auto-pick if not given.
-            for k in flows: server_seen[k]+=1
-            if not server_ip and server_seen:
-                server_ip=server_seen.most_common(1)[0][0]
-            if server_ip and server_ip in flows:
-                anchor.update(flows[server_ip])
-
-            # churning peers: deviation FROM AGGREGATE, no per-peer baseline needed
-            agg_dev = aggregate.deviation()
-            peer_devs={}
-            if agg_total>0:
-                for k,v in flows.items():
-                    if k==server_ip: continue
-                    share=v/agg_total if agg_total>0 else 0
-                    peer_devs[k]=round(share,3)
-
-            a_deg = anchor.degraded()
-            g_deg = aggregate.degraded()
-            a_dev = anchor.deviation()
-            # SIGNAL: the two invariants AGREE degraded (anchor + aggregate)
-            agreed = bool(a_deg) and bool(g_deg)
-
-            trans=""
-            if agreed and state=="clean":
-                state="degraded"
-                if MODE=="act": mark(); trans="  >> INVARIANTS AGREE degraded -> re-marked"
-                else: trans="  >> INVARIANTS AGREE degraded"
-            elif not agreed and state=="degraded":
-                state="clean"
-                if MODE=="act": mark(); trans="  >> cleared -> reverted"
-                else: trans="  >> cleared"
-
-            ad = f"{a_dev:.2f}" if a_dev is not None else "--"
-            gd = f"{agg_dev:.2f}" if agg_dev is not None else "--"
-            sys.stderr.write(f"[anchored] peers={len(peer_devs)} anchor={server_ip or '?'} "
-                             f"anchor_dev={ad} agg_dev={gd} agreed={agreed} state={state}\n")
-            if trans: sys.stderr.write(trans+"\n")
-            sys.stderr.flush()
-            time.sleep(WIN)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if MODE=="act": unmark()
-        sys.stderr.write("\nstopped.\n")
-
-if __name__=="__main__":
-    main()
+case "$1" in
+    on )
+        apply "${2:-$RATE_DEFAULT}" "${3:-$BURST_DEFAULT}" "${4:-$LAT_DEFAULT}" || exit 1
+        echo; echo "compare on vs off by FEEL. Revert: sh egress-smooth.sh off" ;;
+    status )
+        tc -s qdisc show dev "$WAN" 2>/dev/null || echo "(nothing)" ;;
+    off )
+        cleanup; echo "OFF -> restored." ;;
+    * ) echo "usage: sh egress-smooth.sh [on [rate burst latency] | status | off]" ;;
+esac
