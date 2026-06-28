@@ -1,28 +1,27 @@
 #!/bin/sh
-# flow-fusion.sh -- run the isolate+fuse connection-state estimator.
-# Isolates each game flow (server + peers), measures each INDEPENDENTLY, fuses,
-# acts ONLY when independent sources AGREE. Passive sampling (no added latency).
-#
-#   sh flow-fusion.sh monitor   # READ-ONLY: watch the fused agreement signal
-#   sh flow-fusion.sh act        # enable invariant-preserving re-marking on agreement
-#   sh flow-fusion.sh off        # remove any marking table
+# flow-fusion.sh -- run the fusion estimators.
+#   sh flow-fusion.sh monitor          # v1.1 per-flow fusion (stable/single-opp)
+#   sh flow-fusion.sh anchored         # invariant-anchored (Pro Clubs / churn)
+#   sh flow-fusion.sh anchored act     # anchored + re-mark on agreement
+#   sh flow-fusion.sh act              # v1.1 + act
+#   sh flow-fusion.sh off
 
 HOST="192.168.10.50"; DIR="$(dirname "$0")"
-
-# ensure conntrack tool exists (for passive per-flow sampling)
 have_ct(){ command -v conntrack >/dev/null 2>&1 || [ -r /proc/net/nf_conntrack ]; }
 
 case "$1" in
-    monitor )
-        have_ct || { echo "need conntrack or /proc/net/nf_conntrack"; exit 1; }
-        echo "MONITOR: watching independent flows for AGREEMENT. Ctrl-C to stop." >&2
+    monitor ) have_ct||{ echo "need conntrack"; exit 1; }
         FF_HOST="$HOST" FF_MODE="monitor" python3 "$DIR/flow-fusion.py" ;;
-    act )
-        have_ct || { echo "need conntrack or /proc/net/nf_conntrack"; exit 1; }
-        echo "ACT: will re-mark on independent-flow agreement. Ctrl-C stops & cleans." >&2
+    act ) have_ct||{ echo "need conntrack"; exit 1; }
         trap 'nft delete table ip gamefusion 2>/dev/null; exit 0' INT TERM
         FF_HOST="$HOST" FF_MODE="act" python3 "$DIR/flow-fusion.py" ;;
+    anchored )
+        have_ct||{ echo "need conntrack"; exit 1; }
+        M="monitor"; [ "$2" = "act" ] && M="act"
+        echo "ANCHORED mode (invariant-anchored for churning Pro Clubs flows)." >&2
+        [ "$M" = "act" ] && trap 'nft delete table ip gamefusion 2>/dev/null; exit 0' INT TERM
+        FF_HOST="$HOST" FF_MODE="$M" python3 "$DIR/flow-fusion-anchored.py" ;;
     off )
         nft delete table ip gamefusion 2>/dev/null && echo "removed." || echo "(not active)" ;;
-    * ) echo "usage: sh flow-fusion.sh [monitor|act|off]" ;;
+    * ) echo "usage: sh flow-fusion.sh [monitor|act|anchored [act]|off]" ;;
 esac
