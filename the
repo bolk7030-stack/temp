@@ -1,62 +1,65 @@
 #!/bin/sh
-# egress-smooth.sh -- the CLEAN isolation of "flowy": even out the cadence of
-# your own outbound game packets (reduce egress jitter), with the MINIMUM added
-# delay possible. Nothing else -- no fold, no fusion, no reshaping, no per-flow
-# isolation. Just: release your packets at a steadier pace.
+# fc-dscp.sh -- toggle EA FC gameplay DSCP marking (UDP 3659), independent of CAKE.
+#   sh fc-dscp.sh on   [CS4]   # add marking (default CS4; pass CS0/EF/etc to override)
+#   sh fc-dscp.sh off          # remove marking, return to best-effort
+#   sh fc-dscp.sh status       # show current marking rules
 #
-# *** HONEST TENSION: smoothing and delay are physically coupled. Any pacer evens
-#     spacing by holding early packets slightly to align them -- so "smoother"
-#     costs a little "held." This uses the SMALLEST buffer that still smooths, so
-#     you can feel whether the result lands on FLOWY or tips into HELD. That IS
-#     the test. ***
-#
-# Mechanism: a token-bucket (tbf) on JUST the game flow, rate set HIGH (near line)
-# so it doesn't throttle throughput, with a SMALL burst + tiny latency target --
-# this evens inter-packet spacing (paces release) without meaningfully delaying.
-# tbf is the lightest cadence-shaping tool; no netem, no NFQUEUE, no userspace hop.
-#
-# Usage:
-#   sh egress-smooth.sh on            # smooth with default (gentle) settings
-#   sh egress-smooth.sh on 50 1540    # custom: rate(mbit) burst(bytes)
-#   sh egress-smooth.sh off
-#   sh egress-smooth.sh status
+# NOTE: this is an EXPERIMENT. Only meaningful judged by a COUNTED W/L set
+# (mark ON for N matches, OFF for N, compare records) -- not by single-session feel.
+# Kept separate from setup-cake.sh on purpose: your shaper is validated, this isn't.
 
-WAN="eth1"; HOST="192.168.10.50"; GP="3659"
-RATE_DEFAULT="90mbit"    # high -- near line speed, so throughput isn't throttled
-BURST_DEFAULT="1600"     # ~1 packet; small burst = tighter pacing (smoother)
-LAT_DEFAULT="2ms"        # tiny latency target -- minimum hold to even spacing
+ACTION="$1"; MARK="${2:-CS4}"; PORT="3659"
 
-cleanup(){ tc qdisc del dev "$WAN" root 2>/dev/null; nft delete table inet esmooth 2>/dev/null; }
-trap 'echo; echo "egress-smooth OFF -> restored"; cleanup; exit 0' INT TERM
-
-apply(){
-    RATE="$1"; BURST="$2"; LAT="$3"
-    cleanup
-    # prio root: game flow -> band 1:1 (tbf-paced), everything else -> 1:2 (clean)
-    tc qdisc add dev "$WAN" root handle 1: prio bands 3 || return 1
-    # tbf on the game band: high rate (no throttle) + small burst + tiny latency
-    # = evens packet spacing (paces) with minimal delay
-    tc qdisc add dev "$WAN" parent 1:1 handle 10: tbf \
-        rate "$RATE" burst "$BURST" latency "$LAT" 2>/dev/null || {
-        echo "tbf unavailable on this build"; cleanup; return 1; }
-    tc qdisc add dev "$WAN" parent 1:2 handle 20: pfifo 2>/dev/null
-    tc qdisc add dev "$WAN" parent 1:3 handle 30: pfifo 2>/dev/null
-    # send ONLY game egress to the paced band
-    tc filter add dev "$WAN" parent 1: protocol ip prio 1 u32 \
-        match ip src "${HOST}/32" match ip sport "$GP" 0xffff flowid 1:1 2>/dev/null
-    echo "EGRESS-SMOOTH ON: game flow paced at rate=$RATE burst=$BURST latency=$LAT"
-    echo "  Evens your outbound cadence (smoother) with minimal hold."
-    echo "  FEEL TEST: is it FLOWY (smoother helps) or HELD (the hold dominates)?"
-    echo "  Tighten burst (smaller=smoother,more hold) or raise it (looser,less hold)."
+clear_rules() {
+    # delete any existing FC-DSCP rules by name (idempotent)
+    while uci show firewall 2>/dev/null | grep -q "name='FC-DSCP"; do
+        IDX=$(uci show firewall | grep -m1 "name='FC-DSCP" | sed "s/firewall\.@rule\[\([0-9]*\)\].*/\1/")
+        [ -z "$IDX" ] && break
+        uci delete firewall.@rule[$IDX]
+    done
 }
 
-case "$1" in
-    on )
-        apply "${2:-$RATE_DEFAULT}" "${3:-$BURST_DEFAULT}" "${4:-$LAT_DEFAULT}" || exit 1
-        echo; echo "compare on vs off by FEEL. Revert: sh egress-smooth.sh off" ;;
-    status )
-        tc -s qdisc show dev "$WAN" 2>/dev/null || echo "(nothing)" ;;
-    off )
-        cleanup; echo "OFF -> restored." ;;
-    * ) echo "usage: sh egress-smooth.sh [on [rate burst latency] | status | off]" ;;
+case "$ACTION" in
+  on)
+    echo "== Marking EA FC (udp $PORT) as $MARK ..."
+    clear_rules
+    uci add firewall rule >/dev/null
+    uci set firewall.@rule[-1].name='FC-DSCP-out'
+    uci set firewall.@rule[-1].src='lan'
+    uci set firewall.@rule[-1].proto='udp'
+    uci set firewall.@rule[-1].dest_port="$PORT"
+    uci set firewall.@rule[-1].set_dscp="$MARK"
+    uci set firewall.@rule[-1].target='DSCP'
+    uci set firewall.@rule[-1].enabled='1'
+    uci add firewall rule >/dev/null
+    uci set firewall.@rule[-1].name='FC-DSCP-in'
+    uci set firewall.@rule[-1].src='lan'
+    uci set firewall.@rule[-1].proto='udp'
+    uci set firewall.@rule[-1].src_port="$PORT"
+    uci set firewall.@rule[-1].set_dscp="$MARK"
+    uci set firewall.@rule[-1].target='DSCP'
+    uci set firewall.@rule[-1].enabled='1'
+    uci commit firewall
+    service firewall restart
+    echo "== Applied. Verifying in nftables:"
+    nft list ruleset 2>/dev/null | grep -i dscp || echo "  !! NOTHING in nft -- fw4 didn't apply it; tell me and I'll give the native nft version."
+    ;;
+  off)
+    echo "== Removing FC DSCP marking (back to best-effort CS0)..."
+    clear_rules
+    uci commit firewall
+    service firewall restart
+    echo "== Removed. Verify (should be empty):"
+    nft list ruleset 2>/dev/null | grep -i dscp || echo "  clean -- no dscp marking."
+    ;;
+  status)
+    echo "== Current FC DSCP rules (uci):"
+    uci show firewall | grep -i "FC-DSCP\|dscp" || echo "  none in uci"
+    echo "== In nftables:"
+    nft list ruleset 2>/dev/null | grep -i dscp || echo "  none in nft"
+    ;;
+  *)
+    echo "Usage: sh fc-dscp.sh on [CS4|CS0|EF|...]   |   off   |   status"
+    exit 1
+    ;;
 esac
