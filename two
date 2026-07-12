@@ -1,144 +1,73 @@
 #!/bin/sh
-# qos-audit-git.sh
-# Runs QoS audit -> saves log -> commits -> pushes to GitHub automatically
+# setup-cake.sh -- one-shot CAKE/SQM setup for OpenWrt (Protectli)
+# Usage: sh setup-cake.sh <download_kbit> <upload_kbit> [rtt_ms] [wan_iface]
+#   e.g. 500/50 Mbps measured -> 90%, real RTT 30ms:  sh setup-cake.sh 450000 45000 30
+# Run a speedtest FIRST and pass ~90% of measured speeds. That number is the main trick.
+#
+# rtt_ms (optional, default 100): CAKE defaults to assuming 100ms RTT. If your real
+# ping to the game/server is lower (e.g. 20-40ms), telling CAKE the true value makes
+# its AQM react faster on your low-latency flow -- a real, single-parameter lever.
+# Measure with:  ping -c 10 <server_or_8.8.8.8>   and pass the avg.
+# Leave blank to keep CAKE's 100ms default.
 
-TAG="${1:-run}"
+set -e
 
-# =========================
-# CONFIG
-# =========================
+DL="$1"; UL="$2"; RTT="${3:-100}"; WAN="${4:-wan}"
 
-REPO_DIR="/root/temp"
-BRANCH="main"
-
-GITHUB_USER="bolk7030-stack"
-GITHUB_TOKEN="ghp_WyiNYZ0aGRJ6H25VbRBKKEHSPSt008mbEu"
-
-# Example:
-# REPO_URL="https://github.com/yourname/temp.git"
-REPO_URL="https://github.com/bolk7030-stack/temp.service status"
-
-#!/bin/sh
-
-TAG="${1:-run}"
-
-
-REPO_NAME="temp"
-BRANCH="main"
-
-PARENT_DIR="/root"
-REPO_DIR="${PARENT_DIR}/${REPO_NAME}"
-AUTH_REPO_URL="https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/${GITHUB_USER}/${REPO_NAME}.git"
-
-TS="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo manual)"
-OUT="/tmp/qos-audit-${TS}-${TAG}.log"
-
-{
-LINE="---------------------------------------------------------------"
-say() { echo; echo "$LINE"; echo "== $1"; echo "$LINE"; }
-
-echo "qos-audit  tag=$TAG  time=$TS"
-
-say "1. ALL qdiscs on ALL devices"
-tc qdisc show
-
-say "2. Does any HFSC / class 1:20 / 1:60 exist ANYWHERE?"
-found=0
-for d in $(tc qdisc show | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | sort -u); do
-    if tc class show dev "$d" 2>/dev/null | grep -qE '1:20|1:60|hfsc'; then
-        echo "FOUND on dev $d:"
-        tc class show dev "$d" 2>/dev/null | grep -E '1:20|1:60|hfsc'
-        found=1
-    fi
-done
-[ "$found" -eq 0 ] && echo "none found on any device"
-
-say "3. The REAL shaper: CAKE on ifb-eth1"
-tc -s qdisc show dev ifb-eth1
-
-say "4. Is UPLOAD/egress direction shaped?"
-for d in eth0 eth1 eth2 eth3; do
-    echo "-- dev $d root qdisc:"
-    tc qdisc show dev "$d" 2>/dev/null | head -1 | sed 's/^/     /'
-done
-
-say "5. Per-tin CAKE detail"
-tc -s qdisc show dev ifb-eth1 | grep -iE 'cake|tin|besteffort|diffserv|thresh|target|pk_delay|av_delay|sp_delay|backlog|drops|marks' | sed 's/^/     /'
-
-say "6. qosmate config"
-if [ -f /etc/config/qosmate ]; then
-    cat /etc/config/qosmate
-else
-    echo "/etc/config/qosmate not found"
-    ls -la /etc/config/ 2>/dev/null | grep -iE 'qos|sqm|cake' | sed 's/^/     /'
-fi
-
-say "7. Packages + service status"
-if command -v apk >/dev/null 2>&1; then
-    apk info 2>/dev/null | grep -iE 'qosmate|sqm|cake|tc|iproute' | sed 's/^/     /'
-elif command -v opkg >/dev/null 2>&1; then
-    opkg list-installed 2>/dev/null | grep -iE 'qosmate|sqm|cake|tc-' | sed 's/^/     /'
-fi
-
-[ -f /etc/init.d/qosmate ] && {
-    echo "qosmate status:"
-    /etc/init.d/qosmate status 2>/dev/null | sed 's/^/     /'
-}
-
-say "8. Bare path jitter"
-GW=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
-if [ -n "$GW" ]; then
-    ping -c 10 "$GW" 2>/dev/null | tail -3 | sed 's/^/     /'
-else
-    echo "no default gateway found"
-fi
-
-echo
-echo "$LINE"
-echo "DONE."
-echo "$LINE"
-} 2>&1 | tee "$OUT"
-
-echo
-echo "saved audit to: $OUT"
-
-mkdir -p "$PARENT_DIR"
-
-if [ ! -d "$REPO_DIR/.git" ]; then
-    echo "Repo not found. Cloning into $REPO_DIR..."
-    rm -rf "$REPO_DIR"
-    git clone "$AUTH_REPO_URL" "$REPO_DIR" || {
-        echo "ERROR: git clone failed"
-        exit 1
-    }
-fi
-
-cd "$REPO_DIR" || {
-    echo "ERROR: cannot cd into $REPO_DIR"
+if [ -z "$DL" ] || [ -z "$UL" ]; then
+    echo "Usage: sh setup-cake.sh <download_kbit> <upload_kbit> [rtt_ms] [wan_iface]"
+    echo "Example (500/50 Mbps, 30ms RTT): sh setup-cake.sh 450000 45000 30"
     exit 1
-}
+fi
 
-git config user.name "openwrt-audit"
-git config user.email "openwrt-audit@local"
+# resolve the physical device behind the logical interface
+WANDEV=$(uci -q get "network.${WAN}.device" || echo "$WAN")
+echo "== WAN logical: $WAN  device: $WANDEV"
+echo "== Shaping: ${DL} kbit down / ${UL} kbit up  (CAKE rtt: ${RTT}ms)"
 
-cd /root/temp || exit 1
+echo "== [1/5] Disabling flow offloading (bypasses CAKE if on)..."
+uci -q set firewall.@defaults[0].flow_offloading='0' || true
+uci -q set firewall.@defaults[0].flow_offloading_hw='0' || true
+uci commit firewall
+/etc/init.d/firewall reload >/dev/null 2>&1 || fw4 reload >/dev/null 2>&1 || true
 
-git pull --rebase "$AUTH_REPO_URL" main || {
-    echo "ERROR: pull/rebase failed"
-    exit 1
-}
+echo "== [2/5] Checking for old shaper remnants (egress-smooth etc.)..."
+if grep -q "egress-smooth\|tc qdisc" /etc/rc.local 2>/dev/null; then
+    echo "   !! Found shaper lines in /etc/rc.local -- commenting them out:"
+    grep -n "egress-smooth\|tc qdisc" /etc/rc.local
+    sed -i 's/^\(.*\(egress-smooth\|tc qdisc\).*\)$/# DISABLED-BY-CAKE-SETUP: \1/' /etc/rc.local
+fi
+# clear any live qdisc our old scripts left on the device
+tc qdisc del dev "$WANDEV" root 2>/dev/null || true
 
-mkdir -p audits
-DEST="audits/$(basename "$OUT")"
-cp "$OUT" "$DEST"
+echo "== [3/5] Installing sqm-scripts + luci-app-sqm..."
+apk update
+apk add sqm-scripts luci-app-sqm
 
-git add audits/
-git commit -m "audit ${TS} ${TAG}" || {
-    echo "Nothing new to commit."
-    exit 0
-}
+echo "== [4/5] Configuring SQM: cake + layer_cake (honors your DSCP marks)..."
+uci -q delete sqm.@queue[0] 2>/dev/null || true
+uci add sqm queue >/dev/null
+uci set sqm.@queue[-1].enabled='1'
+uci set sqm.@queue[-1].interface="$WANDEV"
+uci set sqm.@queue[-1].download="$DL"
+uci set sqm.@queue[-1].upload="$UL"
+uci set sqm.@queue[-1].qdisc='cake'
+uci set sqm.@queue[-1].script='layer_cake.qos'
+uci set sqm.@queue[-1].linklayer='ethernet'
+uci set sqm.@queue[-1].overhead='44'
+uci set sqm.@queue[-1].qdisc_advanced='1'
+uci set sqm.@queue[-1].qdisc_really_really_advanced='1'
+uci set sqm.@queue[-1].iqdisc_opts="nat dual-dsthost rtt ${RTT}ms"
+uci set sqm.@queue[-1].eqdisc_opts="nat dual-srchost rtt ${RTT}ms"
+uci commit sqm
 
-git push "$AUTH_REPO_URL" main || {
-    echo "ERROR: git push failed"
-    exit 1
-}
+echo "== [5/5] Enabling and starting SQM..."
+/etc/init.d/sqm enable
+/etc/init.d/sqm restart
+
+echo ""
+echo "== Verify CAKE is live on $WANDEV:"
+tc qdisc show dev "$WANDEV" | head -4
+echo ""
+echo "== DONE. Now run the bufferbloat test: https://www.waveform.com/tools/bufferbloat"
+echo "   Target: A/A+ with flat latency under load. If achieved: closed, no further tuning."
