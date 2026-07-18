@@ -1,73 +1,75 @@
 #!/bin/sh
-# setup-cake.sh -- one-shot CAKE/SQM setup for OpenWrt (Protectli)
-# Usage: sh setup-cake.sh <download_kbit> <upload_kbit> [rtt_ms] [wan_iface]
-#   e.g. 500/50 Mbps measured -> 90%, real RTT 30ms:  sh setup-cake.sh 450000 45000 30
-# Run a speedtest FIRST and pass ~90% of measured speeds. That number is the main trick.
+# setup-fqcodel.sh -- htb+fq_codel alternative to setup-cake.sh (lean A/B test)
+# Usage: sh setup-fqcodel.sh <download_kbit> <upload_kbit> [rtt_ms] [wan_iface]
+#   e.g.  sh setup-fqcodel.sh 120000 80000 2
 #
-# rtt_ms (optional, default 100): CAKE defaults to assuming 100ms RTT. If your real
-# ping to the game/server is lower (e.g. 20-40ms), telling CAKE the true value makes
-# its AQM react faster on your low-latency flow -- a real, single-parameter lever.
-# Measure with:  ping -c 10 <server_or_8.8.8.8>   and pass the avg.
-# Leave blank to keep CAKE's 100ms default.
+# WHY THIS EXISTS: to test whether CAKE's extra machinery (shaper + flow isolation
+# + ack-filtering + diffserv tiers) is itself adding anything your single game flow
+# doesn't want. fq_codel is the leaner AQM; htb does the shaping.
+#
+# RTT MAPPING: fq_codel has no 'rtt' knob. interval == the RTT assumption
+# (default 100ms); target is conventionally ~5% of it (default 5ms).
+#   rtt 2  ->  interval 2ms, target ~0.1ms  ... BUT 0.1ms is below the time it
+# takes to physically serialize one 1500B packet (~0.15ms at 80Mbit), which makes
+# fq_codel drop faster than the wire can send. CAKE floors this internally;
+# fq_codel does NOT. So target is floored at 500us here.
 
 set -e
-
 DL="$1"; UL="$2"; RTT="${3:-100}"; WAN="${4:-wan}"
 
 if [ -z "$DL" ] || [ -z "$UL" ]; then
-    echo "Usage: sh setup-cake.sh <download_kbit> <upload_kbit> [rtt_ms] [wan_iface]"
-    echo "Example (500/50 Mbps, 30ms RTT): sh setup-cake.sh 450000 45000 30"
+    echo "Usage: sh setup-fqcodel.sh <download_kbit> <upload_kbit> [rtt_ms] [wan_iface]"
     exit 1
 fi
 
-# resolve the physical device behind the logical interface
 WANDEV=$(uci -q get "network.${WAN}.device" || echo "$WAN")
-echo "== WAN logical: $WAN  device: $WANDEV"
-echo "== Shaping: ${DL} kbit down / ${UL} kbit up  (CAKE rtt: ${RTT}ms)"
 
-echo "== [1/5] Disabling flow offloading (bypasses CAKE if on)..."
+# interval = rtt; target = rtt/20, floored at 500us
+INTERVAL_US=$(( RTT * 1000 ))
+TARGET_US=$(( INTERVAL_US / 20 ))
+if [ "$TARGET_US" -lt 500 ]; then
+    TARGET_US=500
+    echo "!! target floored to 500us (rtt ${RTT}ms would give $(( INTERVAL_US / 20 ))us,"
+    echo "   which is below packet serialization time -- fq_codel would over-drop)."
+fi
+
+echo "== WAN: $WAN  device: $WANDEV"
+echo "== Shaping: ${DL} kbit down / ${UL} kbit up"
+echo "== fq_codel: target ${TARGET_US}us  interval ${INTERVAL_US}us  (from rtt ${RTT}ms)"
+
+echo "== [1/4] Disabling flow offloading..."
 uci -q set firewall.@defaults[0].flow_offloading='0' || true
 uci -q set firewall.@defaults[0].flow_offloading_hw='0' || true
 uci commit firewall
 /etc/init.d/firewall reload >/dev/null 2>&1 || fw4 reload >/dev/null 2>&1 || true
 
-echo "== [2/5] Checking for old shaper remnants (egress-smooth etc.)..."
-if grep -q "egress-smooth\|tc qdisc" /etc/rc.local 2>/dev/null; then
-    echo "   !! Found shaper lines in /etc/rc.local -- commenting them out:"
-    grep -n "egress-smooth\|tc qdisc" /etc/rc.local
-    sed -i 's/^\(.*\(egress-smooth\|tc qdisc\).*\)$/# DISABLED-BY-CAKE-SETUP: \1/' /etc/rc.local
-fi
-# clear any live qdisc our old scripts left on the device
-tc qdisc del dev "$WANDEV" root 2>/dev/null || true
+echo "== [2/4] Ensuring sqm-scripts present..."
+apk update >/dev/null 2>&1 || true
+apk add sqm-scripts luci-app-sqm 2>/dev/null || true
 
-echo "== [3/5] Installing sqm-scripts + luci-app-sqm..."
-apk update
-apk add sqm-scripts luci-app-sqm
-
-echo "== [4/5] Configuring SQM: cake + layer_cake (honors your DSCP marks)..."
+echo "== [3/4] Configuring SQM: htb + fq_codel (simple.qos)..."
 uci -q delete sqm.@queue[0] 2>/dev/null || true
 uci add sqm queue >/dev/null
 uci set sqm.@queue[-1].enabled='1'
 uci set sqm.@queue[-1].interface="$WANDEV"
 uci set sqm.@queue[-1].download="$DL"
 uci set sqm.@queue[-1].upload="$UL"
-uci set sqm.@queue[-1].qdisc='cake'
-uci set sqm.@queue[-1].script='layer_cake.qos'
+uci set sqm.@queue[-1].qdisc='fq_codel'
+uci set sqm.@queue[-1].script='simple.qos'
 uci set sqm.@queue[-1].linklayer='ethernet'
 uci set sqm.@queue[-1].overhead='44'
 uci set sqm.@queue[-1].qdisc_advanced='1'
 uci set sqm.@queue[-1].qdisc_really_really_advanced='1'
-uci set sqm.@queue[-1].iqdisc_opts="nat dual-dsthost rtt ${RTT}ms"
-uci set sqm.@queue[-1].eqdisc_opts="nat dual-srchost rtt ${RTT}ms"
+uci set sqm.@queue[-1].iqdisc_opts="target ${TARGET_US}us interval ${INTERVAL_US}us"
+uci set sqm.@queue[-1].eqdisc_opts="target ${TARGET_US}us interval ${INTERVAL_US}us"
 uci commit sqm
 
-echo "== [5/5] Enabling and starting SQM..."
+echo "== [4/4] Restarting SQM..."
 /etc/init.d/sqm enable
 /etc/init.d/sqm restart
 
 echo ""
-echo "== Verify CAKE is live on $WANDEV:"
-tc qdisc show dev "$WANDEV" | head -4
+echo "== Verify on $WANDEV:"
+tc qdisc show dev "$WANDEV" | head -6
 echo ""
-echo "== DONE. Now run the bufferbloat test: https://www.waveform.com/tools/bufferbloat"
-echo "   Target: A/A+ with flat latency under load. If achieved: closed, no further tuning."
+echo "== To go back to CAKE:  sh setup-cake.sh $DL $UL $RTT"
